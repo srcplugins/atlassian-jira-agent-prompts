@@ -1,0 +1,28 @@
+# Shared srcplugins file, synchronized across repositories.
+# Security updates only: Dependabot opens one grouped PR when an advisory affects a dependency.
+# Routine version updates are off (limit 0). Toolchain pins are shared across srcplugins
+# repositories and updated together, not by a Dependabot PR.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: Security
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ['*']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: Security
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ['*']

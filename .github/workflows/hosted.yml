@@ -1,0 +1,151 @@
+# Shared srcplugins file, synchronized across repositories.
+name: Hosted
+
+# The full hosted suite (forge-test.mjs) on every push to a feature branch: deploy this commit to
+# the Forge development environment, upgrade the owned site's installation, then every unattended
+# journey and runner. Site, accounts and evidence stay private: values come from the `acceptance`
+# environment's secrets and are masked, and reports and journals are uploaded only age-encrypted.
+# Setup: the test framework's docs/ci.md.
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Hosted suite
+        type: choice
+        options: [full, features]
+        default: full
+      cleanup:
+        description: >-
+          Instead of the suite, after inspecting a failed run: one guarded cleanup, for example
+          "node tests/hosted/verify-setup.mjs cleanup <run-uuid>" or "npx forge-test cleanup native-prompt-links <run-uuid>"
+        required: false
+        default: ''
+  # Publish runs the release suite on its tagged build.
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      deploy_tag:
+        type: string
+        required: true
+      suite:
+        type: string
+        default: release
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  hosted:
+    name: Hosted suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment: acceptance
+    # Queued, never cancelled: a started run must finish its own cleanup.
+    concurrency:
+      group: hosted-primary-site
+      cancel-in-progress: false
+    env:
+      CI: 'true'
+      SUITE: ${{ inputs.suite || 'full' }}
+      CLEANUP: ${{ inputs.cleanup }}
+      DEPLOY_TAG: ${{ inputs.deploy_tag }}
+      FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+        run: git config --global url."https://${TOKEN:+x-access-token:$TOKEN@}github.com/".insteadOf ssh://git@github.com/
+      - name: Install dependencies
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+          sudo apt-get install -y --no-install-recommends age > /dev/null
+      - name: Restore sessions and mask private values
+        env:
+          JIRA_SESSION_ADMIN: ${{ secrets.JIRA_SESSION_ADMIN }}
+          JIRA_SESSION_ADMIN2: ${{ secrets.JIRA_SESSION_ADMIN2 }}
+          JIRA_SESSION_MEMBER: ${{ secrets.JIRA_SESSION_MEMBER }}
+          JIRA_SESSION_RESTRICTED: ${{ secrets.JIRA_SESSION_RESTRICTED }}
+          JIRA_IDENTITY_FIXTURE: ${{ secrets.JIRA_IDENTITY_FIXTURE }}
+        run: |
+          npx forge-test mask
+          npx forge-test restore
+          npx forge-test mask
+      # Run journals carry fixture ownership between runs, encrypted to the owner and this
+      # workflow. An unresolved journal makes the next run refuse instead of ignoring leftovers.
+      - name: Restore run journals
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
+        run: |
+          # The API doesn't list newest first; runs are serial, so the newest state is current.
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-state&per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not)] | max_by(.created_at) | .id // empty')
+          if [ -z "$id" ]; then echo "::warning::No earlier run journals; starting without them."; exit 0; fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/state.zip"
+          unzip -o -q "$RUNNER_TEMP/state.zip" -d "$RUNNER_TEMP/state"
+          age -d -i <(printf '%s' "$CI_AGE_KEY") "$RUNNER_TEMP/state/journals.tar.age" | tar -xz -C .local
+          echo "Restored run journals from artifact $id."
+      - name: Forge CLI settings
+        run: node config/forge.mjs settings set usage-analytics false
+      - name: Deploy the published build to development
+        if: env.DEPLOY_TAG != ''
+        run: node config/forge.mjs deploy --tag "$DEPLOY_TAG" -e development --non-interactive
+      - name: Hosted suite
+        if: env.CLEANUP == ''
+        run: npx forge-test suite "$SUITE"
+      - name: Guarded cleanup of a failed run
+        if: env.CLEANUP != ''
+        env:
+          NATIVE_SETUP_TESTS: '1'
+          NATIVE_ACCESS_TESTS: '1'
+        run: |
+          pattern='^(npx forge-test cleanup [a-z][a-z0-9-]*|node tests/hosted/verify-(setup|access)\.mjs cleanup) [0-9a-f-]{36}$'
+          [[ "$CLEANUP" =~ $pattern ]] || { echo "::error::Unsupported cleanup command"; exit 1; }
+          read -r -a command <<< "$CLEANUP"
+          "${command[@]}"
+      - name: Encrypt journals and evidence
+        if: always() && steps.state.outcome == 'success'
+        env:
+          CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
+          OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          ci=$(age-keygen -y <(printf '%s' "$CI_AGE_KEY"))
+          cd .local
+          find sites -path '*/e2e/*runs/*.json' > "$RUNNER_TEMP/journals.txt"
+          tar -czf - -T "$RUNNER_TEMP/journals.txt" | age -r "$OWNER" -r "$ci" > "$RUNNER_TEMP/out/journals.tar.age"
+          find sites \( -name '*-report.json' -o -path '*-results/*' -o -path '*/e2e/*runs/*.png' -o -path '*/e2e/*runs/*.txt' \) -type f \
+            > "$RUNNER_TEMP/evidence.txt"
+          tar -czf - -T "$RUNNER_TEMP/evidence.txt" | age -r "$OWNER" > "$RUNNER_TEMP/out/evidence.tar.age"
+      - name: Save run journals
+        if: always() && steps.state.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-state
+          path: ${{ runner.temp }}/out/journals.tar.age
+          retention-days: 90
+      - name: Save evidence (owner key only)
+        if: always() && steps.state.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-evidence
+          path: ${{ runner.temp }}/out/evidence.tar.age
+          retention-days: 14

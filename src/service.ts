@@ -1,0 +1,583 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { sourceContent } from './prompt-text';
+export { sourceContent } from './prompt-text';
+import {
+  snapshotContent,
+  recoverEmptyAttributes,
+  observedManaged,
+  matchesShape,
+  DescriptionError,
+  synchronizeDescription,
+  type ManagedBlock,
+} from './description';
+import { UserError, requireCompanyManagedSoftware } from './shared/jira.mjs';
+export { UserError };
+/** The request never got an HTTP response from Jira. */
+export class JiraUnavailable extends UserError {}
+/** Jira documented that it did not apply this write (see isDefinitiveRejection). */
+export class JiraRejected extends UserError {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object')
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`)
+      .join(',')}}`;
+  return JSON.stringify(value);
+}
+export const hash = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex');
+export function numeric(value: unknown): string {
+  if (typeof value !== 'string' || !/^[1-9]\d{0,19}$/.test(value))
+    throw new UserError('Invalid Jira identifier.');
+  return value;
+}
+export interface Context {
+  accountId: string;
+  projectId: string;
+  issueId?: string;
+}
+export interface Prompt {
+  id: string;
+  key: string;
+  name: string;
+  selectedOnly?: boolean;
+}
+export interface Issue {
+  id: string;
+  key: string;
+  fields: {
+    project: { id: string };
+    issuetype: { id: string };
+    summary: string;
+    description: unknown;
+    updated: string;
+    [key: string]: unknown;
+  };
+}
+export interface State {
+  ids: string[];
+  managed: ManagedBlock | null;
+  pending?: {
+    before: string;
+    after: string;
+    ids: string[];
+    managed: ManagedBlock | null;
+    attemptId?: string;
+    phase?: 'prepared' | 'submitted';
+    started?: number;
+    observed?: number;
+    /** Exact field value sent, and the requested block's skeleton (null when removed). */
+    keys?: string[];
+    shape?: string | null;
+    /** 'field': only the Agent Prompts field was written; hashes cover the field alone. */
+    scope?: 'field';
+  };
+}
+export interface Stored {
+  revision: number;
+  data: State;
+}
+export interface PromptPage {
+  prompts: Prompt[];
+  incomplete: boolean;
+  nextCursor?: string;
+  searchError?: string;
+}
+export interface PromptQuery {
+  query?: string;
+  cursor?: string;
+  limit: 10 | 20;
+}
+export function promptQuery(
+  input: { query?: unknown; cursor?: unknown; surface?: unknown } = {},
+): PromptQuery {
+  if (
+    (input.query !== undefined && (typeof input.query !== 'string' || input.query.length > 200)) ||
+    (input.cursor !== undefined &&
+      (typeof input.cursor !== 'string' || !input.cursor || input.cursor.length > 8192)) ||
+    (input.surface !== undefined && !['picker', 'library'].includes(String(input.surface)))
+  )
+    throw new UserError('Invalid prompt search. Use up to 200 characters.');
+  const query = (input.query as string | undefined)?.trim() ?? '';
+  return {
+    query,
+    ...(input.cursor ? { cursor: input.cursor as string } : {}),
+    limit: input.surface === 'picker' ? 10 : 20,
+  };
+}
+export interface Ports {
+  refreshAfterSave?(project: string): Promise<boolean>;
+  retainedTypes?(project: string): Promise<string[]>;
+  config(project: string): Promise<string | undefined>;
+  project(id: string): Promise<{
+    id: string;
+    key: string;
+    projectTypeKey: string;
+    style: string;
+    issueTypes: { id: string; name: string; subtask: boolean }[];
+  }>;
+  allowed(project: string, permission: string, issue?: string): Promise<void>;
+  search(project: string, type: string, input?: PromptQuery): Promise<PromptPage>;
+  issue(id: string, field?: string): Promise<Issue>;
+  field(): Promise<string>;
+  update(id: string, fields: Record<string, unknown>): Promise<void>;
+  get(id: string): Promise<Stored | undefined>;
+  cas(id: string, revision: number, data: State): Promise<void>;
+}
+const targetHash = (issue: Issue, field: string) =>
+  hash([issue.fields.description, issue.fields[field] ?? [], issue.fields.updated]);
+const contentHash = (issue: Issue, field: string) =>
+  hash([issue.fields.description, issue.fields[field] ?? []]);
+const fieldHash = (issue: Issue, field: string) => hash(['field', issue.fields[field] ?? []]);
+type Pending = NonNullable<State['pending']>;
+/** The hash a pending receipt's before/after values were computed with. */
+const receiptHash = (issue: Issue, field: string, pending: Pending) =>
+  pending.scope === 'field' ? fieldHash(issue, field) : contentHash(issue, field);
+const recoveryDelay = 120_000;
+function withoutPending(data: State): State {
+  return { ids: data.ids, managed: data.managed };
+}
+/** Jira applied the requested save but returned it in a different representation: the field is
+ * exactly what was sent and the one tracked block has the requested text and structure. */
+function adoptable(issue: Issue, field: string, pending: Pending) {
+  if (
+    pending.scope === 'field' ||
+    pending.phase === 'prepared' ||
+    !pending.keys ||
+    pending.shape === undefined ||
+    contentHash(issue, field) === pending.before
+  )
+    return false;
+  if (hash(issue.fields[field] ?? []) !== hash(pending.keys)) return false;
+  const localId =
+    pending.managed && !('mode' in pending.managed) ? pending.managed.localId : `npl-${issue.id}`;
+  try {
+    return matchesShape(issue.fields.description, localId, pending.shape);
+  } catch {
+    return false;
+  }
+}
+export interface SaveStatus {
+  pending: boolean;
+  revision?: number;
+  fingerprint?: string;
+  unchanged?: boolean;
+  /** Jira holds the requested save in a different representation; an administrator may accept it. */
+  adoptable?: boolean;
+  keys?: string[];
+  administrator?: boolean;
+  waitSeconds?: number;
+}
+interface RecoveryInput {
+  revision: number;
+  fingerprint: string;
+  acknowledged: boolean;
+}
+export function createService(p: Ports) {
+  async function scope(c: Context) {
+    numeric(c.projectId);
+    const type = await p.config(c.projectId);
+    if (!type)
+      throw new UserError(
+        'Open Agent Prompts for Jira → Project configuration to choose a ticket type first.',
+      );
+    return numeric(type);
+  }
+  async function target(c: Context, field: string) {
+    if (!c.issueId) throw new UserError('Open Agent Prompts on an existing ticket.');
+    const issue = await p.issue(numeric(c.issueId), field);
+    if (issue.id !== c.issueId || issue.fields.project.id !== c.projectId)
+      throw new UserError('Ticket context changed. Reopen the field.');
+    return issue;
+  }
+  async function state(c: Context, issue: Issue, field: string, allowPending = false) {
+    let stored = (await p.get(issue.id)) ?? { revision: 0, data: { ids: [], managed: null } };
+    if (stored.data.pending?.phase === 'prepared') {
+      // A sender must win another CAS before issuing its PUT. Cancelling a
+      // prepared claim fences that sender, even if its original response arrives late.
+      const data = withoutPending(stored.data);
+      await p.cas(issue.id, stored.revision, data);
+      stored = { revision: stored.revision + 1, data };
+    }
+    if (stored.data.pending) {
+      const pending = stored.data.pending;
+      const reconstructed =
+        pending.scope === 'field'
+          ? undefined
+          : recoverEmptyAttributes(issue.fields.description, pending.managed);
+      if (
+        receiptHash(issue, field, pending) !== pending.after &&
+        (!reconstructed || hash([reconstructed, issue.fields[field] ?? []]) !== pending.after)
+      ) {
+        if (allowPending) return stored;
+        throw new UserError(
+          'The previous save could not be verified. Check saved state; a Jira administrator can investigate an unchanged outcome.',
+        );
+      }
+      const managed =
+        pending.scope === 'field'
+          ? null
+          : observedManaged(issue.fields.description, pending.managed);
+      await p.cas(issue.id, stored.revision, { ids: pending.ids, managed });
+      stored = {
+        revision: stored.revision + 1,
+        data: { ids: pending.ids, managed },
+      };
+    }
+    // Older confirmed snapshots can also contain a fingerprint of empty attrs.
+    const reconstructed = recoverEmptyAttributes(issue.fields.description, stored.data.managed);
+    if (reconstructed) {
+      const managed = observedManaged(issue.fields.description, stored.data.managed);
+      if (hash(managed) !== hash(stored.data.managed)) {
+        await p.cas(issue.id, stored.revision, { ...stored.data, managed });
+        stored = { revision: stored.revision + 1, data: { ...stored.data, managed } };
+      }
+    }
+    return stored;
+  }
+  /** Shared guards for administrator recovery of an unresolved save: Administer Jira and Edit
+   * Issues, explicit acknowledgement, the exact revision and ticket the administrator inspected,
+   * a submitted (or legacy) record, and two minutes since the save started or was first seen. */
+  async function recoveryTarget(c: Context, input: RecoveryInput, action: string) {
+    if (
+      !Number.isSafeInteger(input.revision) ||
+      input.revision < 0 ||
+      typeof input.fingerprint !== 'string' ||
+      input.acknowledged !== true
+    )
+      throw new UserError(`Inspect Jira and acknowledge the previous save before ${action} it.`);
+    await p.allowed(c.projectId, 'ADMINISTER');
+    const field = await p.field();
+    const issue = await target(c, field);
+    await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
+    const stored = await p.get(issue.id);
+    const pending = stored?.data.pending;
+    if (
+      !stored ||
+      !pending ||
+      pending.phase === 'prepared' ||
+      stored.revision !== input.revision ||
+      targetHash(issue, field) !== input.fingerprint
+    )
+      throw new UserError('Saved state changed. Check saved state again.');
+    const started = pending.started ?? pending.observed;
+    if (started === undefined || !Number.isFinite(started) || Date.now() - started < recoveryDelay)
+      throw new UserError(`Wait two minutes and check saved state before ${action} this save.`);
+    return { issue, field, stored, pending };
+  }
+  async function releaseUnsent(issueId: string, attemptId: string) {
+    // A failed CAS can mean a concurrent writer won. Never release a claim by
+    // revision or identical content alone: only this invocation's unique attempt.
+    const current = await p.get(issueId);
+    if (current?.data.pending?.attemptId === attemptId)
+      await p.cas(issueId, current.revision, withoutPending(current.data));
+  }
+  return {
+    async saveStatus(c: Context): Promise<SaveStatus> {
+      const field = await p.field();
+      const issue = await target(c, field);
+      let stored = await state(c, issue, field, true);
+      let pending = stored.data.pending;
+      if (!pending) return { pending: false };
+      let administrator = false;
+      try {
+        await p.allowed(c.projectId, 'ADMINISTER');
+        await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
+        administrator = true;
+      } catch {
+        // Failure to establish administrator/edit rights never enables recovery.
+      }
+      if (administrator && pending.started === undefined && pending.observed === undefined) {
+        // Legacy receipts have no clock. Start an observation window rather than
+        // treating missing metadata as proof the original invocation has ended.
+        pending = { ...pending, observed: Date.now() };
+        await p.cas(issue.id, stored.revision, { ...stored.data, pending });
+        stored = { revision: stored.revision + 1, data: { ...stored.data, pending } };
+      }
+      const started = pending.started ?? pending.observed ?? Date.now();
+      return {
+        pending: true,
+        revision: stored.revision,
+        fingerprint: targetHash(issue, field),
+        unchanged: receiptHash(issue, field, pending) === pending.before,
+        adoptable: adoptable(issue, field, pending),
+        ...(pending.keys ? { keys: pending.keys } : {}),
+        administrator,
+        waitSeconds: Math.max(0, Math.ceil((started + recoveryDelay - Date.now()) / 1000)),
+      };
+    },
+    async resolveSave(c: Context, input: RecoveryInput) {
+      const { issue, field, stored, pending } = await recoveryTarget(c, input, 'releasing');
+      if (receiptHash(issue, field, pending) !== pending.before)
+        throw new UserError(
+          'The ticket differs from the pre-save state. Investigate in Jira; no recovery record was released.',
+        );
+      await p.cas(issue.id, stored.revision, withoutPending(stored.data));
+      return { resolved: true };
+    },
+    async acceptSave(c: Context, input: RecoveryInput) {
+      const { issue, field, stored, pending } = await recoveryTarget(c, input, 'accepting');
+      if (!adoptable(issue, field, pending))
+        throw new UserError(
+          'The ticket no longer matches the requested save. Investigate in Jira; nothing was accepted.',
+        );
+      // Adopt Jira's representation of the requested block; never write Jira here.
+      const managed = pending.shape
+        ? observedManaged(issue.fields.description, pending.managed)
+        : null;
+      await p.cas(issue.id, stored.revision, { ids: pending.ids, managed });
+      return { accepted: true };
+    },
+    async setup(c: Context) {
+      const project = await p.project(c.projectId);
+      requireCompanyManagedSoftware(project, c.projectId);
+      return { project, type: await p.config(c.projectId) };
+    },
+    async library(c: Context, input: Parameters<typeof promptQuery>[0] = {}) {
+      const query = promptQuery(input);
+      return p.search(c.projectId, await scope(c), query);
+    },
+    async read(c: Context, id: string) {
+      const type = await scope(c);
+      const issue = await p.issue(id);
+      if (issue.fields.project.id !== c.projectId || issue.fields.issuetype.id !== type)
+        throw new UserError('This issue is not a prompt in the selected project.');
+      return {
+        id: issue.id,
+        key: issue.key,
+        name: issue.fields.summary,
+        content: sourceContent({
+          type: 'doc',
+          version: 1,
+          content: snapshotContent(issue.fields.description),
+        }),
+      };
+    },
+    async load(c: Context) {
+      const type = await scope(c);
+      const field = await p.field();
+      const issue = await target(c, field);
+      const stored = await state(c, issue, field);
+      const cleanupOnly = issue.fields.issuetype.id === type;
+      if (cleanupOnly && !stored.data.ids.length)
+        throw new UserError(
+          'Prompt tickets cannot add other prompts; existing links can only be removed.',
+        );
+      let retainedUnavailable = false;
+      let refreshUnavailable = false;
+      const [library, retained, refreshAfterSave] = await Promise.all([
+        cleanupOnly
+          ? Promise.resolve({ prompts: [] as Prompt[], incomplete: false })
+          : p.search(c.projectId, type, { limit: 10 }).catch((): PromptPage => ({
+              prompts: [],
+              incomplete: true,
+              searchError:
+                'Could not load prompt suggestions. Your saved selections are still available. Retry search to find prompts.',
+            })),
+        (p.retainedTypes?.(c.projectId) ?? Promise.resolve<string[]>([])).catch((): string[] => {
+          retainedUnavailable = true;
+          return [];
+        }),
+        (p.refreshAfterSave?.(c.projectId) ?? Promise.resolve(false)).catch(() => {
+          refreshUnavailable = true;
+          return false;
+        }),
+      ]);
+      for (const id of stored.data.ids.filter(
+        (id) => !library.prompts.some((item) => item.id === id),
+      )) {
+        try {
+          const source = await p.issue(id);
+          if (
+            source.fields.project.id === c.projectId &&
+            (source.fields.issuetype.id === type || retained.includes(source.fields.issuetype.id))
+          )
+            library.prompts.push({
+              id,
+              key: source.key,
+              name:
+                source.fields.issuetype.id === type
+                  ? source.fields.summary
+                  : `${source.fields.summary} (previous type)`,
+              ...(source.fields.issuetype.id === type ? {} : { selectedOnly: true }),
+            });
+        } catch {
+          /* Inaccessible sources remain removable without exposing their content. */
+        }
+      }
+      const loadWarning = [
+        retainedUnavailable
+          ? 'Previous prompt types could not be checked. Saved selections can still be removed.'
+          : '',
+        refreshUnavailable
+          ? 'The ticket reload preference could not be checked. Reload the ticket manually after saving.'
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+      return {
+        ...library,
+        cleanupOnly,
+        refreshAfterSave,
+        ...(loadWarning ? { loadWarning } : {}),
+        ids: stored.data.ids,
+        revision: stored.revision,
+        fingerprint: targetHash(issue, field),
+      };
+    },
+    async save(c: Context, input: { ids: string[]; revision: number; fingerprint: string }) {
+      if (
+        !Array.isArray(input.ids) ||
+        input.ids.length > 5 ||
+        new Set(input.ids).size !== input.ids.length ||
+        !Number.isInteger(input.revision) ||
+        typeof input.fingerprint !== 'string'
+      )
+        throw new UserError('Choose up to five distinct prompts.');
+      input.ids.forEach(numeric);
+      const type = await scope(c);
+      const field = await p.field();
+      const issue = await target(c, field);
+      await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
+      if (input.ids.includes(issue.id)) throw new UserError('Prompts cannot link other prompts.');
+      const stored = await state(c, issue, field);
+      if (
+        issue.fields.issuetype.id === type &&
+        (!stored.data.ids.length || input.ids.some((id) => !stored.data.ids.includes(id)))
+      )
+        throw new UserError('Prompt tickets can only remove their existing prompt links.');
+      if (stored.revision !== input.revision || targetHash(issue, field) !== input.fingerprint)
+        throw new UserError('The ticket changed. Review your selection and save again.');
+      const sources = await Promise.all(input.ids.map((id) => p.issue(id)));
+      const needsRetainedType = sources.some(
+        (source) =>
+          source.fields.project.id === c.projectId &&
+          source.fields.issuetype.id !== type &&
+          stored.data.ids.includes(source.id),
+      );
+      const retained = needsRetainedType ? ((await p.retainedTypes?.(c.projectId)) ?? []) : [];
+      const prompts = sources.map((source) => {
+        if (
+          source.fields.project.id !== c.projectId ||
+          (source.fields.issuetype.id !== type &&
+            !(stored.data.ids.includes(source.id) && retained.includes(source.fields.issuetype.id)))
+        )
+          throw new UserError(
+            'A selected prompt moved or changed type. Remove it from your selection.',
+          );
+        if (source.id !== input.ids[sources.indexOf(source)])
+          throw new UserError('Jira returned a different source. Reopen the field.');
+        try {
+          return {
+            id: source.id,
+            name: `${source.key}: ${source.fields.summary}`,
+            content: snapshotContent(source.fields.description),
+          };
+        } catch (error) {
+          if (error instanceof DescriptionError)
+            throw new UserError(`${source.key}: ${error.message}`);
+          throw error;
+        }
+      });
+      const next = synchronizeDescription(
+        issue.fields.description,
+        prompts,
+        stored.data.managed,
+        `npl-${issue.id}`,
+      );
+      const keys = sources.map((s) => s.key);
+      const fresh = await target(c, field);
+      if (targetHash(fresh, field) !== input.fingerprint)
+        throw new UserError('The ticket changed. Review your selection and save again.');
+      // A block the user already deleted is forgotten by clearing only the field: the
+      // Description is never rewritten on that path.
+      const fields = next.forgotten
+        ? { [field]: keys }
+        : { description: next.description, [field]: keys };
+      const pending: Pending = next.forgotten
+        ? {
+            before: fieldHash(issue, field),
+            after: hash(['field', keys]),
+            ids: input.ids,
+            managed: null,
+            scope: 'field',
+          }
+        : {
+            before: contentHash(issue, field),
+            after: hash([next.description, keys]),
+            ids: input.ids,
+            managed: next.managed,
+            keys,
+            shape: next.shape,
+          };
+      // An unchanged write cannot be distinguished from an in-flight write by
+      // recovery. Never publish such a claim or send a redundant Jira update.
+      if (pending.before === pending.after) {
+        const data = { ids: input.ids, managed: next.managed };
+        const changed = hash(data) !== hash(stored.data);
+        if (changed) await p.cas(issue.id, stored.revision, data);
+        return {
+          revision: stored.revision + (changed ? 1 : 0),
+          fingerprint: targetHash(fresh, field),
+          ids: input.ids,
+        };
+      }
+      const attemptId = randomUUID();
+      const prepared = { ...pending, attemptId, phase: 'prepared' as const, started: Date.now() };
+      try {
+        await p.cas(issue.id, stored.revision, { ...stored.data, pending: prepared });
+        await p.cas(issue.id, stored.revision + 1, {
+          ...stored.data,
+          pending: { ...prepared, phase: 'submitted' },
+        });
+      } catch {
+        try {
+          await releaseUnsent(issue.id, attemptId);
+        } catch {
+          throw new UserError(
+            'The save was not sent to Jira, but its storage claim could not be released. Check saved state.',
+          );
+        }
+        throw new UserError('The save was not sent to Jira. Review your selection and save again.');
+      }
+      try {
+        await p.update(issue.id, fields);
+      } catch (error) {
+        if (error instanceof JiraRejected) {
+          try {
+            await p.cas(issue.id, stored.revision + 2, stored.data);
+          } catch {
+            throw new UserError(
+              'Jira rejected the save, but its status could not be verified. Reopen this field.',
+            );
+          }
+          throw new UserError(error.message);
+        }
+        throw new UserError('The save could not be confirmed.');
+      }
+      const observed = await target(c, field);
+      let managed = pending.managed;
+      if (receiptHash(observed, field, pending) !== pending.after) {
+        // Jira confirmed the write (2xx) but returned another representation. While this
+        // invocation still holds the claim, adopt it if the field and block skeleton match.
+        if (!adoptable(observed, field, { ...pending, phase: 'submitted' }))
+          throw new UserError('The saved ticket did not match the requested change.');
+        managed = pending.shape
+          ? observedManaged(observed.fields.description, pending.managed)
+          : null;
+      }
+      await p.cas(issue.id, stored.revision + 2, { ids: input.ids, managed });
+      return {
+        revision: stored.revision + 3,
+        fingerprint: targetHash(observed, field),
+        ids: input.ids,
+      };
+    },
+  };
+}

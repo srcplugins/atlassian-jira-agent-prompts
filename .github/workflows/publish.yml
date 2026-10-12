@@ -1,0 +1,164 @@
+# Shared srcplugins file, synchronized across repositories.
+name: Publish
+
+# Manual release to Forge production with verifiable provenance. Run it for a pushed vX.Y.Z tag
+# on main: it checks the tag and source, uploads one Forge build tagged with the commit (stamped
+# into the app's settings page), attests that bundle, runs the release suite against exactly that
+# build on development, then, with the owner's approval of the `production` environment, deploys
+# the same build to production and writes the GitHub release notes. `production: false` rehearses
+# everything except the production deployment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z), already pushed and on main
+        required: true
+      production:
+        description: Deploy the tested build to production (off rehearses)
+        type: boolean
+        default: true
+      approve_major:
+        description: Approve a major version (scope or egress change) after reviewing the manifest diff
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Check, build and attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: acceptance
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      build: ${{ steps.build.outputs.build }}
+      sha: ${{ steps.source.outputs.sha }}
+      attestation: ${{ steps.attest.outputs.attestation-url }}
+    env:
+      TAG: ${{ inputs.tag }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag is a release on main
+        id: source
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag must be vX.Y.Z"; exit 1; }
+          [ "v$(node -p "require('./package.json').version")" = "$TAG" ] ||
+            { echo "::error::package.json version differs from $TAG"; exit 1; }
+          git merge-base --is-ancestor HEAD origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+        run: git config --global url."https://${TOKEN:+x-access-token:$TOKEN@}github.com/".insteadOf ssh://git@github.com/
+      - name: Install and check
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+          npm run check
+      - name: Upload one Forge build of the tagged commit
+        id: build
+        env:
+          SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          sed -i "s/^export const build = 'development';$/export const build = '${SHA::12}';/" src/build-info.ts
+          grep -q "'${SHA::12}'" src/build-info.ts || { echo "::error::Build stamp failed"; exit 1; }
+          build="$TAG-${SHA::12}-$GITHUB_RUN_ID"
+          node config/forge.mjs settings set usage-analytics false
+          node config/forge.mjs build --tag "$build" --inspect --non-interactive
+          tar -czf "$RUNNER_TEMP/forge-bundle.tgz" -C .forge inspect
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+      - name: Attest the uploaded bundle
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/forge-bundle.tgz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: forge-bundle
+          path: ${{ runner.temp }}/forge-bundle.tgz
+          retention-days: 90
+
+  test:
+    name: Release suite on the build
+    needs: build
+    uses: ./.github/workflows/hosted.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+      deploy_tag: ${{ needs.build.outputs.build }}
+      suite: release
+    secrets: inherit
+
+  production:
+    name: Deploy the tested build to production
+    needs: [build, test]
+    if: inputs.production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+      BUILD: ${{ needs.build.outputs.build }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+        run: git config --global url."https://${TOKEN:+x-access-token:$TOKEN@}github.com/".insteadOf ssh://git@github.com/
+      - name: Install
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+      - name: Deploy the same build to production
+        env:
+          FORGE_ALLOW_PRODUCTION: '1'
+          APPROVE_MAJOR: ${{ inputs.approve_major }}
+        run: |
+          node config/forge.mjs settings set usage-analytics false
+          approve=()
+          [ "$APPROVE_MAJOR" = "true" ] && approve=(--approve MAJOR_VERSION_RULE)
+          # Without approve_major, a major version stops here with the linter's reason.
+          node config/forge.mjs deploy --tag "$BUILD" -e production --non-interactive "${approve[@]}"
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.build.outputs.sha }}
+          ATTESTATION: ${{ needs.build.outputs.attestation }}
+        run: |
+          notes="Deployed to Forge production from commit $SHA as build $BUILD. Build provenance: $ATTESTATION. Release changes are in CHANGELOG.md."
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$notes"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes"
+          fi
+          echo "$TAG deployed to production as build $BUILD." >> "$GITHUB_STEP_SUMMARY"

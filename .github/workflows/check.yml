@@ -1,0 +1,34 @@
+# Shared srcplugins file, synchronized across repositories.
+name: Check
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      # GitHub dependencies (the test framework) install over HTTPS. While the framework is
+      # private, a read-only token authorizes it; without the token the fetch is anonymous.
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+        run: git config --global url."https://${TOKEN:+x-access-token:$TOKEN@}github.com/".insteadOf ssh://git@github.com/
+      - name: Verified Forge CLI archive
+        run: node config/prepare-forge-cli.mjs
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - name: Production dependency advisories
+        run: npm audit --omit=dev --audit-level=low

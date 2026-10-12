@@ -1,0 +1,128 @@
+// Shared srcplugins file, synchronized across repositories.
+// @ts-check
+// Jira request and input helpers shared by plugins (synchronized to src/shared/jira.mjs).
+
+/** A failure whose message is safe to show the user. Anything else becomes a generic message. */
+export class UserError extends Error {}
+
+/** A non-2xx Jira response. The status is kept so callers can classify write outcomes. */
+export class JiraHttpError extends UserError {
+  /** @param {number} status @param {string} [message] */
+  constructor(status, message) {
+    super(message ?? `Jira request failed (HTTP ${status}). Check your access or try again later.`);
+    this.status = status;
+  }
+}
+
+// Statuses Jira documents as rejecting a write before applying it, per endpoint. 429 is included:
+// Jira refuses rate-limited requests before processing them. Anything else (5xx, transport
+// failures, unreadable success bodies) leaves the outcome uncertain and must be reconciled by
+// reading, never retried.
+const definitiveRejections = {
+  'issue-edit': [400, 401, 403, 404, 409, 422, 429],
+  'issuetype-create': [400, 401, 403, 409, 429],
+  'issuetypescheme-add': [400, 401, 403, 404, 429],
+};
+
+/**
+ * Whether a write's HTTP status proves Jira did not apply it.
+ * @param {keyof typeof definitiveRejections} operation
+ * @param {number} status
+ */
+export function isDefinitiveRejection(operation, status) {
+  const statuses = definitiveRejections[operation];
+  if (!statuses) throw Error(`Unknown Jira write operation: ${operation}`);
+  return statuses.includes(status);
+}
+
+/** @param {unknown} value @returns {value is Record<string, unknown>} */
+const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const projectKeyPattern = /^[A-Z][A-Z0-9_]{1,49}$/;
+
+/**
+ * The invoking user's account ID from a Rovo action context. Never read identity from the payload.
+ * @param {unknown} context
+ */
+export function rovoAccountId(context) {
+  const accountId = isRecord(context) && isRecord(context.principal) && context.principal.accountId;
+  if (typeof accountId !== 'string' || !accountId.trim())
+    throw new UserError('Authenticated user context is required.');
+  return accountId;
+}
+
+/** @param {unknown} value @returns {string} */
+export function requireProjectKey(value) {
+  if (typeof value !== 'string' || !projectKeyPattern.test(value))
+    throw new UserError('Provide one explicit uppercase project key.');
+  return value;
+}
+
+/**
+ * The project ID from a project-page resolver context.
+ * @param {unknown} context
+ */
+export function projectContext(context) {
+  const extension = isRecord(context) && isRecord(context.extension) ? context.extension : {};
+  const id = isRecord(extension.project) ? String(extension.project.id ?? '') : '';
+  if (
+    !isRecord(context) ||
+    typeof context.accountId !== 'string' ||
+    !context.accountId.trim() ||
+    !/^[1-9]\d*$/.test(id)
+  )
+    throw new UserError('Open this app in a Jira project.');
+  return { accountId: context.accountId, projectId: id };
+}
+
+/**
+ * Rejects payload fields an operation does not accept.
+ * @param {unknown} [payload]
+ */
+export function requireEmptyPayload(payload = {}) {
+  if (!isRecord(payload) || Object.keys(payload).length)
+    throw new UserError('This operation does not accept custom inputs.');
+}
+
+/**
+ * Confirms the response is the requested company-managed Jira Software project.
+ * @param {unknown} project
+ * @param {string} idOrKey The numeric ID or key that was requested.
+ */
+export function requireCompanyManagedSoftware(project, idOrKey) {
+  if (!isRecord(project) || (String(project.id) !== idOrKey && project.key !== idOrKey))
+    throw new UserError('Project context does not match.');
+  if (project.projectTypeKey !== 'software' || project.style !== 'classic')
+    throw new UserError('Company-managed Jira Software projects only.');
+  return project;
+}
+
+/**
+ * Reads JSON as the invoking user. Transport failures, non-2xx responses (as JiraHttpError) and
+ * unreadable bodies become UserErrors; nothing is retried.
+ * @param {Pick<import('@forge/api').FetchAPI, 'asUser'>} api
+ */
+export function jiraReader(api) {
+  /**
+   * @param {import('@forge/api').Route} path
+   * @param {{ method?: string, headers?: Record<string, string>, body?: string }} [options]
+   */
+  return async (path, options = {}) => {
+    let response;
+    try {
+      response = await api.asUser().requestJira(path, {
+        method: 'GET',
+        ...options,
+        headers: { Accept: 'application/json', ...options.headers },
+      });
+    } catch {
+      throw new UserError('Jira connection failed. Try again.');
+    }
+    if (!response.ok) throw new JiraHttpError(response.status);
+    try {
+      return await response.json();
+    } catch {
+      throw new UserError('Jira returned unreadable data.');
+    }
+  };
+}

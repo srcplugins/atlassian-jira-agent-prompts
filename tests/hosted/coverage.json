@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "features": [
+    {
+      "id": "NPL-01",
+      "behavior": "Lazy native field, server-side search, ordinary source snapshots, explicit refresh and precise unlink",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Disposable native Prompt and Task in owned PLSNATIVE",
+      "assertion": "Exact unrelated ADF and custom field readback; expander contains complete source text; zero unopened calls; bounded server search; source edit stays local until explicit Sync",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/service.test.mjs",
+        "tests/boundary.test.mjs",
+        "tests/snapshots.test.mjs",
+        "tests/handler-save.test.mjs"
+      ]
+    },
+    {
+      "id": "NPL-02",
+      "behavior": "Explicit project health, simplified details and cancelled modal review",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Disposable marked issue in owned PLSNATIVE",
+      "assertion": "Actual field editability; accessible type selector; cancellation preserves configuration revision and exact Jira fields",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/settings.test.mjs", "tests/boundary.test.mjs"]
+    },
+    {
+      "id": "NPL-11",
+      "behavior": "Details modal focus, contrast and layout in dark theme and at narrow width",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Disposable marked issue in owned PLSNATIVE; owner theme journaled and restored",
+      "assertion": "Focus inside the modal and returned to View details on Escape; settings links open a new tab; heading contrast at least 4.5:1; modal within a 640 px viewport without horizontal overflow; configuration and exact Jira fields unchanged",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/settings.test.mjs", "tests/boundary.test.mjs"]
+    },
+    {
+      "id": "NPL-03",
+      "behavior": "Initially null Description link/unlink and recovery after reopening",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Disposable marked Prompt and null-Description Task in PLSNATIVE",
+      "assertion": "Exact empty ADF after unlink; cleared custom field; editor opens without a pending-save error",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs"]
+    },
+    {
+      "id": "NPL-04",
+      "behavior": "Opt-in real non-admin setup denial after successful backend eligibility",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Existing saved member/restricted sessions; read-only PLSNATIVE; NATIVE_IDENTITY_TESTS=1",
+      "assertion": "Distinct identities; independent ADMINISTER=false; successful setup initialization then actual settings-projects permission denial and no Apply control",
+      "cleanup": "persistent-read-only",
+      "lowerLevelTests": ["tests/settings.test.mjs", "tests/settings-ui.test.mjs"]
+    },
+    {
+      "id": "NPL-05",
+      "behavior": "Unified global configuration with explicit selected health checks and all-page selection",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Owned PLSNATIVE with normal project lock; read-only global configure page",
+      "assertion": "All matching projects selected across table pages; cancelled review preserves selection and checked health; explicitly checked details preserve independent Jira project facts; only inventory, health and saved-progress/catalog reads",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/health-ui.test.mjs", "tests/wizard-ui.test.mjs"]
+    },
+    {
+      "id": "NPL-06",
+      "behavior": "Failed plain-text source save and read-only recovery preserve an unsaved selection",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Owned synthetic plain-text Prompt and target tickets in PLSNATIVE",
+      "assertion": "Source-specific error; unsaved selection retained after automatic read-only reconciliation; explicit discard; independent unchanged source and target fields",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/field-ui.test.mjs",
+        "tests/service.test.mjs",
+        "tests/save-accept.test.mjs",
+        "tests/interleave.test.mjs"
+      ]
+    },
+    {
+      "id": "NPL-07",
+      "behavior": "Native Create dialog preselects project/type and uses the minimal ordinary-text Prompt form",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Journal-owned Prompt in PLSNATIVE after its documented minimal screen/workflow configuration",
+      "assertion": "Actual native create/cancel; only Summary and Description content inputs; exact ordinary source ADF; fixed status and zero transitions",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/boundary.test.mjs", "tests/snapshots.test.mjs"]
+    },
+    {
+      "id": "NPL-08",
+      "behavior": "Opt-in reload after confirmed linking and native project/type search links",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Owned PLSNATIVE lock; journaled source/target and saved reload preference baseline",
+      "assertion": "Preference round-trip; actual main-frame navigation only after save; independent exact ADF/custom field; native rendered copied text; NPL-01/03 verify search JQL IDs",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/field-ui.test.mjs", "tests/settings.test.mjs"]
+    },
+    {
+      "id": "NPL-09",
+      "behavior": "Single searchable dropdown, newest suggestions, cursor pages, stable selections and Jira themes",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "21 journaled native Prompt tickets and one Task in owned PLSNATIVE",
+      "assertion": "Independent newest-first Jira IDs; ten initial picker suggestions, ten-result picker and twenty-result library pages; reordered multiword search and older exact-key lookup; retained draft labels; keyboard selection and label contrast in light/dark themes; unchanged target",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/prompt-search.test.mjs",
+        "tests/boundary.test.mjs",
+        "tests/field-ui.test.mjs"
+      ]
+    },
+    {
+      "id": "NPL-10",
+      "behavior": "A prompt block deleted in Jira refuses Sync with guidance and is forgotten by a field-only save",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Owned synthetic Prompt and target tickets in PLSNATIVE; the block is deleted through REST",
+      "assertion": "Sync rejected with the remove-all-first message and no Jira change; removing the prompt clears only the field; Description identical to the user's edit",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/save-accept.test.mjs", "tests/snapshots.test.mjs"]
+    }
+  ],
+  "manualJourneys": [
+    {
+      "id": "ROVO-NPL-02",
+      "method": "manual-browser",
+      "automated": false,
+      "version": "development 3.14.0",
+      "fixture": "One journaled disposable plain-text PLSNATIVE ticket with withheld Description marker; owner session; two fresh chats",
+      "assertion": "Exact-ticket read action; accurate summary and withheld marker in both responses; independently unchanged ticket. Synced-block comparison and external-agent handoff remain separate unexecuted cases.",
+      "cleanup": "Guarded fixture deletion independently confirmed; journal clean",
+      "lowerLevelTests": ["tests/description-rovo.test.mjs"]
+    }
+  ],
+  "scriptedJourneys": [
+    {
+      "id": "NPL-SETUP",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-setup.mjs",
+      "optIn": "NATIVE_SETUP_TESTS",
+      "command": "NATIVE_SETUP_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-setup.mjs run",
+      "fixture": "Two uniquely marked empty company-managed projects with dedicated schemes; optional NATIVE_SETUP_SHARED=1 creates three owned projects sharing one scheme, selects two and leaves one unconfigured",
+      "assertion": "Exact selected project snapshot; one global type and one addition per scheme; shared mode requires affected-project acknowledgment, two app mappings and no mapping for the unselected third project; repeated existing-type configuration; rename/shared repair/replacement; independent scheme deltas and zero issues; browser-response-loss recovery",
+      "cleanup": "Exact type/project/scheme ownership and mappings checked before deletion; durable recovery journal; independent absence",
+      "version": "development 3.25.0 (shared mode); earlier dedicated mode in report",
+      "lowerLevelTests": [
+        "tests/hosted-setup.test.mjs",
+        "tests/settings.test.mjs",
+        "tests/wizard.test.mjs",
+        "tests/wizard-ui.test.mjs",
+        "tests/project-reads.test.mjs"
+      ]
+    },
+    {
+      "id": "ROVO-NPL-01",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-rovo.mjs",
+      "optIn": "NATIVE_ROVO_TESTS",
+      "command": "NATIVE_ROVO_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-rovo.mjs",
+      "fixture": "One journal-owned ordinary-description PLSNATIVE source in the current configured type; consenting owner session; shared project lock; existing unresolved scale journal blocks execution",
+      "assertion": "Actual app catalog includes the fixture; two fresh chats search its exact key and retrieve its withheld name, then read complete normalized instructions withheld from chat input; independent Jira inventory unchanged throughout reads",
+      "cleanup": "Exact run-owned fixture deleted with guarded verification; complete original inventory restored; private UUID artifacts retained, failed reads remain failed",
+      "version": "Current ordinary-description runner not run hosted; historical native-source reads passed on development 3.5.0",
+      "lowerLevelTests": ["tests/hosted-rovo.test.mjs", "tests/boundary.test.mjs"]
+    },
+    {
+      "id": "NPL-LIFECYCLE-PRODUCTION",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-lifecycle.mjs",
+      "optIn": "NATIVE_LIFECYCLE_TESTS",
+      "command": "NATIVE_LIFECYCLE_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> PLUGIN_TEST_ENVIRONMENT=production node tests/hosted/verify-lifecycle.mjs production",
+      "fixture": "Marked company-managed PLSNATIVE; exact owner, nc-admin and nc-user sessions; existing Story type only",
+      "assertion": "nc-admin configures without Jira scheme changes; nc-user ADMINISTER=false and administration denial; existing NPL-01 and NPL-03 snapshot, Sync and unlink assertions with independent Jira readbacks",
+      "cleanup": "Site-specific durable fixture journal and project lock; explicit cleanup <run-uuid>; verified issue absence and configuration unlink. Interrupted runs require inspection.",
+      "version": "Current installed production",
+      "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
+    },
+    {
+      "id": "NPL-LIFECYCLE-REINSTALL",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-lifecycle.mjs",
+      "optIn": "NATIVE_LIFECYCLE_TESTS",
+      "command": "NATIVE_LIFECYCLE_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> PLUGIN_TEST_ENVIRONMENT=development node tests/hosted/verify-lifecycle.mjs reinstall-prepare; authorized uninstall/reinstall; reinstall-verify <run-uuid>",
+      "fixture": "Marked company-managed PLSNATIVE; exact owner, nc-admin and nc-user sessions; existing Story type only",
+      "assertion": "Exact Jira source and copied Description retained during uninstall; original field restored on reinstall; absent configuration; old-copy adoption refused unchanged; explicit repair and fresh link/Sync/unlink work",
+      "cleanup": "Site-specific durable fixture journal and project lock; explicit cleanup <run-uuid>; verified issue absence and configuration unlink. Interrupted runs require inspection.",
+      "version": "Current development; verified uninstall and reinstall required",
+      "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
+    },
+    {
+      "id": "NPL-LIFECYCLE-UPGRADE",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-lifecycle.mjs",
+      "optIn": "NATIVE_LIFECYCLE_TESTS",
+      "command": "NATIVE_LIFECYCLE_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> PLUGIN_TEST_ENVIRONMENT=development node tests/hosted/verify-lifecycle.mjs upgrade-prepare; repeat with NATIVE_LIFECYCLE_PROJECT=secondary; authorized development deployment; upgrade-verify <run-uuid>",
+      "fixture": "PLSNATIVE and PLSSBOX with exact owner session; two guarded project journals; existing Story types",
+      "assertion": "Exact mappings, revisions, reload preference, source, Description and field survive minor development deployment; pre-upgrade target still Syncs and unlinks",
+      "cleanup": "Site-specific durable fixture journal and project lock; explicit cleanup <run-uuid>; verified issue absence and configuration unlink. Interrupted runs require inspection.",
+      "version": "Current development; verified new deployment required",
+      "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
+    },
+    {
+      "id": "NPL-LIFECYCLE-ISOLATION",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-lifecycle.mjs",
+      "optIn": "NATIVE_LIFECYCLE_TESTS",
+      "command": "NATIVE_LIFECYCLE_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> PLUGIN_TEST_ENVIRONMENT=development node tests/hosted/verify-lifecycle.mjs isolation-prepare / isolation-probe <source-run-uuid>; NATIVE_TENANT_ISOLATION=1 NATIVE_LIFECYCLE_PROJECT=secondary on each owned host",
+      "fixture": "Same-key marked PLSISO projects on primary and isolation sites; exact owner sessions",
+      "assertion": "Configuration remains independent; library and picker exclude foreign names and IDs; forged foreign-ID save is refused with exact Jira source/target unchanged on both tenants",
+      "cleanup": "Site-specific durable fixture journal and project lock; explicit cleanup <run-uuid>; verified issue absence and configuration unlink. Interrupted runs require inspection.",
+      "version": "Current development; Rovo eligibility checked separately",
+      "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
+    }
+  ]
+}

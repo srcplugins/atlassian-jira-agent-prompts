@@ -1,0 +1,9 @@
+# Shared srcplugins file, synchronized across repositories.
+node_modules/
+static/
+.forge/
+.container-service-assets/
+.local/
+coverage/
+package-lock.json
+tsconfig.base.json

@@ -1,0 +1,960 @@
+import { editor, snapshotJourney } from './support/native-snapshots.mjs';
+import {
+  expect,
+  installation,
+  projectPage,
+  themeTest as test,
+  textContrast,
+  observeAction,
+  client,
+  adf,
+} from '@srcplugins/atlassian-forge-test-framework/jira';
+import {
+  activeTarget,
+  fixtureProject,
+  isMarker,
+  markers,
+} from '@srcplugins/atlassian-forge-test-framework/core';
+import { agentPromptsFixture } from './support/fixture.mjs';
+test.use({
+  fixtureApp: agentPromptsFixture,
+  themePage: { app: 'agent-prompts', project: fixtureProject(agentPromptsFixture) },
+});
+test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
+  test.skip(
+    process.env.NATIVE_IDENTITY_TESTS !== '1',
+    'Explicit identity mode and saved consenting actors required',
+  );
+  const api = client(jiraRequest);
+  const project = await api('/project/PLSNATIVE');
+  expect(isMarker(project.description, markers.browserProject(agentPromptsFixture))).toBe(true);
+  const owner = await api('/myself');
+  const actors = new Set([owner.accountId]);
+  for (const role of ['member', 'restricted']) {
+    const context = await browser.newContext({
+      storageState: `${activeTarget().authDirectory}/${role}.json`,
+    });
+    try {
+      const actorApi = client(context.request);
+      const actor = await actorApi('/myself');
+      expect(actor.accountId).toBeTruthy();
+      expect(actors.has(actor.accountId)).toBe(false);
+      actors.add(actor.accountId);
+      const permissions = await actorApi(
+        `/mypermissions?projectId=${project.id}&permissions=ADMINISTER,BROWSE_PROJECTS`,
+      );
+      expect(permissions.permissions.ADMINISTER.havePermission).toBe(false);
+      expect(permissions.permissions.BROWSE_PROJECTS.havePermission).toBe(true);
+      const page = await context.newPage();
+      const t = installation('agent-prompts');
+      try {
+        await observeAction(
+          page,
+          'setup',
+          () =>
+            page.goto(
+              `${activeTarget().site}/jira/software/projects/${project.key}/apps/${t.appId}/${t.environmentId}`,
+            ),
+          t,
+        );
+      } catch (error) {
+        await page.screenshot({
+          path: `${activeTarget().directory}/${role}-native-eligibility.png`,
+          fullPage: true,
+        });
+        throw error;
+      }
+      await expect(
+        observeAction(
+          page,
+          'settings-projects',
+          () => page.getByRole('button', { name: 'Project configuration', exact: true }).click(),
+          t,
+        ),
+      ).rejects.toMatchObject({ category: 'resolver-failed' });
+      await expect(
+        page.getByText('Missing Jira permission: ADMINISTER.', { exact: true }).first(),
+      ).toBeVisible();
+      await expect(
+        page.getByRole('button', { name: 'Configure selected', exact: true }),
+      ).toBeDisabled();
+      await expect(page.getByRole('button', { name: 'Apply changes', exact: true })).toHaveCount(0);
+    } finally {
+      await context.close();
+    }
+  }
+});
+for (const blank of [false, true]) {
+  test(`${blank ? 'NPL-03 blank Description round-trip' : 'NPL-01 prompt snapshots, explicit Sync and precise unlink'}`, async ({
+    page,
+    owned,
+  }, testInfo) => {
+    await snapshotJourney({ page, owned, blank, testInfo });
+  });
+}
+
+async function configuration(page, owned, global = false) {
+  const t = installation('agent-prompts');
+  if (!global) await projectPage(page, 'agent-prompts', owned.project.key);
+  if (global)
+    await page.goto(
+      `${activeTarget().site}/jira/settings/apps/configure/${t.appId}/${t.environmentId}`,
+    );
+  else await page.getByRole('button', { name: 'Project configuration', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Find a project', exact: true })).toBeEnabled({
+    timeout: 60000,
+  });
+  await page.getByRole('textbox', { name: 'Find a project', exact: true }).fill(owned.project.key);
+  await page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }).click();
+  const health = await observeAction(
+    page,
+    'settings-health',
+    () => page.getByRole('button', { name: 'Check selected', exact: true }).click(),
+    t,
+    owned.project.id,
+  );
+  return health;
+}
+async function details(page, key) {
+  await page
+    .getByRole('row')
+    .filter({ has: page.getByRole('checkbox', { name: `Select ${key}`, exact: true }) })
+    .getByRole('button', { name: 'View details', exact: true })
+    .click();
+}
+
+test('NPL-02 selected project health and cancelled modal preserve Jira', async ({
+  page,
+  owned,
+}) => {
+  const t = installation('agent-prompts');
+  const issue = await owned.issue('Native setup read-only baseline');
+  const before = await owned.api(`/issue/${issue.id}?fields=description,issuetype`);
+  const health = await configuration(page, owned);
+  expect(health.checks.every((c) => c.ok)).toBe(true);
+  await details(page, owned.project.key);
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Issue key', exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole('heading', { name: 'Jira configuration', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Issue key', exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole('dialog').getByRole('link', { name: 'View in Jira', exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole('button', { name: 'Reconfigure project', exact: true }).click();
+  const plan = await observeAction(
+    page,
+    'wizard-preview',
+    () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
+    t,
+  );
+  expect(plan.type).toBe(health.state.data.type);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Find a project', exact: true })).toBeEnabled();
+  await expect(
+    page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }),
+  ).toBeChecked();
+  const after = await observeAction(
+    page,
+    'settings-health',
+    () => page.getByRole('button', { name: 'Check selected', exact: true }).click(),
+    t,
+    owned.project.id,
+  );
+  expect(after.state).toEqual(health.state);
+  expect((await owned.api(`/issue/${issue.id}?fields=description,issuetype`)).fields).toEqual(
+    before.fields,
+  );
+});
+
+test('NPL-11 details modal keeps focus, contrast and layout in dark theme and narrow width', async ({
+  page,
+  owned,
+  theme,
+}) => {
+  const t = installation('agent-prompts');
+  const issue = await owned.issue('Details appearance baseline');
+  const before = await owned.api(`/issue/${issue.id}?fields=description,issuetype`);
+  const dialog = page.getByRole('dialog');
+  const viewDetails = page
+    .getByRole('row')
+    .filter({
+      has: page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }),
+    })
+    .getByRole('button', { name: 'View details', exact: true });
+  for (const [name, viewport] of [
+    ['Dark', { width: 1440, height: 1100 }],
+    ['Dark', { width: 640, height: 900 }],
+    ['Light', { width: 640, height: 900 }],
+  ]) {
+    // The theme menu is in the account menu, which narrow layouts collapse.
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await theme(name);
+    await page.setViewportSize(viewport);
+    await configuration(page, owned);
+    await expect(page.locator('html')).toHaveAttribute('data-color-mode', name.toLowerCase());
+    await viewDetails.click();
+    await expect(
+      dialog.getByRole('heading', { name: 'Jira configuration', exact: true }),
+    ).toBeVisible();
+    // Measure only once the open animation has finished and the modal is fully opaque.
+    await expect
+      .poll(() =>
+        dialog.evaluate((element) => {
+          let opacity = 1;
+          for (let node = element; node; node = node.parentElement)
+            opacity *= Number(getComputedStyle(node).opacity);
+          return opacity;
+        }),
+      )
+      .toBe(1);
+    // Focus moves into the modal, and every settings link opens a new tab.
+    expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+    const links = dialog.getByRole('link');
+    expect(await links.count()).toBeGreaterThanOrEqual(2);
+    for (const link of await links.all()) await expect(link).toHaveAttribute('target', '_blank');
+    await textContrast(dialog.getByRole('heading', { name: 'Jira configuration', exact: true }));
+    const box = await dialog.boundingBox();
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
+    expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(
+      true,
+    );
+    await page.screenshot({
+      path: `${activeTarget().runs}/${owned.run.state.runId}-details-${name.toLowerCase()}-${viewport.width}.png`,
+      fullPage: true,
+    });
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(viewDetails).toBeFocused();
+  }
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  const after = await observeAction(
+    page,
+    'settings-health',
+    () => page.getByRole('button', { name: 'Check selected', exact: true }).click(),
+    t,
+    owned.project.id,
+  );
+  expect(after.checks.every((c) => c.ok)).toBe(true);
+  expect((await owned.api(`/issue/${issue.id}?fields=description,issuetype`)).fields).toEqual(
+    before.fields,
+  );
+});
+
+test('NPL-05 unified global configuration checks selected projects and selects across pages', async ({
+  page,
+  owned,
+}, testInfo) => {
+  const t = installation('agent-prompts');
+  const before = await owned.api(`/project/${owned.project.id}`);
+  const calls = [];
+  page.on('request', (r) => {
+    try {
+      const input = r.postDataJSON()?.variables?.input;
+      if (input?.extensionId?.includes(t.appId)) calls.push(input.payload?.call?.functionKey);
+    } catch {
+      /* non app traffic */
+    }
+  });
+  await configuration(page, owned, true);
+  const search = page.getByRole('textbox', { name: 'Find a project', exact: true });
+  await search.fill('');
+  const all = page.getByRole('checkbox', { name: 'Select all matching projects', exact: true });
+  await all.click();
+  await expect(all).toBeChecked();
+  const inventory = await observeAction(
+    page,
+    'wizard-catalog',
+    () => page.getByRole('button', { name: 'Configure selected', exact: true }).click(),
+    t,
+  );
+  await expect(
+    page.getByRole('heading', {
+      name: `Configure ${inventory.projects.length} projects`,
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(search).toBeEnabled({ timeout: 60000 });
+  await search.fill(owned.project.key);
+  await page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }).click();
+  await observeAction(
+    page,
+    'settings-health',
+    () => page.getByRole('button', { name: 'Check selected', exact: true }).click(),
+    t,
+    owned.project.id,
+  );
+  await details(page, owned.project.key);
+  await expect(page.getByRole('heading', { name: 'Configuration', exact: true })).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath('project-configuration-details.png'),
+    fullPage: true,
+  });
+  expect(
+    calls.every((c) =>
+      [
+        'settings-projects',
+        'settings-health',
+        'wizard-status',
+        'wizard-cancel-interrupted',
+        'wizard-catalog',
+      ].includes(c),
+    ),
+  ).toBe(true);
+  const after = await owned.api(`/project/${owned.project.id}`);
+  expect(after.issueTypes).toEqual(before.issueTypes);
+  expect(after.description).toEqual(before.description);
+});
+
+test('NPL-06 empty prompt save preserves unsaved selection during read-only recovery', async ({
+  page,
+  owned,
+}, testInfo) => {
+  const setup = await observeAction(
+    page,
+    'setup',
+    () => projectPage(page, 'agent-prompts', owned.project.key),
+    installation('agent-prompts'),
+  );
+  const source = await owned.propertyIssue(
+    `Empty prompt ${owned.run.state.runId.slice(0, 8)}`,
+    'Ordinary prompt instructions.',
+    setup.type,
+  );
+  source.expected.descriptionVariants = [
+    source.expected.description,
+    null,
+    { type: 'doc', version: 1, content: [] },
+  ];
+  owned.run.persist();
+  await owned.api(`/issue/${source.id}`, 'PUT', { fields: { description: null } });
+  const target = await owned.issue('Native prompt failed-save recovery');
+  const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,description,issuetype`);
+  const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
+  const t = installation('agent-prompts');
+  const field = (await owned.api('/field')).find(
+    (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
+  );
+  expect(field).toBeTruthy();
+  const before = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  await expect(async () => {
+    const found = await owned.api('/search/jql', 'POST', {
+      jql: `project = ${owned.project.id} AND issuetype = ${sourceIssue.fields.issuetype.id} ORDER BY key ASC`,
+      maxResults: 100,
+      fields: ['summary'],
+    });
+    expect(found.issues.some((i) => i.id === source.id)).toBe(true);
+  }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+  await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+  const readView = page
+    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
+    .locator('..')
+    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const loaded = await observeAction(
+    page,
+    'load',
+    () => readView.click({ position: { x: 2, y: 2 } }),
+    t,
+  );
+  owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
+  owned.run.persist();
+  expect(loaded.prompts.map((p) => p.id)).toContain(source.id);
+  const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  await expect(combo).toBeEnabled();
+  await observeAction(
+    page,
+    'library',
+    () =>
+      editor(page)
+        .getByRole('combobox', { name: 'Agent Prompts', exact: true })
+        .fill(sourceIssue.key),
+    installation('agent-prompts'),
+  );
+  await combo.press('ArrowDown');
+  const selectedLabel = `${sourceIssue.key} — ${source.expected.summary}`;
+  await editor(page).getByText(selectedLabel, { exact: true }).click();
+  await expect(editor(page).getByText(/Unsaved changes/)).toBeVisible();
+  await expect(
+    observeAction(
+      page,
+      'save',
+      () => editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
+      t,
+    ),
+  ).rejects.toMatchObject({ category: 'resolver-failed' });
+  await expect(
+    editor(page).getByText(`${sourceIssue.key}: Prompt instructions must`, { exact: false }),
+  ).toBeVisible();
+  // A definitive rejection is reconciled by one read: no saved-state recovery is needed.
+  await expect(
+    editor(page).getByRole('button', { name: 'Check saved state', exact: true }),
+  ).toHaveCount(0);
+  await expect(editor(page).getByText(selectedLabel, { exact: true })).toBeVisible();
+  await expect(editor(page).getByText(/Unsaved changes/)).toBeVisible();
+  await expect(editor(page).getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
+  await page.screenshot({
+    path: testInfo.outputPath('unsaved-selection-preserved.png'),
+    fullPage: true,
+  });
+  expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
+    before,
+  );
+  expect((await owned.api(`/issue/${source.id}?fields=description`)).fields.description).toEqual(
+    sourceIssue.fields.description,
+  );
+  await editor(page).getByRole('button', { name: 'Discard changes', exact: true }).click();
+  await expect(editor(page).getByText(selectedLabel, { exact: true })).toHaveCount(0);
+  await expect(editor(page).getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
+  expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
+    before,
+  );
+});
+
+test('NPL-10 a prompt block deleted in Jira is forgotten by a field-only save', async ({
+  page,
+  owned,
+}) => {
+  const t = installation('agent-prompts');
+  const setup = await observeAction(
+    page,
+    'setup',
+    () => projectPage(page, 'agent-prompts', owned.project.key),
+    t,
+  );
+  const source = await owned.propertyIssue(
+    `Deleted block ${owned.run.state.runId.slice(0, 8)}`,
+    'Instructions copied before the block is deleted.',
+    setup.type,
+  );
+  const target = await owned.issue('Native prompt deleted block');
+  const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,issuetype`);
+  const field = (await owned.api('/field')).find(
+    (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
+  );
+  expect(field).toBeTruthy();
+  await expect(async () => {
+    const found = await owned.api('/search/jql', 'POST', {
+      jql: `project = ${owned.project.id} AND issuetype = ${sourceIssue.fields.issuetype.id} ORDER BY key ASC`,
+      maxResults: 100,
+      fields: ['summary'],
+    });
+    expect(found.issues.some((i) => i.id === source.id)).toBe(true);
+  }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+  const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
+  const original = targetIssue.fields.description;
+  const readView = page
+    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
+    .locator('..')
+    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const open = async () => {
+    await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+    await observeAction(page, 'load', () => readView.click({ position: { x: 2, y: 2 } }), t);
+    await expect(
+      editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
+    ).toBeEnabled();
+  };
+  const save = () =>
+    observeAction(
+      page,
+      'save',
+      () => editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
+      t,
+    );
+  await open();
+  const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  await observeAction(page, 'library', () => combo.fill(sourceIssue.key), t);
+  await combo.press('ArrowDown');
+  await editor(page)
+    .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
+    .click();
+  await save();
+  const linked = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  expect(linked[field.id]).toEqual([sourceIssue.key]);
+  expect(linked.description.content.some((n) => n.attrs?.localId === `npl-${target.id}`)).toBe(
+    true,
+  );
+  // An editor deletes the whole Agent Prompts block in Jira and adds their own text.
+  const deletedDescription = {
+    type: 'doc',
+    version: 1,
+    content: [
+      ...linked.description.content.filter((n) => n.attrs?.localId !== `npl-${target.id}`),
+      { type: 'paragraph', content: [{ type: 'text', text: 'Edited after deleting the block.' }] },
+    ],
+  };
+  target.expected.descriptionVariants = [
+    ...(target.expected.descriptionVariants ?? [original]),
+    linked.description,
+    deletedDescription,
+  ];
+  owned.run.persist();
+  await owned.api(`/issue/${target.id}`, 'PUT', { fields: { description: deletedDescription } });
+  const afterEdit = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+
+  await open();
+  // Refreshing copies needs the block: refused with guidance and no write.
+  await expect(
+    observeAction(
+      page,
+      'save',
+      () => editor(page).getByRole('button', { name: 'Sync', exact: true }).click(),
+      t,
+    ),
+  ).rejects.toMatchObject({ category: 'resolver-failed' });
+  await expect(
+    editor(page).getByText(/block was removed in Jira\. Remove all prompts and save/i),
+  ).toBeVisible();
+  expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
+    afterEdit,
+  );
+
+  // Removing every prompt forgets the deleted block by clearing only the field.
+  await editor(page)
+    .getByRole('button', { name: new RegExp(`remove.*${source.expected.summary}`, 'i') })
+    .click();
+  await save();
+  const cleared = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  expect(cleared.description).toEqual(afterEdit.description);
+  expect(cleared[field.id] ?? []).toEqual([]);
+  target.expected.customField = { id: field.id, value: cleared[field.id] };
+  owned.run.persist();
+});
+
+test('NPL-07 native Create uses the minimal Prompt form and ordinary instructions', async ({
+  page,
+  owned,
+}, testInfo) => {
+  const setup = await observeAction(
+    page,
+    'setup',
+    () => projectPage(page, 'agent-prompts', owned.project.key),
+    installation('agent-prompts'),
+  );
+  const open = async () => {
+    await page.getByRole('button', { name: 'Create a prompt ticket', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Create Prompt', exact: true });
+    await expect(dialog.getByRole('textbox', { name: 'Summary', exact: true })).toBeVisible();
+    await expect(dialog.locator('[contenteditable="true"]')).toBeVisible();
+    await expect(dialog.getByRole('button', { name: /^Prompt available/ })).toBeVisible();
+    for (const label of [
+      'Assignee',
+      'Priority',
+      'Labels',
+      'Due date',
+      'Components',
+      'Fix versions',
+      'Parent',
+    ])
+      await expect(dialog.getByText(label, { exact: true })).toHaveCount(0);
+    return dialog;
+  };
+  let dialog = await open();
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  const marker = markers.runMarker(owned.run.state.runId, 0);
+  const summary = `Native Create ${owned.run.state.runId}`;
+  const body = `Ordinary reusable instructions. Synthetic ${marker}`;
+  const originalCreate = owned.run.adapters.issue.create;
+  dialog = await open();
+  owned.run.adapters.issue.create = async (expected) => {
+    await dialog.getByRole('textbox', { name: 'Summary', exact: true }).fill(expected.summary);
+    await dialog.locator('[contenteditable="true"]').fill(body);
+    await page.screenshot({
+      path: testInfo.outputPath('native-prompt-create.png'),
+      fullPage: true,
+    });
+    await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    // Observe the native creation by its exact unique title; never repeat Create.
+    let created;
+    await expect(async () => {
+      const found = await owned.api('/search/jql', 'POST', {
+        jql: `project = ${owned.project.id} AND issuetype = ${setup.type} ORDER BY id DESC`,
+        fields: ['summary'],
+        maxResults: 100,
+      });
+      const matches = found.issues.filter((issue) => issue.fields.summary === summary);
+      expect(matches).toHaveLength(1);
+      created = matches[0];
+    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    const entry = owned.run.state.resources.at(-1);
+    entry.id = created.id;
+    owned.run.persist();
+    const issue = await owned.api(
+      `/issue/${created.id}?fields=summary,description,project,issuetype`,
+    );
+    expect(issue.fields.project.id).toBe(owned.project.id);
+    expect(issue.fields.issuetype.id).toBe(setup.type);
+    expect(issue.fields.summary).toBe(summary);
+    const actual = structuredClone(issue.fields.description);
+    // Jira's native editor adds an optional paragraph localId; no other normalization.
+    const para = actual.content[0];
+    if (para.attrs) {
+      expect(Object.keys(para.attrs)).toEqual(['localId']);
+      expect(para.attrs.localId).toEqual(expect.any(String));
+      expect(para.attrs.localId.length).toBeGreaterThan(0);
+      delete para.attrs;
+    }
+    expect(actual).toEqual(adf(body));
+    entry.expected.descriptionVariants = [expected.description, issue.fields.description];
+    owned.run.persist();
+    await owned.api(`/issue/${created.id}/properties/${markers.fixtureProperty}`, 'PUT', {
+      marker,
+    });
+    return created;
+  };
+  try {
+    const source = await owned.run.create('issue', {
+      summary,
+      description: adf(body),
+      marker,
+      propertyMarker: marker,
+      labels: [],
+      comments: [],
+      typeId: setup.type,
+    });
+    expect((await owned.api(`/issue/${source.id}/transitions`)).transitions).toEqual([]);
+    expect(source.observedFields.status.name).toBe('Prompt available');
+    const createdTicket = await owned.api(`/issue/${source.id}?fields=summary`);
+    await page.goto(`${activeTarget().site}/browse/${createdTicket.key}`);
+    await expect(page.getByText('Prompt available', { exact: true }).first()).toBeVisible();
+    await expect(page.getByText(body, { exact: true }).first()).toBeVisible();
+    for (const name of [
+      'Assignee',
+      'Reporter',
+      'Priority',
+      'Labels',
+      'Due date',
+      'Story Points',
+      'Original estimate',
+      'Time tracking',
+    ])
+      await expect(page.getByText(name, { exact: true })).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath('native-prompt-view.png'), fullPage: true });
+    owned.run.check('native ordinary Create with minimal form and no transitions');
+  } finally {
+    owned.run.adapters.issue.create = originalCreate;
+  }
+});
+
+test('NPL-08 opt-in ticket reload follows confirmed linking and restores project preference', async ({
+  page,
+  owned,
+}, testInfo) => {
+  const t = installation('agent-prompts');
+  async function health() {
+    const value = await configuration(page, owned);
+    await details(page, owned.project.key);
+    return value;
+  }
+  const initial = await health();
+  const original = initial.state.data.refreshAfterSave === true;
+  owned.run.state.reloadPreference = { original, restored: false };
+  owned.run.persist();
+  async function preference(enabled) {
+    const current = await health();
+    if ((current.state.data.refreshAfterSave === true) !== enabled) {
+      const toggle = page.getByRole('checkbox', {
+        name: 'Reload ticket after saving prompts',
+        exact: true,
+      });
+      await toggle.click();
+      if (enabled) await expect(toggle).toBeChecked();
+      else await expect(toggle).not.toBeChecked();
+      const checked = await observeAction(
+        page,
+        'settings-health',
+        () => page.getByRole('button', { name: 'Save', exact: true }).click(),
+        t,
+      );
+      expect(checked.state.data.refreshAfterSave).toBe(enabled);
+      expect(checked.state.data.type).toBe(initial.state.data.type);
+    }
+  }
+  try {
+    await preference(true);
+    const source = await owned.propertyIssue(
+      'Reload preference source',
+      'RELOAD-SENTINEL',
+      initial.state.data.type,
+    );
+    const target = await owned.issue('Reload preference target');
+    const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,description`);
+    const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
+    const field = (await owned.api('/field')).find(
+      (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
+    );
+    const linked = {
+      ...target.expected.description,
+      content: [
+        ...target.expected.description.content,
+        {
+          type: 'expand',
+          attrs: { localId: `npl-${target.id}`, title: 'Agent Prompts' },
+          content: [
+            {
+              type: 'heading',
+              attrs: { level: 2 },
+              content: [{ type: 'text', text: `${sourceIssue.key}: ${source.expected.summary}` }],
+            },
+            ...source.expected.description.content,
+          ],
+        },
+      ],
+    };
+    target.expected.descriptionVariants = [target.expected.description, linked];
+    target.expected.customField = { id: field.id, value: [sourceIssue.key] };
+    owned.run.persist();
+    await expect(async () => {
+      const found = await owned.api('/search/jql', 'POST', {
+        jql: `project = ${owned.project.id} AND issuetype = ${initial.state.data.type}`,
+        fields: ['summary'],
+        maxResults: 100,
+      });
+      expect(found.issues.some((i) => i.id === source.id)).toBe(true);
+    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+    const read = page
+      .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
+      .locator('..')
+      .locator(
+        '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
+      );
+    const loaded = await observeAction(
+      page,
+      'load',
+      () => read.click({ position: { x: 2, y: 2 } }),
+      t,
+    );
+    owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
+    owned.run.persist();
+    expect(loaded.refreshAfterSave).toBe(true);
+    await observeAction(
+      page,
+      'library',
+      () =>
+        editor(page)
+          .getByRole('combobox', { name: 'Agent Prompts', exact: true })
+          .fill(sourceIssue.key),
+      installation('agent-prompts'),
+    );
+    await editor(page)
+      .getByRole('combobox', { name: 'Agent Prompts', exact: true })
+      .press('ArrowDown');
+    await editor(page)
+      .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
+      .click();
+    await Promise.all([
+      page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+      editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
+    ]);
+    const actual = await owned.api(`/issue/${target.id}?fields=description,${field.id}`);
+    expect(actual.fields.description).toEqual(linked);
+    expect(actual.fields[field.id]).toEqual([sourceIssue.key]);
+    await expect(
+      editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
+    ).toHaveCount(0);
+    await page.getByRole('button', { name: 'Agent Prompts', exact: true }).click();
+    await expect(page.getByText('RELOAD-SENTINEL', { exact: false })).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath('automatic-ticket-reload.png'),
+      fullPage: true,
+    });
+    // A second source exercises the user's add-more/remove-after-save sequence.
+    const second = await owned.propertyIssue(
+      'Second reload source',
+      'SECOND-RELOAD-SENTINEL',
+      initial.state.data.type,
+    );
+    const secondIssue = await owned.api(`/issue/${second.id}?fields=summary,description`);
+    await expect(async () => {
+      const found = await owned.api('/search/jql', 'POST', {
+        jql: `project = ${owned.project.id} AND issuetype = ${initial.state.data.type}`,
+        fields: ['summary'],
+        maxResults: 100,
+      });
+      expect(found.issues.some((i) => i.id === second.id)).toBe(true);
+    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    await read.click({ position: { x: 2, y: 2 } });
+    const picker = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+    await expect(picker).toBeEnabled();
+    await observeAction(
+      page,
+      'library',
+      () =>
+        editor(page)
+          .getByRole('combobox', { name: 'Agent Prompts', exact: true })
+          .fill(secondIssue.key),
+      installation('agent-prompts'),
+    );
+    await picker.press('ArrowDown');
+    await editor(page)
+      .getByText(`${secondIssue.key} — ${second.expected.summary}`, { exact: true })
+      .click();
+    const two = structuredClone(linked);
+    two.content.at(-1).content.push(
+      {
+        type: 'heading',
+        attrs: { level: 2 },
+        content: [{ type: 'text', text: `${secondIssue.key}: ${second.expected.summary}` }],
+      },
+      ...second.expected.description.content,
+    );
+    async function saveAndReload(description, keys) {
+      target.expected.descriptionVariants.push(description);
+      target.expected.customField = { id: field.id, value: keys };
+      owned.run.persist();
+      await Promise.all([
+        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+        editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
+      ]);
+      const saved = await owned.api(`/issue/${target.id}?fields=description,${field.id}`);
+      expect(saved.fields.description).toEqual(description);
+      expect(saved.fields[field.id]).toEqual(keys);
+    }
+    await saveAndReload(two, [sourceIssue.key, secondIssue.key]);
+    await read.click({ position: { x: 2, y: 2 } });
+    await expect(picker).toBeEnabled();
+    await editor(page)
+      .getByRole('button', {
+        name: `${sourceIssue.key} — ${source.expected.summary}, remove ${sourceIssue.key} — ${source.expected.summary}`,
+        exact: true,
+      })
+      .click();
+    const onlySecond = structuredClone(two);
+    onlySecond.content.at(-1).content.splice(0, 2);
+    await saveAndReload(onlySecond, [secondIssue.key]);
+  } finally {
+    await preference(original);
+    owned.run.state.reloadPreference.restored = true;
+    owned.run.persist();
+  }
+});
+
+test('NPL-09 newest prompts, server search and cursor pages preserve draft selections', async ({
+  page,
+  owned,
+  theme,
+}) => {
+  const t = installation('agent-prompts');
+  const setup = await observeAction(
+    page,
+    'setup',
+    () => projectPage(page, 'agent-prompts', owned.project.key),
+    t,
+  );
+  const term = `Paging${owned.run.state.runId.replaceAll('-', '')}`;
+  const sources = [];
+  for (let i = 0; i < 21; i++)
+    sources.push(await owned.propertyIssue(`${term} prompt ${i}`, `Instructions ${i}`, setup.type));
+  const target = await owned.issue('Prompt search destination');
+  const before = await owned.api(`/issue/${target.id}?fields=description`);
+  const jql = `project = ${owned.project.id} AND issuetype = ${setup.type} AND summary ~ "${term}*" ORDER BY created DESC, key DESC`;
+  let expected;
+  await expect(async () => {
+    const result = await owned.api('/search/jql', 'POST', {
+      jql,
+      fields: ['summary'],
+      maxResults: 50,
+    });
+    expect(result.isLast).toBe(true);
+    expect(result.issues).toHaveLength(21);
+    expected = result.issues;
+  }).toPass({ timeout: 60000, intervals: [1000, 3000] });
+  const library = await observeAction(
+    page,
+    'library',
+    () => page.getByRole('textbox', { name: 'Search prompts', exact: true }).fill(term),
+    t,
+  );
+  expect(library.prompts.map((p) => p.id)).toEqual(expected.slice(0, 20).map((p) => p.id));
+  expect(library.nextCursor).toBeTruthy();
+  const next = await observeAction(
+    page,
+    'library',
+    () => page.getByRole('button', { name: 'Load more', exact: true }).click(),
+    t,
+  );
+  expect(next.prompts.map((p) => p.id)).toEqual([expected[20].id]);
+  expect(next.nextCursor).toBeUndefined();
+  await expect(
+    page.getByRole('link', {
+      name: `${expected[20].key} — ${expected[20].fields.summary}`,
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.goto(`${activeTarget().site}/browse/${before.key}`);
+  const readView = page
+    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
+    .locator('..')
+    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const loaded = await observeAction(
+    page,
+    'load',
+    () => readView.click({ position: { x: 2, y: 2 } }),
+    t,
+  );
+  expect(loaded.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
+  const search = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  const first = await observeAction(page, 'library', () => search.fill(`prompt ${term}`), t);
+  expect(first.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
+  const second = await observeAction(
+    page,
+    'library',
+    () => editor(page).getByRole('button', { name: 'Load more', exact: true }).click(),
+    t,
+  );
+  expect(second.prompts.map((p) => p.id)).toEqual(expected.slice(10, 20).map((p) => p.id));
+  const picker = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  await picker.press('ArrowDown');
+  await editor(page)
+    .getByText(`${expected[19].key} — ${expected[19].fields.summary}`, { exact: true })
+    .click();
+  const exact = await observeAction(page, 'library', () => search.fill(expected[20].key), t);
+  expect(exact.prompts.map((p) => p.id)).toEqual([expected[20].id]);
+  await expect(
+    editor(page).getByText(`${expected[19].key} — ${expected[19].fields.summary}`, { exact: true }),
+  ).toBeVisible();
+  await picker.press('ArrowDown');
+  await editor(page)
+    .getByText(`${expected[20].key} — ${expected[20].fields.summary}`, { exact: true })
+    .click();
+  await expect(
+    editor(page).getByText('2/5 selected · Unsaved changes', { exact: true }),
+  ).toBeVisible();
+  await observeAction(page, 'library', () => search.fill(''), t);
+  await expect(editor(page).getByRole('button', { name: 'Load more', exact: true })).toHaveCount(0);
+  await expect(
+    editor(page).getByText(`${expected[19].key} — ${expected[19].fields.summary}`, { exact: true }),
+  ).toBeVisible();
+  await editor(page).getByRole('button', { name: 'Discard changes', exact: true }).click();
+  expect((await owned.api(`/issue/${target.id}?fields=description`)).fields.description).toEqual(
+    before.fields.description,
+  );
+  for (const name of ['Light', 'Dark']) {
+    await theme(name);
+    await page.goto(`${activeTarget().site}/browse/${before.key}`);
+    await observeAction(page, 'load', () => readView.click({ position: { x: 2, y: 2 } }), t);
+    await expect(editor(page).locator('html')).toHaveAttribute(
+      'data-color-mode',
+      name.toLowerCase(),
+    );
+    await textContrast(editor(page).locator('label'));
+    await picker.press('ArrowDown');
+    await picker.press('Enter');
+    await expect(
+      editor(page).getByText('1/5 selected · Unsaved changes', { exact: true }),
+    ).toBeVisible();
+    await picker.press('ArrowDown');
+    await page.screenshot({
+      path: `${activeTarget().runs}/${owned.run.state.runId}-prompt-search-${name.toLowerCase()}.png`,
+      fullPage: true,
+    });
+    await picker.press('Escape');
+    await editor(page).getByRole('button', { name: 'Discard changes', exact: true }).click();
+  }
+});
