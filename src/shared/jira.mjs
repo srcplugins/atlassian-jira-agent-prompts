@@ -54,12 +54,12 @@ export function rovoAccountId(context) {
 /** @param {unknown} value @returns {string} */
 export function requireProjectKey(value) {
   if (typeof value !== 'string' || !projectKeyPattern.test(value))
-    throw new UserError('Provide one explicit uppercase project key.');
+    throw new UserError('Provide one explicit uppercase space key.');
   return value;
 }
 
 /**
- * The project ID from a project-page resolver context.
+ * The space ID from a space-page resolver context.
  * @param {unknown} context
  */
 export function projectContext(context) {
@@ -71,7 +71,7 @@ export function projectContext(context) {
     !context.accountId.trim() ||
     !/^[1-9]\d*$/.test(id)
   )
-    throw new UserError('Open this app in a Jira project.');
+    throw new UserError('Open this app in a Jira space.');
   return { accountId: context.accountId, projectId: id };
 }
 
@@ -85,15 +85,16 @@ export function requireEmptyPayload(payload = {}) {
 }
 
 /**
- * Confirms the response is the requested company-managed Jira Software project.
+ * Confirms the response is the requested company-managed Jira Software space. Use it only where the
+ * spec's Supported spaces table marks team-managed Software as Not supported or Open.
  * @param {unknown} project
  * @param {string} idOrKey The numeric ID or key that was requested.
  */
 export function requireCompanyManagedSoftware(project, idOrKey) {
   if (!isRecord(project) || (String(project.id) !== idOrKey && project.key !== idOrKey))
-    throw new UserError('Project context does not match.');
+    throw new UserError('Space context does not match.');
   if (project.projectTypeKey !== 'software' || project.style !== 'classic')
-    throw new UserError('Company-managed Jira Software projects only.');
+    throw new UserError('Company-managed Jira software spaces only.');
   return project;
 }
 

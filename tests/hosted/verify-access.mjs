@@ -1,6 +1,6 @@
 // Hosted acceptance for hidden sources and revoked edit access on an owned development site.
 // Everything it changes is created by this run in one disposable
-// project with its own permission and issue security schemes, journaled before each write.
+// space with its own permission and issue security schemes, journaled before each write.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import {
@@ -13,16 +13,22 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { chromium, expect } from '@playwright/test';
-import { activeTarget, markers, siteFor } from '@srcplugins/atlassian-forge-test-framework/core';
+import {
+  activeTarget,
+  fixtureProject,
+  markers,
+  siteFor,
+} from '@srcplugins/atlassian-forge-test-framework/core';
+import { agentPromptsFixture } from './support/fixture.mjs';
 import {
   identityFixture,
   tokenRequest,
   client,
   adf,
   installation,
-  projectPage,
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
+import { spaceSettings } from './support/space-settings.mjs';
 
 const [mode, recoveryId] = process.argv.slice(2);
 assert.ok(mode === 'run' || (mode === 'cleanup' && /^[0-9a-f-]{36}$/.test(recoveryId)));
@@ -65,7 +71,7 @@ const j =
         id,
         site: activeTarget().site,
         key: `NA${short}`,
-        marker: markers.acceptance('access', `${id}. Synthetic project only.`),
+        marker: markers.acceptance('access', `${id}. Synthetic space only.`),
         label: `${markers.namespace}-access-${short.toLowerCase()}`,
         issues: {},
         stage: 'preflight',
@@ -100,7 +106,7 @@ async function pages(endpoint) {
   }
   throw Error('Complete pagination required');
 }
-// The project's issues must be exactly journaled fixtures before anything is deleted.
+// The space's work items must be exactly journaled fixtures before anything is deleted.
 async function projectIssues() {
   const found = await api('/search/jql', 'POST', {
     jql: `project = ${j.project.id} ORDER BY id ASC`,
@@ -128,7 +134,7 @@ async function cleanup() {
   }
   if (j.project && !j.projectDeleted) {
     if ((await api(`/project/${j.project.id}`)) === null) {
-      assert.equal(j.projectDeleteIntent, true, 'Project vanished without a recorded delete');
+      assert.equal(j.projectDeleteIntent, true, 'Space vanished without a recorded delete');
     } else {
       await ownedProject();
       const journaled = new Map(
@@ -138,7 +144,10 @@ async function cleanup() {
       );
       for (const issue of await projectIssues()) {
         const entry = journaled.get(issue.fields.summary);
-        assert.ok(entry, 'Unexpected issue in the access fixture project; inspect before cleanup');
+        assert.ok(
+          entry,
+          'Unexpected work item in the access fixture space; inspect before cleanup',
+        );
         assert.ok(issue.fields.labels.includes(j.label));
         if (entry.id) assert.equal(entry.id, issue.id);
       }
@@ -203,7 +212,7 @@ async function cleanup() {
   persist();
 }
 
-// Each Jira issue write is journaled by its unique summary first, so an unknown outcome is
+// Each Jira work item write is journaled by its unique summary first, so an unknown outcome is
 // reconciled by search instead of a second create.
 async function createIssue(name, fields) {
   const entry = (j.issues[name] = { summary: `Access ${name} ${short}` });
@@ -250,13 +259,18 @@ try {
       sessions[role] = { context, page, api: actorApi };
     }
     const page = sessions.owner.page;
-    await observeAction(page, 'setup', () => projectPage(page, 'agent-prompts', 'PLSNATIVE'), t);
+    await observeAction(
+      page,
+      'setup',
+      () => spaceSettings(page, fixtureProject(agentPromptsFixture)),
+      t,
+    );
     const field = (await api('/field')).find(
       (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
     );
     assert.ok(field, 'Agent Prompts field required');
 
-    stage('create-project');
+    stage('create-space');
     assert.equal(await api(`/project/${j.key}`), null);
     j.projectIntent = true;
     persist();
@@ -374,7 +388,7 @@ try {
       .toBe(j.securityScheme.id);
 
     stage('field-on-screens');
-    // The template gives the project its own screens; add the app field only to those.
+    // The template gives the space its own screens; add the app field only to those.
     const itss = (await pages(`/issuetypescreenscheme/project?projectId=${j.project.id}`))[0]
       .issueTypeScreenScheme;
     assert.ok(itss.name.startsWith(`${j.key}:`));
@@ -414,9 +428,8 @@ try {
       (x) => !x.subtask && x.id !== task?.id && x.hierarchyLevel === 0,
     );
     assert.ok(task && targetType);
-    await projectPage(page, 'agent-prompts', j.key);
-    await page.getByRole('button', { name: 'Project configuration', exact: true }).click();
-    const find = page.getByRole('textbox', { name: 'Find a project', exact: true });
+    await spaceSettings(page, j.key);
+    const find = page.getByRole('textbox', { name: 'Find a space', exact: true });
     await expect(find).toBeEnabled({ timeout: 60000 });
     await find.fill(j.key);
     await page.getByRole('checkbox', { name: `Select ${j.key}`, exact: true }).click();
@@ -425,7 +438,7 @@ try {
     await page.getByRole('option', { name: task.name, exact: true }).click();
     // Without the reload preference, save responses are observed in place.
     const reload = page.getByRole('checkbox', {
-      name: 'Reload ticket after saving prompts',
+      name: 'Reload work item after saving prompts',
       exact: true,
     });
     if (await reload.isChecked()) await reload.click();
@@ -437,7 +450,7 @@ try {
     ).toBeVisible({ timeout: 60000 });
     await page.getByRole('button', { name: 'Done', exact: true }).click();
 
-    stage('create-issues');
+    stage('create-work-items');
     const visible = await createIssue('visible', {
       issuetype: { id: task.id },
       description: adf(`ACCESS-VISIBLE-${id}`),
@@ -503,11 +516,11 @@ try {
     const targetState = async () =>
       (await api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
 
-    stage('owner-links');
+    stage('owner-selections');
     await open(page);
     for (const source of [visible, hidden]) {
       const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
-      await observeAction(page, 'library', () => combo.fill(source.key), t);
+      await observeAction(page, 'search', () => combo.fill(source.key), t);
       await combo.press('ArrowDown');
       await editor(page).getByText(`${source.key} — ${source.summary}`, { exact: true }).click();
     }
@@ -522,23 +535,11 @@ try {
     assert.ok(JSON.stringify(linked.description).includes(`ACCESS-HIDDEN-${id}`));
     assert.ok(JSON.stringify(linked.description).includes(`ACCESS-VISIBLE-${id}`));
 
-    // Both actors: the library never names or returns the hidden source, and the field shows it
-    // only as an unavailable, removable selection.
+    // Both actors: search never names or returns the hidden source, and the field shows it only
+    // as an unavailable, removable selection.
     for (const role of ['restricted', 'member']) {
       stage(`hidden-${role}`);
       const p = sessions[role].page;
-      await observeAction(p, 'setup', () => projectPage(p, 'agent-prompts', j.key), t);
-      const search = p.getByRole('textbox', { name: 'Search prompts', exact: true });
-      for (const query of [hidden.key, hidden.summary, visible.key]) {
-        const found = await observeAction(p, 'library', () => search.fill(query), t);
-        assert.ok(!found.prompts.some((x) => x.id === hidden.id || x.name === hidden.summary));
-        if (query === visible.key)
-          assert.ok(
-            found.prompts.some((x) => x.id === visible.id),
-            'Positive control',
-          );
-      }
-      assert.ok(!(await p.locator('body').innerText()).includes(hidden.summary));
       const loaded = await open(p);
       assert.deepEqual(loaded.ids, [visible.id, hidden.id]);
       assert.ok(loaded.prompts.some((x) => x.id === visible.id));
@@ -547,6 +548,20 @@ try {
         editor(p).getByText(`Unavailable prompt (${hidden.id})`, { exact: false }),
       ).toBeVisible();
       await p.screenshot({ path: `${directory}/${id}-${role}-unavailable.png`, fullPage: true });
+      const search = editor(p).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+      for (const query of [hidden.key, hidden.summary, visible.key]) {
+        const found = await observeAction(p, 'search', () => search.fill(query), t);
+        assert.ok(!found.prompts.some((x) => x.id === hidden.id || x.name === hidden.summary));
+        if (query === visible.key)
+          assert.ok(
+            found.prompts.some((x) => x.id === visible.id),
+            'Positive control',
+          );
+      }
+      // Only the app frame: Jira's own history shows the copy saved into the target's
+      // description, which every reader of the target may see.
+      assert.ok(!(await editor(p).locator('body').innerText()).includes(hidden.summary));
+      await observeAction(p, 'search', () => search.fill(''), t);
     }
     assert.deepEqual(await targetState(), linked);
 
@@ -609,6 +624,50 @@ try {
     assert.deepEqual(await targetState(), removed);
     await member.screenshot({ path: `${directory}/${id}-member-forged.png`, fullPage: true });
 
+    stage('member-admin-refused');
+    // Jira refuses space settings to non-administrators before the app loads, so prove the app's
+    // own check here: the field's load is rewritten into the read-only space inventory call.
+    await member.goto(`${j.site}/browse/${target.key}`);
+    await expect(readView(member)).toBeVisible({ timeout: 60000 });
+    let refused;
+    await member.route(pattern, async (route) => {
+      let body;
+      try {
+        body = route.request().postDataJSON();
+      } catch {
+        return route.continue();
+      }
+      const call = body?.variables?.input?.payload?.call;
+      if (
+        refused !== undefined ||
+        call?.functionKey !== 'load' ||
+        !body.variables.input.extensionId?.includes(t.appId)
+      )
+        return route.continue();
+      call.functionKey = 'settings-projects';
+      const response = await route.fetch({ postData: JSON.stringify(body) });
+      const text = await response.text();
+      const find = (value) =>
+        !value || typeof value !== 'object'
+          ? null
+          : typeof value.ok === 'boolean'
+            ? value
+            : Object.values(value).map(find).find(Boolean);
+      refused = find(JSON.parse(text)) ?? null;
+      return route.fulfill({ response, body: text });
+    });
+    await readView(member).click({ position: { x: 2, y: 2 } });
+    await expect(
+      editor(member).getByText('This needs the Jira permission Administer Jira.', { exact: true }),
+    ).toBeVisible({ timeout: 45000 });
+    await member.unroute(pattern);
+    assert.deepEqual(refused, {
+      ok: false,
+      error: 'This needs the Jira permission Administer Jira.',
+    });
+    assert.deepEqual(await targetState(), removed);
+    await member.screenshot({ path: `${directory}/${id}-member-admin.png`, fullPage: true });
+
     stage('member-edit-revoked');
     // The picker opened while Edit was allowed; revoke only this run's grant, then Save once.
     await open(member);
@@ -667,6 +726,7 @@ try {
       hiddenNeverListed: true,
       unavailableRemoved: true,
       forgedAddRefused: true,
+      adminCallRefused: true,
       revokedSaveRefused: true,
     };
     j.passed = true;
@@ -674,7 +734,7 @@ try {
   }
   stage('cleanup');
   await cleanup();
-  console.log(`Native access ${id}: ${j.passed ? 'passed' : 'recovered'}; cleanup verified.`);
+  console.log(`Access run ${id}: ${j.passed ? 'passed' : 'recovered'}; cleanup verified.`);
 } catch (error) {
   writeFileSync(
     `${directory}/${id}-failure.txt`,
@@ -689,7 +749,7 @@ try {
   j.failedAt = j.stage;
   persist();
   console.error(
-    `Native access ${id} stopped at ${j.stage}; inspect private journal. No automatic write retry.`,
+    `Access run ${id} stopped at ${j.stage}; inspect private journal. No automatic write retry.`,
   );
   process.exitCode = 1;
 } finally {

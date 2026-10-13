@@ -4,7 +4,7 @@ import {
   lifecycleOptions,
   verifyLifecycleActors,
   verifyConfigurationPlan,
-} from './hosted/support/native-lifecycle.mjs';
+} from './hosted/support/lifecycle.mjs';
 const site = 'second-example.atlassian.net';
 const env = {
   NATIVE_LIFECYCLE_TESTS: '1',
@@ -60,7 +60,7 @@ test('lifecycle requires exact distinct actors and independent ordinary-user den
   assert.throws(() => verifyLifecycleActors(expected, bad));
   assert.throws(() => verifyLifecycleActors({ ...expected, 'nc-user': expected.owner }, observed));
 });
-test('configuration refuses scheme modifications and cross-project plans', () => {
+test('configuration refuses scheme modifications and cross-space plans', () => {
   const plan = { project: { id: '12' }, type: '34', attach: false };
   verifyConfigurationPlan(plan, '12', '34');
   for (const bad of [

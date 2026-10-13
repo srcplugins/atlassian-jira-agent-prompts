@@ -35,6 +35,8 @@ function fixture() {
     },
   };
   const p = {
+    refreshAfterSave: async () => false,
+    retainedTypes: async () => [],
     config: async () => '3',
     field: async () => 'customfield_1',
     allowed: async () => {},
@@ -65,7 +67,7 @@ function fixture() {
     transactions: () => transactions,
   };
 }
-async function pending(f, { modern = true, phase = 'submitted', age = 120001 } = {}) {
+async function pending(f, { phase = 'submitted', age = 120001 } = {}) {
   await f.p.cas('10', f.stored()?.revision ?? 0, {
     ids: [],
     managed: null,
@@ -74,7 +76,14 @@ async function pending(f, { modern = true, phase = 'submitted', age = 120001 } =
       after: 'unobserved',
       ids: ['20'],
       managed: null,
-      ...(modern ? { attemptId: 'original', phase, started: Date.now() - age } : {}),
+      keys: ['TEST-20'],
+      shape: 'unobserved',
+      beforeField: hash(['field', []]),
+      beforeBlock: hash([]),
+      afterBlock: 'unobserved',
+      attemptId: 'original',
+      phase,
+      started: Date.now() - age,
     },
   });
 }
@@ -163,27 +172,15 @@ test('abandoned submitted writes require admin, Edit, explicit acknowledgment, t
     }
   }
 });
-test('legacy records start a durable observation window, not an immediate release', async () => {
+test('failed administrator authorization exposes no manual release capability', async () => {
   const f = fixture();
-  await pending(f, { modern: false });
-  const value = await f.service.saveStatus(c);
-  assert.ok(value.waitSeconds > 0 && value.waitSeconds <= 120);
-  assert.ok(f.stored().data.pending.observed);
-  await assert.rejects(
-    f.service.resolveSave(c, { ...value, acknowledged: true }),
-    /Wait two minutes/,
-  );
-  assert.equal(f.writes(), 0);
-});
-test('failed administrator authorization exposes no manual release capability or new clock', async () => {
-  const f = fixture();
-  await pending(f, { modern: false });
+  await pending(f);
   f.p.allowed = async () => {
     throw Error('Permission service unavailable');
   };
   const value = await f.service.saveStatus(c);
   assert.equal(value.administrator, false);
-  assert.equal(f.stored().data.pending.observed, undefined);
+  assert.equal(value.keys, undefined);
 });
 test('submitted uncertainty is never cleared by an ordinary load or retried automatically', async () => {
   const f = fixture();
@@ -200,7 +197,7 @@ test('submitted uncertainty is never cleared by an ordinary load or retried auto
   assert.equal(f.stored().data.pending.phase, 'submitted');
   assert.deepEqual(f.target, baseline);
 });
-test('lost response during Sync releases the unsent claim and permits later unlink', async () => {
+test('lost response during Sync releases the unsent claim and permits later removal', async () => {
   const f = fixture();
   await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
   f.source.fields.description = doc('Changed instructions');
@@ -272,6 +269,11 @@ test('release is refused when Jira no longer holds the pre-save state, even with
       after: 'unobserved',
       ids: ['20'],
       managed: null,
+      keys: ['TEST-20'],
+      shape: 'unobserved',
+      beforeField: hash(['field', []]),
+      beforeBlock: 'a block Jira no longer holds',
+      afterBlock: 'unobserved',
       attemptId: 'original',
       phase: 'submitted',
       started: Date.now() - 120_001,

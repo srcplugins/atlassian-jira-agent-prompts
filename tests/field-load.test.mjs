@@ -34,6 +34,8 @@ function fixture() {
     },
   };
   const ports = {
+    refreshAfterSave: async () => false,
+    retainedTypes: async () => [],
     config: async () => '3',
     field: async () => 'customfield_1',
     allowed: async () => {},
@@ -152,7 +154,7 @@ test('auxiliary settings failures preserve saved removal while retained-source a
     }
     if (mode !== 'retained') {
       assert.equal(current.refreshAfterSave, false);
-      assert.match(current.loadWarning, /Reload the ticket manually/);
+      assert.match(current.loadWarning, /Reload the work item manually/);
     }
     const readsBeforeRemoval = retainedReads;
     await f.service.save(context, { ...current, ids: [] });

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { call } from './client';
 import type { Prompt, PromptPage } from './service';
 
-export function usePromptSearch(surface: 'picker' | 'library') {
+export function usePromptSearch() {
   const [items, setItems] = useState<Prompt[]>([]);
   const [query, setQuery] = useState('');
   const [loaded, setLoaded] = useState(false);
@@ -47,8 +47,7 @@ export function usePromptSearch(surface: 'picker' | 'library') {
     setBusy(true);
     setError('');
     try {
-      const page = await call<PromptPage>('library', {
-        surface,
+      const page = await call<PromptPage>('search', {
         query: current.query,
         ...(append && current.cursor ? { cursor: current.cursor } : {}),
       });

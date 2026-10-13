@@ -1,7 +1,7 @@
 import Resolver from '@forge/resolver';
 import api, { route, getAppContext } from '@forge/api';
 import { kvs, Filter, FilterConditions } from '@forge/kvs';
-import { registerResolvers, registerRovo, registerDescriptionRovo } from './integration';
+import { registerResolvers, registerRovo } from './integration';
 const sdk = {
   Resolver,
   api,
@@ -16,5 +16,3 @@ const sdk = {
 };
 export const handler = registerResolvers(sdk);
 export const searchPrompts = registerRovo(sdk);
-
-export const readDescription = registerDescriptionRovo(sdk);

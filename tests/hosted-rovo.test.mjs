@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { FixtureRun } from '@srcplugins/atlassian-forge-test-framework/core';
-import { runNativeRovoJourney } from './hosted/support/agent-prompts-rovo.mjs';
+import { runRovoJourney } from './hosted/support/agent-prompts-rovo.mjs';
 
 function fixture() {
-  const baseline = { id: '10', fields: { summary: 'Unrelated ticket', description: null } };
+  const baseline = { id: '10', fields: { summary: 'Unrelated work item', description: null } };
   const issues = [structuredClone(baseline)];
   const calls = [];
   const captures = [];
@@ -67,20 +67,6 @@ function fixture() {
         },
       });
     },
-    issue(summary) {
-      const marker = 'srcplugins-run-550e8400-1';
-      return run.create('issue', {
-        summary,
-        marker,
-        description: {
-          version: 1,
-          type: 'doc',
-          content: [
-            { type: 'paragraph', content: [{ type: 'text', text: `disposable ${marker}` }] },
-          ],
-        },
-      });
-    },
     api: async (path) =>
       structuredClone(issues.find((issue) => path.startsWith(`/issue/${issue.id}?`))),
     cleanup: () => run.cleanup(),
@@ -107,7 +93,7 @@ function fixture() {
 
 test('Rovo runner journals one ordinary source in the current type and cleans after two searches/reads', async () => {
   const f = fixture();
-  await runNativeRovoJourney(f.input);
+  await runRovoJourney(f.input);
   assert.deepEqual(f.calls, ['create', 'search-1', 'read-1', 'search-2', 'read-2', 'delete']);
   assert.equal(f.owned.run.state.status, 'clean');
   assert.equal(f.owned.run.state.testStatus, 'passed');
@@ -116,7 +102,7 @@ test('Rovo runner journals one ordinary source in the current type and cleans af
   assert.equal(f.captures.length, 4);
 });
 
-test('missing consent/setup, missing mapping and wrong project fail before fixture creation', async () => {
+test('missing consent/setup, missing space setup and wrong space fail before fixture creation', async () => {
   for (const setup of [
     async () => {
       throw Error('Consent required');
@@ -125,7 +111,7 @@ test('missing consent/setup, missing mapping and wrong project fail before fixtu
     async () => ({ project: { id: '2' }, type: '39' }),
   ]) {
     const f = fixture();
-    await assert.rejects(runNativeRovoJourney({ ...f.input, setup }));
+    await assert.rejects(runRovoJourney({ ...f.input, setup }));
     assert.deepEqual(f.calls, []);
     assert.equal(f.owned.run.state.testStatus, 'failed');
     assert.equal(f.owned.run.state.status, 'clean');
@@ -133,13 +119,13 @@ test('missing consent/setup, missing mapping and wrong project fail before fixtu
 });
 
 // Each case must fail acceptance and still remove exactly the journaled fixture.
-test('catalog absence, unverified search, failed/incomplete reads and Jira drift cannot pass', async () => {
+test('search absence, unverified search, failed/incomplete reads and Jira drift cannot pass', async () => {
   for (const [name, change, calls, error = Error] of [
     [
-      'source absent from the actual app catalog',
+      'source absent from Jira search',
       () => ({ discover: async () => ({ prompts: [] }) }),
       ['create', 'delete'],
-      /actual app catalog/,
+      /searchable in Jira/,
     ],
     [
       'search without the withheld source name',
@@ -173,7 +159,7 @@ test('catalog absence, unverified search, failed/incomplete reads and Jira drift
     ],
   ]) {
     const f = fixture();
-    await assert.rejects(runNativeRovoJourney({ ...f.input, ...change(f) }), error, name);
+    await assert.rejects(runRovoJourney({ ...f.input, ...change(f) }), error, name);
     assert.deepEqual(f.calls, calls, name);
     assert.equal(f.owned.run.state.testStatus, 'failed', name);
     assert.equal(f.owned.run.state.status, 'clean', name);
@@ -187,7 +173,7 @@ test('changed fixture content blocks guarded deletion instead of being silently 
     f.issues[1].fields.description.content[0].content[0].text = 'Owner edited this fixture';
     return response;
   };
-  await assert.rejects(runNativeRovoJourney({ ...f.input, read }), /cleanup incomplete/);
+  await assert.rejects(runRovoJourney({ ...f.input, read }), /cleanup incomplete/);
   assert.equal(f.owned.run.state.status, 'cleanup-required');
   assert.equal(f.calls.includes('delete'), false);
   assert.equal(f.issues.length, 2);
@@ -196,7 +182,7 @@ test('changed fixture content blocks guarded deletion instead of being silently 
 test('successful chats remain failed acceptance when final inventory restoration cannot be verified', async () => {
   const f = fixture();
   await assert.rejects(
-    runNativeRovoJourney({
+    runRovoJourney({
       ...f.input,
       verifyCleanup: async () => {
         throw Error('Inventory still differs');
@@ -206,26 +192,4 @@ test('successful chats remain failed acceptance when final inventory restoration
   );
   assert.equal(f.owned.run.state.status, 'clean');
   assert.equal(f.owned.run.state.testStatus, 'failed');
-});
-
-test('Ticket Description Summary must report the Description-only marker in two fresh chats', async () => {
-  const f = fixture();
-  const summarize = async ({ key, index }) => {
-    f.calls.push(`summary-${index}`);
-    const ticket = f.issues.find((issue) => issue.key === key);
-    return `${key}: ${ticket.fields.description.content[0].content[0].text}`;
-  };
-  await runNativeRovoJourney({ ...f.input, summarize });
-  assert.deepEqual(f.calls.slice(5), ['create', 'summary-1', 'summary-2', 'delete', 'delete']);
-  assert.equal(f.owned.run.state.testStatus, 'passed');
-  assert.deepEqual(f.issues, [f.baseline]);
-
-  const g = fixture();
-  await assert.rejects(
-    runNativeRovoJourney({ ...g.input, summarize: async ({ key }) => `${key}: a summary` }),
-    /Description marker/,
-  );
-  assert.equal(g.owned.run.state.testStatus, 'failed');
-  assert.equal(g.owned.run.state.status, 'clean');
-  assert.deepEqual(g.issues, [g.baseline]);
 });

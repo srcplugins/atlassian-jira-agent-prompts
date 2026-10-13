@@ -70,6 +70,8 @@ function world(seed, features) {
     jira.fields.updated += '1';
   };
   const p = {
+    refreshAfterSave: async () => false,
+    retainedTypes: async () => [],
     config: async () => (await gate(), '3'),
     field: async () => (await gate(), FIELD),
     allowed: async () => void (await gate()),
@@ -214,7 +216,7 @@ async function explore(seed, now) {
       assert.equal(block(w.jira.fields.description).length, 0, `${label}: deselect left the block`);
     } else if (!faulty) assert.fail(`${label}: deselect failed: ${cleared.error?.message}`);
   } else if (!faulty && !features.native)
-    assert.fail(`${label}: normalization alone left the ticket unresolved`);
+    assert.fail(`${label}: normalization alone left the work item unresolved`);
   return outcome;
 }
 
@@ -226,7 +228,9 @@ test('the save protocol stays safe and recoverable across seeded interleavings a
     const outcome = await explore(seed, now);
     outcomes[outcome] = (outcomes[outcome] ?? 0) + 1;
   }
-  // Coverage guard: each recovery path is actually exercised, so the test cannot go vacuous.
-  for (const outcome of ['saved', 'released', 'accepted', 'pending'])
+  // Coverage guard: each recovery path is actually exercised, so the test cannot go vacuous. The
+  // native edits here append outside the block, so no fault leaves a save pending for good.
+  assert.equal(outcomes.pending, undefined, JSON.stringify(outcomes));
+  for (const outcome of ['saved', 'released', 'accepted'])
     assert.ok(outcomes[outcome] > 0, `no ${outcome} outcome in ${JSON.stringify(outcomes)}`);
 });

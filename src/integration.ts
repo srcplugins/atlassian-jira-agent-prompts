@@ -1,10 +1,17 @@
 import { createSettings, type SettingsPorts, type SettingsRecord } from './settings';
-import { createWizard, type WizardPorts, type WizardRecord, type WizardProject } from './wizard';
+import {
+  createConfigurationBatch,
+  type BatchPorts,
+  type BatchRecord,
+  type InventoryProject,
+} from './configuration-batch';
 import { resolveSafely } from './shared/resolver.mjs';
 import {
   JiraHttpError,
   isDefinitiveRejection,
+  projectContext,
   requireCompanyManagedSoftware,
+  requireEmptyPayload,
   requireProjectKey,
   rovoAccountId,
 } from './shared/jira.mjs';
@@ -12,6 +19,7 @@ import {
   createService,
   JiraRejected,
   JiraUnavailable,
+  StorageUnavailable,
   numeric,
   UserError,
   type Context,
@@ -20,7 +28,7 @@ import {
   type Prompt,
   type Stored,
 } from './service';
-import { DescriptionError, validateDescription } from './description';
+import { DescriptionError } from './description';
 interface Sdk {
   Resolver: typeof import('@forge/resolver').default;
   api: typeof import('@forge/api').default;
@@ -54,20 +62,27 @@ function classifyWrite(
     );
   throw error;
 }
+/** One exact work item key such as TEAM-42. Jira keys are case-insensitive, so a key typed in
+ * lower case is upper-cased; anything else, including a numeric ID, is refused. */
+function exactKey(value: unknown, message: string) {
+  const key = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  if (!/^[A-Z][A-Z0-9_]{1,30}-[1-9][0-9]{0,19}$/.test(key)) throw new UserError(message);
+  return key;
+}
+/** The trusted space (and, on a work item, its ID) from a field or search resolver context. */
 function context(raw: unknown): Context {
-  if (
-    !record(raw) ||
-    typeof raw.accountId !== 'string' ||
-    !raw.accountId ||
-    !record(raw.extension) ||
-    !record(raw.extension.project)
-  )
-    throw new UserError('Open this app in a Jira project.');
-  return {
-    accountId: raw.accountId,
-    projectId: numeric(raw.extension.project.id),
-    ...(record(raw.extension.issue) ? { issueId: numeric(raw.extension.issue.id) } : {}),
-  };
+  const { accountId, projectId } = projectContext(raw);
+  const issue = (raw as { extension: Record<string, unknown> }).extension.issue;
+  return { accountId, projectId, ...(record(issue) ? { issueId: numeric(issue.id) } : {}) };
+}
+/** Reads one operational record. A failing storage call is reported as storage being unavailable,
+ * so callers can tell an outage from a defect. */
+async function readState<T>(kvs: Sdk['kvs'], key: string) {
+  try {
+    return await kvs.entity<T>('native-prompt-state').get(key);
+  } catch {
+    throw new StorageUnavailable('App storage is unavailable. Try again shortly.');
+  }
 }
 function requester({ api }: Sdk) {
   async function request(path: ReturnType<Sdk['route']>, method = 'GET', body?: unknown) {
@@ -103,24 +118,23 @@ function requester({ api }: Sdk) {
 export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldType }: Sdk): Ports {
   const request = requester({ api, route, kvs, Filter, FilterConditions, fieldType } as Sdk);
   let fieldPromise: Promise<string> | undefined;
+  // One space settings record serves three lookups; read it once per request. These ports never
+  // write it (configuration writes go through the settings ports), so the copy cannot go stale.
+  const settings = new Map<string, Promise<SettingsRecord | undefined>>();
+  const spaceSettings = (project: string) => {
+    if (!settings.has(project))
+      settings.set(project, readState<SettingsRecord>(kvs, `config-${project}`));
+    return settings.get(project)!;
+  };
   return {
     refreshAfterSave: async (project) =>
-      (await kvs.entity<SettingsRecord>('native-prompt-state').get(`config-${project}`))?.data
-        .refreshAfterSave === true,
-
-    config: async (project) =>
-      (
-        await kvs
-          .entity<{ revision: number; data: { type: string } }>('native-prompt-state')
-          .get(`config-${project}`)
-      )?.data.type,
-    retainedTypes: async (project) =>
-      (await kvs.entity<SettingsRecord>('native-prompt-state').get(`config-${project}`))?.data
-        .previousTypes ?? [],
+      (await spaceSettings(project))?.data.refreshAfterSave === true,
+    config: async (project) => (await spaceSettings(project))?.data.type,
+    retainedTypes: async (project) => (await spaceSettings(project))?.data.previousTypes ?? [],
     project: async (id) => {
       const value = await request(route`/rest/api/3/project/${id}`);
       if (!value || value.id !== id || !Array.isArray(value.issueTypes))
-        throw new UserError('Incomplete project data.');
+        throw new UserError('Incomplete space data.');
       return value;
     },
     allowed: async (project, permission, issue) => {
@@ -130,7 +144,9 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
           : route`/rest/api/3/mypermissions?projectId=${project}&permissions=${permission}`,
       );
       if (value?.permissions?.[permission]?.havePermission !== true)
-        throw new UserError(`Missing Jira permission: ${permission}.`);
+        throw new UserError(
+          `This needs the Jira permission ${permission === 'ADMINISTER' ? 'Administer Jira' : 'Edit work items'}.`,
+        );
     },
     field: () => {
       fieldPromise ??= (async () => {
@@ -138,7 +154,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
         if (!Array.isArray(fields)) throw new UserError('Incomplete Jira field data.');
         const matches = fields.filter((f) => f.schema?.custom === fieldType());
         if (matches.length !== 1 || !/^customfield_[1-9]\d*$/.test(matches[0].id))
-          throw new UserError('Add the Agent Prompts field to this issue screen.');
+          throw new UserError('Add the Agent Prompts field to this work item’s screen.');
         return matches[0].id;
       })();
       return fieldPromise;
@@ -146,7 +162,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
     search: async (project, type, input) => {
       if (input) {
         const query = input.query?.trim() ?? '';
-        // Treat input as text, never as executable JQL/Lucene syntax. Exact issue keys
+        // Treat input as text, never as executable JQL/Lucene syntax. Exact work item keys
         // use Jira's key lookup; words use ANDed, escaped prefix terms in Summary.
         const key = /^[A-Z][A-Z0-9_]*-[1-9]\d*$/i.test(query);
         const tokens = (query.match(/[\p{L}\p{N}_]+/gu) ?? []).map((word) => word.toLowerCase());
@@ -178,7 +194,8 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
         } catch (error) {
           // Jira answers 400 for an exact key that does not exist or is not visible, and for
           // text it cannot parse. Either way nothing matches; it is not an access failure.
-          if (query && error instanceof JiraHttpError && error.status === 400)
+          // A follow-up page (expired or invalid cursor) is a failed page, never the end of results.
+          if (query && !input.cursor && error instanceof JiraHttpError && error.status === 400)
             return { prompts: [], incomplete: false };
           throw error;
         }
@@ -231,9 +248,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
             throw new UserError('Incomplete prompt metadata.');
           numeric(issue.id);
           if (prompts.some((p) => p.id === issue.id))
-            throw new UserError(
-              'Jira returned repeated search results. Check configuration again.',
-            );
+            throw new UserError('Jira returned repeated search results. Check the space again.');
           if (prompts.length === 120) return { prompts, incomplete: true };
           prompts.push({ id: issue.id, key: issue.key, name: issue.fields.summary });
         }
@@ -251,7 +266,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
     },
     issue: async (id, field) => {
       if (!/^(?:[1-9]\d{0,19}|[A-Z][A-Z0-9_]{1,30}-[1-9]\d*)$/.test(id))
-        throw new UserError('Invalid issue key.');
+        throw new UserError('Invalid work item key.');
       const fields = `project,issuetype,summary,description,updated${field ? `,${field}` : ''}`;
       const value = await request(route`/rest/api/3/issue/${id}?fields=${fields}`);
       if (
@@ -261,7 +276,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
         typeof value.fields?.updated !== 'string' ||
         !('description' in value.fields)
       )
-        throw new UserError('Incomplete issue data.');
+        throw new UserError('Incomplete work item data.');
       numeric(value.id);
       numeric(value.fields.project?.id);
       numeric(value.fields.issuetype?.id);
@@ -275,12 +290,12 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
         // transports and unreadable successes stay uncertain.
         classifyWrite(e, 'issue-edit', (status) =>
           status === 400
-            ? 'Jira rejected this save (HTTP 400). Check that the Agent Prompts field is available on this ticket, then save again.'
+            ? 'Jira rejected this save (HTTP 400). Check that the Agent Prompts field is available on this work item and that the description is not too long, then save again.'
             : `Jira rejected this save (HTTP ${status}). Review your selection and save again.`,
         );
       }
     },
-    get: (id) => kvs.entity<Stored>('native-prompt-state').get(`issue-${id}`),
+    get: (id) => readState<Stored>(kvs, `issue-${id}`),
     cas: async (id, revision, data) => {
       if (Buffer.byteLength(JSON.stringify(data), 'utf8') > 190_000)
         throw new UserError('Operational state is too large.');
@@ -311,7 +326,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
   const { route, kvs, Filter, FilterConditions } = sdk;
   const request = requester(sdk);
   return {
-    get: (project) => kvs.entity<SettingsRecord>('native-prompt-state').get(`config-${project}`),
+    get: (project) => readState<SettingsRecord>(kvs, `config-${project}`),
     cas: async (project, revision, data) => {
       try {
         await kvs
@@ -330,15 +345,17 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
           .execute();
       } catch {
         throw new UserError(
-          'Configuration changed or storage is unavailable. Check configuration again.',
+          'Configuration changed or storage is unavailable. Check the space again.',
         );
       }
     },
     types: async () => {
       const value = await request(route`/rest/api/3/issuetype`);
+      // Team-managed spaces each bring their own (scoped) types, so only global types are capped.
       if (
         !Array.isArray(value) ||
-        value.length > 2000 ||
+        value.length > 50_000 ||
+        value.filter((t) => !t?.scope).length > 2000 ||
         value.some(
           (t) =>
             !t ||
@@ -347,7 +364,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
             (t.hierarchyLevel !== undefined && !Number.isInteger(t.hierarchyLevel)),
         )
       )
-        throw new UserError('Incomplete or oversized ticket type list.');
+        throw new UserError('Incomplete or oversized work type list.');
       return value.map((t) => ({
         id: numeric(t.id),
         name: t.name,
@@ -359,7 +376,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
     scheme: async (project) => {
       const result = await request(route`/rest/api/3/issuetypescheme/project?projectId=${project}`);
       if (result?.isLast !== true || result.values?.length !== 1)
-        throw new UserError('Could not identify one complete project type scheme.');
+        throw new UserError('Could not identify the space’s work type scheme.');
       const id = numeric(result.values[0].issueTypeScheme?.id);
       const expanded = await request(route`/rest/api/3/issuetypescheme?id=${id}&expand=projects`);
       const item = expanded?.values?.[0];
@@ -370,13 +387,24 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
         typeof item.name !== 'string'
       )
         throw new UserError('Incomplete scheme data.');
+      // Jira embeds one page of the scheme's spaces. When it holds only part of them, the scheme
+      // can still be used as it is, but the app never adds a type to it (see plan).
       if (
         !item.isDefault &&
-        (item.projects?.isLast !== true || !Array.isArray(item.projects.values))
+        (item.projects?.isLast !== true ||
+          !Array.isArray(item.projects.values) ||
+          item.projects.values.length > 1000 ||
+          (item.projects.total !== undefined &&
+            item.projects.total !== item.projects.values.length))
       )
-        throw new UserError(
-          'Scheme project list is incomplete; no automatic changes are available.',
-        );
+        return {
+          id,
+          name: item.name,
+          isDefault: false,
+          projectIds: [],
+          projects: [],
+          complete: false,
+        };
       const projects = item.isDefault
         ? []
         : item.projects.values
@@ -388,13 +416,11 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
             .sort((a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id));
       if (
         !item.isDefault &&
-        (projects.length > 1000 ||
-          new Set(projects.map((p: { id: string }) => p.id)).size !== projects.length ||
-          !projects.some((p: { id: string }) => p.id === project) ||
-          (item.projects.total !== undefined && item.projects.total !== projects.length))
+        (new Set(projects.map((p: { id: string }) => p.id)).size !== projects.length ||
+          !projects.some((p: { id: string }) => p.id === project))
       )
         throw new UserError(
-          'Scheme project list is incomplete or inconsistent; no automatic changes are available.',
+          'The scheme’s space list is inconsistent; no automatic changes are available.',
         );
       return {
         id,
@@ -432,7 +458,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
           e,
           'issuetypescheme-add',
           (status) =>
-            `Jira rejected adding the type to the project's scheme (HTTP ${status}). The scheme was not changed.`,
+            `Jira rejected adding the type to the space's scheme (HTTP ${status}). The scheme was not changed.`,
         );
       }
     },
@@ -448,7 +474,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
         typeof value.isLast !== 'boolean' ||
         value.issues.some((i: { key?: unknown }) => typeof i.key !== 'string')
       )
-        throw new UserError('Incomplete linked-ticket impact data.');
+        throw new UserError('Jira returned incomplete data about work items using these prompts.');
       return { keys: value.issues.map((i: { key: string }) => i.key), incomplete: !value.isLast };
     },
     createFields: async (project, type) => {
@@ -461,20 +487,22 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
     },
   };
 }
-export function createWizardPorts(sdk: Sdk): WizardPorts {
+// Storage key of the unfinished multi-space configuration. Renaming it would orphan a saved run.
+const batchStorageKey = 'configuration-batch';
+export function createBatchPorts(sdk: Sdk): BatchPorts {
   const request = requester(sdk);
   const { route, kvs, Filter, FilterConditions } = sdk;
   return {
     admin: async () => {
       const value = await request(route`/rest/api/3/mypermissions?permissions=ADMINISTER`);
       if (value?.permissions?.ADMINISTER?.havePermission !== true)
-        throw new UserError('Missing Jira permission: ADMINISTER.');
+        throw new UserError('This needs the Jira permission Administer Jira.');
     },
     projects: async () => {
-      const projects: WizardProject[] = [];
+      const projects: InventoryProject[] = [];
       const seen = new Set<string>();
       let start = 0;
-      // Team-managed projects are fetched and discarded, so stay well inside the resolver's
+      // Team-managed spaces are fetched and discarded, so stay well inside the resolver's
       // 25-second limit and report a partial inventory instead of timing out.
       const deadline = Date.now() + 15_000;
       for (let page = 0; page < 20; page++) {
@@ -485,7 +513,7 @@ export function createWizardPorts(sdk: Sdk): WizardPorts {
             route`/rest/api/3/project/search?typeKey=software&status=live&orderBy=key&startAt=${start}&maxResults=100`,
           );
         } catch (error) {
-          // Documented: 404 when no project matches the search.
+          // Documented: 404 when no space matches the search.
           if (!page && error instanceof JiraHttpError && error.status === 404)
             return { projects: [], incomplete: false };
           throw error;
@@ -495,7 +523,7 @@ export function createWizardPorts(sdk: Sdk): WizardPorts {
           value.startAt !== start ||
           typeof value.isLast !== 'boolean'
         )
-          throw new UserError('Project inventory is incomplete. Reload before choosing projects.');
+          throw new UserError('Space inventory is incomplete. Reload before choosing spaces.');
         for (const item of value.values) {
           const id = numeric(item?.id);
           if (
@@ -505,31 +533,31 @@ export function createWizardPorts(sdk: Sdk): WizardPorts {
             !['classic', 'next-gen'].includes(item.style)
           )
             throw new UserError(
-              'Project inventory changed or has an unsupported shape. Reload before choosing projects.',
+              'Space inventory changed or has an unsupported shape. Reload before choosing spaces.',
             );
           seen.add(id);
           if (item.style === 'classic') projects.push({ id, key: item.key, name: item.name });
         }
         if (projects.length > 200) return { projects: projects.slice(0, 200), incomplete: true };
         if (value.isLast) return { projects, incomplete: false };
-        if (!value.values.length) throw new UserError('Project inventory did not advance.');
+        if (!value.values.length) throw new UserError('Space inventory did not advance.');
         start += value.values.length;
       }
       return { projects, incomplete: true };
     },
-    get: () => kvs.entity<WizardRecord>('native-prompt-state').get('wizard'),
+    get: () => readState<BatchRecord>(kvs, batchStorageKey),
     cas: async (revision, data) => {
       if (Buffer.byteLength(JSON.stringify(data), 'utf8') > 190_000)
-        throw new UserError('Configuration contains too many projects. Select a smaller group.');
+        throw new UserError('Configuration contains too many spaces. Select a smaller group.');
       try {
         await kvs
           .transact()
           .set(
-            'wizard',
+            batchStorageKey,
             { revision: revision + 1, data: JSON.parse(JSON.stringify(data)) },
             {
               entityName: 'native-prompt-state',
-              conditions: new Filter<WizardRecord>().and(
+              conditions: new Filter<BatchRecord>().and(
                 'revision',
                 revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
               ),
@@ -556,11 +584,9 @@ export function registerResolvers(sdk: Sdk) {
           !raw.accountId ||
           !record(raw.extension)
         )
-          throw new UserError('Open Jira app settings.');
-        const payload = request.payload ?? {};
-        if (!record(payload) || Object.keys(payload).length)
-          throw new UserError('Unexpected project inventory fields.');
-        const ports = createWizardPorts(sdk);
+          throw new UserError('Open Configure Agent Prompts for Jira in Jira settings.');
+        requireEmptyPayload(request.payload ?? {});
+        const ports = createBatchPorts(sdk);
         await ports.admin();
         return ports.projects();
       },
@@ -577,7 +603,7 @@ export function registerResolvers(sdk: Sdk) {
     'advance',
     'stop',
   ] as const)
-    resolver.define(`wizard-${action}`, (request) =>
+    resolver.define(`configuration-${action}`, (request) =>
       resolveSafely(
         async () => {
           const raw = request.context as unknown;
@@ -587,7 +613,7 @@ export function registerResolvers(sdk: Sdk) {
             !raw.accountId ||
             !record(raw.extension)
           )
-            throw new UserError('Open Jira app settings.');
+            throw new UserError('Open Configure Agent Prompts for Jira in Jira settings.');
           const payload = request.payload ?? {};
           const fields =
             action === 'preview'
@@ -606,7 +632,9 @@ export function registerResolvers(sdk: Sdk) {
                   ? ['id', 'revision']
                   : action === 'stop'
                     ? ['id', 'revision', 'acknowledged']
-                    : [];
+                    : action === 'cancel-interrupted'
+                      ? ['id']
+                      : [];
           if (!record(payload) || Object.keys(payload).some((key) => !fields.includes(key)))
             throw new UserError('Unexpected configuration request fields.');
           if (
@@ -614,10 +642,10 @@ export function registerResolvers(sdk: Sdk) {
             (!Number.isSafeInteger(payload.revision) || Number(payload.revision) < 0)
           )
             throw new UserError('Invalid configuration revision.');
-          const wizard = createWizard(
+          const batch = createConfigurationBatch(
             createPorts(sdk),
             createSettingsPorts(sdk),
-            createWizardPorts(sdk),
+            createBatchPorts(sdk),
           );
           if (action === 'preview' || action === 'start') {
             if (
@@ -628,7 +656,7 @@ export function registerResolvers(sdk: Sdk) {
               (payload.refreshAfterSave !== undefined &&
                 typeof payload.refreshAfterSave !== 'boolean')
             )
-              throw new UserError('Invalid ticket type.');
+              throw new UserError('Invalid work type.');
             const input = {
               ...(typeof payload.name === 'string' ? { name: payload.name } : {}),
               ...(typeof payload.type === 'string' ? { type: payload.type } : {}),
@@ -639,7 +667,7 @@ export function registerResolvers(sdk: Sdk) {
                 : {}),
             };
             if (action === 'preview')
-              return wizard.preview(raw.accountId, String(payload.projectId ?? ''), input);
+              return batch.preview(raw.accountId, String(payload.projectId ?? ''), input);
             if (
               !Array.isArray(payload.entries) ||
               payload.entries.some(
@@ -650,36 +678,36 @@ export function registerResolvers(sdk: Sdk) {
                   Object.keys(e).some((k) => !['projectId', 'fingerprint'].includes(k)),
               )
             )
-              throw new UserError('Invalid reviewed projects.');
-            return wizard.start(
+              throw new UserError('Invalid reviewed spaces.');
+            return batch.start(
               raw.accountId,
               input,
               payload.entries as { projectId: string; fingerprint: string }[],
               Number(payload.revision),
             );
           }
-          if (action === 'cancel-interrupted') return wizard.cancelInterrupted(raw.accountId);
+          if (action === 'cancel-interrupted') {
+            if (payload.id !== undefined && (typeof payload.id !== 'string' || !payload.id))
+              throw new UserError('Invalid configuration request.');
+            return batch.cancelInterrupted(raw.accountId, payload.id as string | undefined);
+          }
           if (action === 'advance')
-            return wizard.advance(
-              raw.accountId,
-              String(payload.id ?? ''),
-              Number(payload.revision),
-            );
+            return batch.advance(raw.accountId, String(payload.id ?? ''), Number(payload.revision));
           if (action === 'stop')
-            return wizard.stop(
+            return batch.stop(
               raw.accountId,
               String(payload.id ?? ''),
               Number(payload.revision),
               payload.acknowledged === true,
             );
-          return wizard[action]();
+          return batch[action]();
         },
         (e) => e instanceof UserError,
       ),
     );
   for (const name of [
     'setup',
-    'library',
+    'search',
     'load',
     'save',
     'save-status',
@@ -698,8 +726,8 @@ export function registerResolvers(sdk: Sdk) {
               ? ['ids', 'revision', 'fingerprint']
               : name === 'resolve-save' || name === 'accept-save'
                 ? ['revision', 'fingerprint', 'acknowledged']
-                : name === 'library'
-                  ? ['query', 'cursor', 'surface']
+                : name === 'search'
+                  ? ['query', 'cursor']
                   : [];
           if (Object.keys(payload).some((k) => !allowed.includes(k)))
             throw new UserError('Unexpected request fields.');
@@ -716,15 +744,15 @@ export function registerResolvers(sdk: Sdk) {
             );
           if (name === 'save')
             return service.save(c, payload as unknown as Parameters<typeof service.save>[1]);
-          if (name === 'library') return service.library(c, payload);
+          if (name === 'search') return service.search(c, payload);
           return service[name](c);
         },
         (e) => e instanceof UserError || e instanceof DescriptionError,
       ),
     );
   }
-  // Settings resolvers serve the project details view. Type changes and unlink go through the
-  // reviewed wizard batch, which serializes configuration writes.
+  // Settings resolvers serve the space details view. Type changes and setup removal go through
+  // the reviewed multi-space configuration, which serializes configuration writes.
   const actions = ['health', 'recover', 'resolve', 'preferences'] as const;
   for (const action of actions)
     resolver.define(`settings-${action}`, (request) =>
@@ -757,11 +785,11 @@ export function registerResolvers(sdk: Sdk) {
             !raw.accountId ||
             !record(raw.extension)
           )
-            throw new UserError('Open Jira app settings.');
+            throw new UserError('Open Configure Agent Prompts for Jira in Jira settings.');
           const trustedProject = record(raw.extension.project)
             ? numeric(raw.extension.project.id)
             : undefined;
-          // Administration may target a selected project from either app surface.
+          // Administration may target a selected space from either app surface.
           // Every settings operation checks ADMINISTER on that explicit target.
           const c = {
             accountId: raw.accountId,
@@ -773,11 +801,11 @@ export function registerResolvers(sdk: Sdk) {
                   typeof reference !== 'string' ||
                   !/^(?:[1-9]\d{0,19}|[A-Z][A-Z0-9_]{1,30})$/.test(reference)
                 )
-                  throw new UserError('Enter a Jira project key or numeric ID.');
+                  throw new UserError('Enter a Jira space key or numeric ID.');
                 if (/^[1-9]\d*$/.test(reference)) return reference;
                 // Resolve a key only for a Jira administrator, so the lookup reveals nothing
                 // a non-administrator could not already learn from Jira.
-                await createWizardPorts(sdk).admin();
+                await createBatchPorts(sdk).admin();
                 const value = await requester(sdk)(sdk.route`/rest/api/3/project/${reference}`);
                 return numeric(value?.id);
               })()),
@@ -800,67 +828,32 @@ export function registerRovo(sdk: Sdk) {
     resolveSafely(
       async () => {
         const accountId = rovoAccountId(raw);
-        const projectKey = requireProjectKey(record(payload) ? payload.projectKey : undefined);
-        if (!record(payload)) throw new UserError('Provide an explicit Jira project key.');
+        // A payload that is not an object has no space key, so requireProjectKey refuses it.
+        const input: Record<string, unknown> = record(payload) ? payload : {};
+        const projectKey = requireProjectKey(input.projectKey);
+        // Validate the whole request before any Jira call. The action reads one exact key, as
+        // its manifest description says; a numeric ID is not accepted here.
+        const promptKey =
+          input.promptKey !== undefined && input.promptKey !== ''
+            ? exactKey(input.promptKey, 'Provide one exact prompt key, such as TEAM-42.')
+            : undefined;
+        if (!promptKey && (typeof input.query !== 'string' || input.query.length > 200))
+          throw new UserError('Provide a search query of at most 200 characters.');
         const service = createService(createPorts(sdk));
-        // Resolve explicit project through the actor-bound API, never from chat identity fields.
+        // Resolve the explicit space through the actor-bound API, never from chat identity fields.
         let project: unknown;
         try {
           project = await requester(sdk)(sdk.route`/rest/api/3/project/${projectKey}`);
         } catch (error) {
           if (error instanceof JiraHttpError && error.status === 429) throw error;
-          if (error instanceof JiraHttpError) throw new UserError('Project is unavailable.');
+          if (error instanceof JiraHttpError) throw new UserError('Space is unavailable.');
           throw error;
         }
         const checked = requireCompanyManagedSoftware(project, projectKey) as { id: unknown };
         const c = { accountId, projectId: numeric(String(checked.id)) };
-        if (typeof payload.promptKey === 'string' && payload.promptKey)
-          return service.read(c, payload.promptKey);
-        if (typeof payload.query !== 'string' || payload.query.length > 200)
-          throw new UserError('Provide a search query of at most 200 characters.');
-        const result = await service.library(c, { query: payload.query });
-        const matches = result.prompts;
-        return {
-          prompts: matches.slice(0, 20),
-          incomplete: result.incomplete || matches.length > 20,
-        };
-      },
-      (e) => e instanceof UserError || e instanceof DescriptionError,
-    );
-}
-
-export function registerDescriptionRovo(sdk: Sdk) {
-  return async (payload: unknown, raw: unknown) =>
-    resolveSafely(
-      async () => {
-        rovoAccountId(raw);
-        if (
-          !record(payload) ||
-          typeof payload.issueKey !== 'string' ||
-          !/^[A-Z][A-Z0-9_]{1,30}-[1-9][0-9]{0,19}$/.test(payload.issueKey)
-        )
-          throw new UserError('Provide one exact Jira ticket key.');
-        const value = await requester(sdk)(
-          sdk.route`/rest/api/3/issue/${payload.issueKey}?fields=description&expand=renderedFields`,
-        );
-        if (!record(value) || value.key !== payload.issueKey || !record(value.fields))
-          throw new UserError('Jira returned an unexpected ticket.');
-        validateDescription(value.fields.description);
-        const rendered = record(value.renderedFields) ? value.renderedFields.description : null;
-        if (rendered !== null && rendered !== undefined && typeof rendered !== 'string')
-          throw new UserError('Jira returned an unreadable rendered Description.');
-        const result = {
-          issueKey: value.key,
-          descriptionAdf: value.fields.description,
-          renderedDescriptionHtml: rendered ?? null,
-          provenance:
-            'One asUser Jira issue GET. No linked source issue was fetched. These are API representations, not the browser-rendered Description or external-agent payload.',
-        };
-        if (Buffer.byteLength(JSON.stringify(result), 'utf8') > 60000)
-          throw new UserError(
-            'Description is too large for this summary. No content was truncated.',
-          );
-        return result;
+        if (promptKey) return service.read(c, promptKey);
+        const result = await service.search(c, { query: input.query as string }, 20);
+        return { prompts: result.prompts, incomplete: result.incomplete };
       },
       (e) => e instanceof UserError || e instanceof DescriptionError,
     );

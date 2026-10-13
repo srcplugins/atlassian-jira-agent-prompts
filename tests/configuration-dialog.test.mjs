@@ -1,8 +1,9 @@
 import './typescript-loader.mjs';
-import { readProjects } from '../src/project-reads.ts';
+import { readSpaces } from '../src/space-reads.ts';
+import { finished } from '../src/batch-status.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wizardFixture } from './wizard-fixture.mjs';
+import { batchFixture } from './batch-fixture.mjs';
 import { bridgeClient, hookHost, load, standIns, view } from './support/ui-harness.mjs';
 function ui(f, selected = [...f.projects.values()]) {
   const calls = [];
@@ -16,23 +17,23 @@ function ui(f, selected = [...f.projects.values()]) {
         if (f.healthFailure) throw Error('Diagnostic unavailable');
         value = { state: { data: {} }, checks: [{ ok: true, label: 'Type', detail: 'Available' }] };
       }
-      if (name === 'wizard-catalog') {
+      if (name === 'configuration-catalog') {
         if (f.catalogFailure) throw Error('Catalog unavailable');
         value = await f.api.catalog();
       }
-      if (name === 'wizard-status') {
+      if (name === 'configuration-status') {
         if (f.statusFailure) throw Error('Progress unavailable');
         value = await f.api.status();
       }
-      if (name === 'wizard-preview')
+      if (name === 'configuration-preview')
         value = await f.api.preview(f.actor ?? 'admin', p.projectId, p);
-      if (name === 'wizard-start')
+      if (name === 'configuration-start')
         value = await f.api.start(f.actor ?? 'admin', p, p.entries, p.revision);
-      if (name === 'wizard-advance')
+      if (name === 'configuration-advance')
         value = await f.api.advance(f.actor ?? 'admin', p.id, p.revision);
-      if (name === 'wizard-stop')
+      if (name === 'configuration-stop')
         value = await f.api.stop(f.actor ?? 'admin', p.id, p.revision, p.acknowledged);
-      if (f.dropStart && name === 'wizard-start') {
+      if (f.dropStart && name === 'configuration-start') {
         f.dropStart = false;
         throw Error('Response lost');
       }
@@ -44,7 +45,8 @@ function ui(f, selected = [...f.projects.values()]) {
   const hooks = hookHost();
   const { ConfigurationDialog } = load('configuration-dialog.tsx', {
     react: hooks.react,
-    './project-reads': { readProjects },
+    './space-reads': { readSpaces },
+    './batch-status': { finished },
     './client': bridgeClient(invoke),
     '@forge/react': {
       useProductContext: () => ({ accountId: f.actor ?? 'admin' }),
@@ -87,15 +89,15 @@ function ui(f, selected = [...f.projects.values()]) {
     disabled: (label) => v.button(label)?.props.isDisabled,
   };
 }
-test('wizard UI checks all existing projects, creates nothing until confirmation, and finishes each saved mapping', async () => {
-  const f = wizardFixture();
+test('configuration dialog checks all existing spaces, creates nothing until confirmation, and finishes each saved setup', async () => {
+  const f = batchFixture();
   const v = ui(f);
   assert.deepEqual(v.calls, []);
   assert.equal(v.hasButton('Check saved progress'), false);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
-  v.change('Checkbox', 'Reload ticket after saving prompts', { target: { checked: true } });
+  v.change('Checkbox', 'Reload work item after saving prompts', { target: { checked: true } });
   await v.click('Review changes');
   assert.deepEqual(f.writes, []);
   assert.equal(v.disabled('Apply changes'), false);
@@ -113,12 +115,37 @@ test('wizard UI checks all existing projects, creates nothing until confirmation
   assert.equal(f.state().data.entries.length, 3);
   assert.equal(f.configs.has('8'), false);
   for (const id of ['1', '2', '7']) assert.equal(f.configs.get(id).data.refreshAfterSave, true);
-  assert.match(v.text(), /3 of 3 projects configured/);
+  assert.match(v.text(), /3 of 3 spaces configured/);
   assert.equal(v.hasButton('Check ONE — One'), false);
   assert.equal(f.writes.filter((x) => x === 'create').length, 1);
 });
-test('wizard UI exposes per-project blockers and disables confirmation without side effects', async () => {
-  const f = wizardFixture();
+test('a step that applied nothing stops the automatic advance and offers Continue reviewed changes', async () => {
+  const { JiraUnavailable } = await import('../src/service.ts');
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Review changes');
+  // Every second type read fails: advance's fresh review passes, apply's own review does not,
+  // so the server returns the batch ready at the same project with nothing applied.
+  const types = f.s.types;
+  let reads = 0;
+  f.s.types = async () => {
+    if (++reads % 2 === 0)
+      throw new JiraUnavailable('Jira connection failed. No write was retried.');
+    return types();
+  };
+  await v.click('Apply changes');
+  assert.equal(v.calls.filter((name) => name === 'configuration-advance').length, 1);
+  assert.equal(f.state().data.status, 'ready');
+  assert.equal(f.state().data.index, 0);
+  assert.deepEqual(f.writes, []);
+  assert.match(v.text(), /Nothing was changed/);
+  assert.equal(v.hasButton('Continue reviewed changes'), true);
+});
+test('configuration dialog exposes per-space blockers and disables confirmation without side effects', async () => {
+  const f = batchFixture();
   f.schemes.get('2').isDefault = true;
   const v = ui(f);
   await v.mount();
@@ -129,8 +156,8 @@ test('wizard UI exposes per-project blockers and disables confirmation without s
   assert.match(v.text(), /Blocked:.*default/);
   assert.deepEqual(f.writes, []);
 });
-test('wizard UI can reopen durable progress even when initial confirmation response was lost', async () => {
-  const f = wizardFixture();
+test('configuration dialog can reopen durable progress even when initial confirmation response was lost', async () => {
+  const f = batchFixture();
   const r = await f.start();
   await f.api.advance('admin', r.data.id, r.revision);
   const v = ui(f);
@@ -143,7 +170,7 @@ test('wizard UI can reopen durable progress even when initial confirmation respo
 });
 
 test('confirmation response loss exposes read-only recovery without a duplicate create', async () => {
-  const f = wizardFixture();
+  const f = batchFixture();
   f.dropStart = true;
   const v = ui(f);
   await v.mount();
@@ -160,7 +187,7 @@ test('confirmation response loss exposes read-only recovery without a duplicate 
 });
 
 test('a completed prior run does not prevent opening a fresh review', async () => {
-  const f = wizardFixture();
+  const f = batchFixture();
   let r = await f.start();
   while (r.data.status === 'ready') r = await f.api.advance('admin', r.data.id, r.revision);
   const v = ui(f);
@@ -171,8 +198,8 @@ test('a completed prior run does not prevent opening a fresh review', async () =
   assert.equal(v.hasButton('Done'), false);
 });
 
-test('shared review lists unselected affected projects and requires acknowledgment before applying', async () => {
-  const f = wizardFixture();
+test('shared review lists unselected affected spaces and requires acknowledgment before applying', async () => {
+  const f = batchFixture();
   const scheme = { id: '91', name: 'Shared', projectIds: ['1', '2', '7'], isDefault: false };
   for (const id of scheme.projectIds) f.schemes.set(id, scheme);
   const v = ui(f, [f.projects.get('1'), f.projects.get('2')]);
@@ -181,10 +208,10 @@ test('shared review lists unselected affected projects and requires acknowledgme
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
   await v.click('Review changes');
   assert.equal(v.disabled('Apply changes'), true);
-  assert.match(v.text(), /3 projects.*2 selected.*1 additional/);
+  assert.match(v.text(), /3 spaces.*2 selected.*1 additional/);
   assert.match(v.text(), /PR7/);
   assert.match(v.text(), /Type available only/);
-  v.change('Checkbox', 'I approve the shared scheme changes for all listed affected projects.', {
+  v.change('Checkbox', 'I approve the shared scheme changes for all listed affected spaces.', {
     target: { checked: true },
   });
   assert.equal(v.disabled('Apply changes'), false);
@@ -194,12 +221,12 @@ test('shared review lists unselected affected projects and requires acknowledgme
   assert.equal(f.configs.has('7'), false);
 });
 
-test('bulk setup saves the selected reload preference for every reviewed project', async () => {
-  const f = wizardFixture();
+test('bulk setup saves the selected reload preference for every reviewed space', async () => {
+  const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-type', { value: '3' });
-  v.change('Checkbox', 'Reload ticket after saving prompts', { target: { checked: true } });
+  v.change('Checkbox', 'Reload work item after saving prompts', { target: { checked: true } });
   await v.click('Review changes');
   await v.click('Apply changes');
   for (const id of ['1', '2', '7']) assert.equal(f.configs.get(id).data.refreshAfterSave, true);
@@ -207,8 +234,8 @@ test('bulk setup saves the selected reload preference for every reviewed project
   assert.deepEqual(v.closed, [true]);
 });
 
-test('bulk unlink is reviewed, preserves Jira and reports only selected projects', async () => {
-  const f = wizardFixture();
+test('bulk setup removal is reviewed, preserves Jira and reports only selected spaces', async () => {
+  const f = batchFixture();
   for (const id of ['1', '2', '7'])
     f.configs.set(id, { revision: 1, data: { type: '3', refreshAfterSave: true } });
   const before = structuredClone([...f.projects]);
@@ -219,7 +246,7 @@ test('bulk unlink is reviewed, preserves Jira and reports only selected projects
   assert.equal(f.configs.get('1').data.type, '3');
   await v.click('Apply changes');
   assert.equal(f.state().data.status, 'complete');
-  assert.match(v.text(), /2 of 2 projects unlinked/);
+  assert.match(v.text(), /Setup removed from 2 of 2 spaces/);
   assert.deepEqual(f.configs.get('1').data, { previousTypes: ['3'] });
   assert.deepEqual(f.configs.get('2').data, { previousTypes: ['3'] });
   assert.equal(f.configs.get('7').data.type, '3');
@@ -228,7 +255,7 @@ test('bulk unlink is reviewed, preserves Jira and reports only selected projects
 });
 
 test('cancelling a reviewed dialog reports no mutation and leaves configuration untouched', async () => {
-  const f = wizardFixture();
+  const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'unlink' });
@@ -239,8 +266,8 @@ test('cancelling a reviewed dialog reports no mutation and leaves configuration 
   assert.deepEqual(f.writes, []);
 });
 
-test('native spinner remains visible during review and apply, then clears', async () => {
-  const f = wizardFixture();
+test('the spinner remains visible during review and apply, then clears', async () => {
+  const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
@@ -270,8 +297,8 @@ test('native spinner remains visible during review and apply, then clears', asyn
   assert.equal(f.state().data.status, 'complete');
 });
 
-test('another administrator can release an abandoned batch without continuing its writes', async () => {
-  const f = wizardFixture();
+test('another administrator can release an abandoned configuration without continuing its writes', async () => {
+  const f = batchFixture();
   const r = await f.start();
   await f.api.advance('admin', r.data.id, r.revision);
   f.actor = 'replacement-admin';
@@ -279,13 +306,13 @@ test('another administrator can release an abandoned batch without continuing it
   const v = ui(f);
   await v.mount();
   assert.equal(v.hasButton('Continue reviewed changes'), false);
-  assert.equal(v.disabled('Release abandoned batch'), true);
+  assert.equal(v.disabled('Release abandoned configuration'), true);
   v.change(
     'Checkbox',
-    'I confirmed this batch is abandoned and inspected its affected Jira changes.',
+    'I confirmed this configuration is abandoned and inspected its affected Jira changes.',
     { target: { checked: true } },
   );
-  await v.click('Release abandoned batch');
+  await v.click('Release abandoned configuration');
   assert.equal(f.state().data.status, 'stopped');
   assert.deepEqual(f.configs.get('1'), before);
   assert.deepEqual(f.writes, ['create', 'attach 91']);
@@ -301,8 +328,8 @@ test('another administrator can release an abandoned batch without continuing it
   assert.deepEqual(f.writes, ['create', 'attach 91', 'attach 92']);
 });
 
-test('foreign-admin release retains uncertain project claims and enforces the wait and fresh acknowledgement', async () => {
-  const f = wizardFixture();
+test('foreign-admin release retains uncertain space claims and enforces the wait and fresh acknowledgement', async () => {
+  const f = batchFixture();
   f.s.attach = async () => {
     throw Error('Association outcome unknown');
   };
@@ -313,16 +340,16 @@ test('foreign-admin release retains uncertain project claims and enforces the wa
   const v = ui(f);
   await v.mount();
   const acknowledgement =
-    'I confirmed this batch is abandoned and inspected its affected Jira changes.';
+    'I confirmed this configuration is abandoned and inspected its affected Jira changes.';
   v.change('Checkbox', acknowledgement, { target: { checked: true } });
-  await v.click('Release abandoned batch');
+  await v.click('Release abandoned configuration');
   assert.match(v.text(), /Wait two minutes/);
   assert.equal(f.state().data.status, 'attention');
   f.state().data.started = Date.now() - 120001;
   await v.click('Check saved progress');
-  assert.equal(v.disabled('Release abandoned batch'), true);
+  assert.equal(v.disabled('Release abandoned configuration'), true);
   v.change('Checkbox', acknowledgement, { target: { checked: true } });
-  await v.click('Release abandoned batch');
+  await v.click('Release abandoned configuration');
   assert.equal(f.state().data.status, 'stopped');
   assert.equal(f.state().data.inspectProject, '1');
   assert.equal(f.state().data.cancelRequested, true);
@@ -331,18 +358,18 @@ test('foreign-admin release retains uncertain project claims and enforces the wa
   assert.deepEqual(f.writes, ['create']);
 });
 
-test('own batches retain automatic cancellation without an abandoned-run control', async () => {
-  const f = wizardFixture();
+test('own runs retain automatic cancellation without an abandoned-run control', async () => {
+  const f = batchFixture();
   await f.start();
   const v = ui(f);
   await v.mount();
-  assert.equal(v.hasButton('Release abandoned batch'), false);
+  assert.equal(v.hasButton('Release abandoned configuration'), false);
   assert.equal(v.hasButton('Continue reviewed changes'), true);
 });
 
-test('unlink remains reviewable when type discovery, inventory or the catalog request fails', async () => {
+test('setup removal remains reviewable when type discovery, inventory or the catalog request fails', async () => {
   for (const failure of ['types', 'inventory', 'catalog']) {
-    const f = wizardFixture();
+    const f = batchFixture();
     f.configs.set('1', { revision: 1, data: { type: '3', refreshAfterSave: true } });
     if (failure === 'types')
       f.s.types = async () => {
@@ -356,7 +383,7 @@ test('unlink remains reviewable when type discovery, inventory or the catalog re
     const v = ui(f, [f.projects.get('1')]);
     await v.mount();
     if (failure !== 'inventory') {
-      assert.match(v.text(), /Ticket types could not be loaded/);
+      assert.match(v.text(), /Work types could not be loaded/);
       assert.equal(v.disabled('Review changes'), true);
       v.change('Select', 'configuration-mode', { value: 'create' });
       v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
@@ -373,22 +400,33 @@ test('unlink remains reviewable when type discovery, inventory or the catalog re
 });
 
 test('saved progress remains observable and recoverable when catalog discovery fails', async () => {
-  const f = wizardFixture();
+  const f = batchFixture();
   await f.start();
   f.actor = 'replacement-admin';
   f.catalogFailure = true;
   const v = ui(f);
   await v.mount();
-  assert.match(v.text(), /0 of 2 projects configured/);
+  assert.match(v.text(), /0 of 2 spaces configured/);
   assert.equal(v.hasButton('Check saved progress'), true);
-  assert.equal(v.hasButton('Release abandoned batch'), true);
+  assert.equal(v.hasButton('Release abandoned configuration'), true);
   assert.equal(v.hasButton('Continue reviewed changes'), false);
   await v.click('Check saved progress');
   assert.deepEqual(f.writes, []);
 });
 
+test('saved progress names a space outside the loaded inventory by its ID, never as a bare number', async () => {
+  const f = batchFixture();
+  const started = await f.start();
+  f.catalogFailure = true;
+  // No selected spaces and no catalog: the saved batch's spaces are known only by ID.
+  const v = ui(f, []);
+  await v.mount();
+  for (const { projectId } of started.data.entries)
+    assert.match(v.text(), new RegExp(`Space ID ${projectId}\\b`));
+  assert.doesNotMatch(v.text(), /^\d+$/m);
+});
 test('failed initial progress read blocks new mutations until an explicit successful status check', async () => {
-  const f = wizardFixture();
+  const f = batchFixture();
   await f.start();
   f.actor = 'replacement-admin';
   f.statusFailure = true;
@@ -401,17 +439,17 @@ test('failed initial progress read blocks new mutations until an explicit succes
   await v.click('Check saved progress');
   v.change(
     'Checkbox',
-    'I confirmed this batch is abandoned and inspected its affected Jira changes.',
+    'I confirmed this configuration is abandoned and inspected its affected Jira changes.',
     { target: { checked: true } },
   );
-  await v.click('Release abandoned batch');
+  await v.click('Release abandoned configuration');
   await v.click('Done');
   assert.deepEqual(v.closed, [true]);
   assert.deepEqual(f.writes, []);
 });
 
 test('a second Apply or Review click delivered before the host re-renders is ignored', async () => {
-  const f = wizardFixture();
+  const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
@@ -420,12 +458,12 @@ test('a second Apply or Review click delivered before the host re-renders is ign
   review.props.onClick();
   review.props.onClick();
   await v.settle();
-  assert.equal(v.calls.filter((c) => c === 'wizard-preview').length, f.projects.size);
+  assert.equal(v.calls.filter((c) => c === 'configuration-preview').length, f.projects.size);
   const apply = v.button('Apply changes');
   apply.props.onClick();
   apply.props.onClick();
   await v.settle();
-  assert.equal(v.calls.filter((c) => c === 'wizard-start').length, 1);
+  assert.equal(v.calls.filter((c) => c === 'configuration-start').length, 1);
   assert.equal(f.state().data.status, 'complete');
   assert.doesNotMatch(v.text(), /progress changed|Reopen the configuration dialog/);
 });

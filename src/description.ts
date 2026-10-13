@@ -10,24 +10,16 @@ export interface AdfNode {
   attrs?: JsonObject;
   [key: string]: unknown;
 }
-export interface AdfDoc extends AdfNode {
+interface AdfDoc extends AdfNode {
   type: 'doc';
   version: 1;
   content: AdfNode[];
 }
-interface ManagedReference {
-  promptId: string;
+/** The one Agent Prompts block the app wrote into a description, by identifier and hash. */
+export interface ManagedBlock {
   localId: string;
-  resourceId: string;
   fingerprint: string;
 }
-// Legacy snapshots are recognized only for a checked, explicit migration on save.
-export type ManagedBlock =
-  | { localId: string; fingerprint: string }
-  | {
-      mode: 'synced';
-      references: ManagedReference[];
-    };
 interface ResolvedPrompt {
   id: string;
   name: string;
@@ -46,7 +38,7 @@ function object(value: unknown): value is Record<string, unknown> {
 }
 
 // Bound traversal before reading or copying an untrusted Jira document. Do not
-// normalize it: unfamiliar JSON attributes and nodes belong to the issue owner.
+// normalize it: unfamiliar JSON attributes and nodes belong to the work item's owner.
 function assertJson(value: unknown, ancestors = new Set<object>(), depth = 0): void {
   if (depth > 100) throw new DescriptionError('The description is too deeply nested.');
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
@@ -115,13 +107,15 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function fingerprint(node: AdfNode): string {
-  return createHash('sha256').update(canonicalJson(node)).digest('hex');
-}
+/** SHA-256 of canonical JSON (sorted keys): the one hash used for fingerprints, receipts and
+ * review fingerprints. */
+export const hash = (value: unknown) =>
+  createHash('sha256').update(canonicalJson(value)).digest('hex');
+const fingerprint = (node: AdfNode) => hash(node);
 
 /** Structural identity of a block: node types, text and mark types, ignoring every attribute.
  * Jira may add or normalize attributes on save; text and structure must survive unchanged. */
-export function blockShape(node: AdfNode): string {
+function blockShape(node: AdfNode): string {
   function skeleton(n: AdfNode): JsonValue {
     return {
       type: n.type,
@@ -130,12 +124,10 @@ export function blockShape(node: AdfNode): string {
       content: (n.content ?? []).map(skeleton),
     };
   }
-  return createHash('sha256')
-    .update(canonicalJson(skeleton(node)))
-    .digest('hex');
+  return hash(skeleton(node));
 }
 
-/** Whether the observed Description holds exactly the requested managed block, by skeleton.
+/** Whether the observed description holds exactly the requested managed block, by skeleton.
  * `shape === null` means the save removed the block, so no node may carry its identifier. */
 export function matchesShape(description: unknown, localId: string, shape: string | null) {
   validateDescription(description);
@@ -157,6 +149,19 @@ export function matchesShape(description: unknown, localId: string, shape: strin
   );
 }
 
+/** Hash of every node carrying `localId`, anywhere in the document, in document order. An
+ * empty list when none does. Lets recovery compare one block while other content changes. */
+export function trackedBlock(description: unknown, localId: string): string {
+  validateDescription(description);
+  const found: AdfNode[] = [];
+  function visit(node: AdfNode) {
+    if (node.attrs?.localId === localId) found.push(node);
+    node.content?.forEach(visit);
+  }
+  description?.content.forEach(visit);
+  return hash(found);
+}
+
 const textMarks = new Set([
   'strong',
   'em',
@@ -174,11 +179,7 @@ const blockMarks = new Set(['alignment', 'indentation']);
 export function snapshotContent(description: unknown): AdfNode[] {
   validateDescription(description);
   if (!description)
-    throw new DescriptionError('Write instructions in the prompt’s Description first.');
-  // Existing feasibility prompts can be reused: their source block owns real ADF.
-  const content = description.content.flatMap((node) =>
-    node.type === 'bodiedSyncBlock' ? (node.content ?? []) : [node],
-  );
+    throw new DescriptionError('Write instructions in the prompt’s description first.');
   let textLength = 0;
   function copy(node: AdfNode): AdfNode {
     if (
@@ -196,15 +197,16 @@ export function snapshotContent(description: unknown): AdfNode[] {
       ].includes(node.type)
     )
       throw new DescriptionError(
-        'Use text, headings, lists, quotes or code in the prompt Description. Embedded content and synced references cannot be copied.',
+        'Use text, headings, lists, quotes or code in the prompt description. Embedded content cannot be copied.',
       );
-    if (node.type === 'text') textLength += String(node.text).length;
+    // Characters as people count them: an emoji or supplementary character counts once.
+    if (node.type === 'text') textLength += Array.from(String(node.text)).length;
     const result = structuredClone(node);
     // Copied editor identifiers must not alias the source or another copied prompt.
     if (result.attrs) delete result.attrs.localId;
     if (result.attrs && !Object.keys(result.attrs).length) delete result.attrs;
     if (Array.isArray(result.marks)) {
-      // Inline comment anchors belong to the source issue; formatting outside the reviewed set
+      // Inline comment anchors belong to the source work item; formatting outside the reviewed set
       // and links to non-web addresses are refused rather than silently changed.
       const kept = (result.marks as { type: string; attrs?: JsonObject }[]).filter((mark) => {
         if (mark.type === 'annotation') return false;
@@ -222,82 +224,29 @@ export function snapshotContent(description: unknown): AdfNode[] {
     if (node.content) result.content = node.content.map(copy);
     return result;
   }
-  const result = content.map(copy);
+  const result = description.content.map(copy);
   if (textLength < 1 || textLength > 4000)
     throw new DescriptionError('Prompt instructions must contain 1–4000 text characters.');
   return result;
-}
-
-/** Recover pre-fix receipts affected by Jira dropping empty copied attributes.
- * Only a unique, top-level, exactly identified snapshot may be considered.
- * Match the original cryptographic fingerprint; never adopt by title/content.
- * Bound old-record reconstruction to 256 variants and 32 KB per block.
- */
-export function recoverEmptyAttributes(description: unknown, managed: ManagedBlock | null) {
-  validateDescription(description);
-  if (!description || !managed || 'mode' in managed) return undefined;
-  const localId = managed.localId;
-  const doc = structuredClone(description);
-  const matches: AdfNode[] = [];
-  function find(node: AdfNode) {
-    if (node.attrs?.localId === localId) matches.push(node);
-    node.content?.forEach(find);
-  }
-  doc.content.forEach(find);
-  const block = matches[0];
-  if (!block || matches.length !== 1 || !doc.content.includes(block) || block.type !== 'expand')
-    return undefined;
-  if (fingerprint(block) === managed.fingerprint) return doc;
-  if (JSON.stringify(block).length > 32_000) return undefined;
-  const candidates: AdfNode[] = [];
-  function collect(node: AdfNode) {
-    if (
-      !node.attrs &&
-      [
-        'paragraph',
-        'heading',
-        'codeBlock',
-        'bulletList',
-        'orderedList',
-        'listItem',
-        'blockquote',
-        'hardBreak',
-        'rule',
-        'text',
-      ].includes(node.type)
-    )
-      candidates.push(node);
-    node.content?.forEach(collect);
-  }
-  block.content?.forEach(collect);
-  if (candidates.length > 8) return undefined;
-  for (let mask = 1; mask < 2 ** candidates.length; mask++) {
-    candidates.forEach((node, i) => {
-      if (mask & (1 << i)) node.attrs = {};
-      else delete node.attrs;
-    });
-    if (fingerprint(block) === managed.fingerprint) return doc;
-  }
-  return undefined;
 }
 
 export function observedManaged(
   description: unknown,
   managed: ManagedBlock | null,
 ): ManagedBlock | null {
-  if (!managed || 'mode' in managed) return managed;
+  if (!managed) return null;
   validateDescription(description);
   const block = description?.content.find((node) => node.attrs?.localId === managed.localId);
-  if (!block) throw new DescriptionError('The saved prompt container is missing.');
+  if (!block) throw new DescriptionError('The Agent Prompts section is missing.');
   return { localId: managed.localId, fingerprint: fingerprint(block) };
 }
 
-/** Change only tracked top-level references; preserve all other ADF verbatim. */
+/** Replace only the tracked top-level block; preserve all other ADF verbatim. */
 export function synchronizeDescription(
   description: unknown,
   prompts: readonly ResolvedPrompt[],
   managed: ManagedBlock | null,
-  legacyId: string,
+  blockId: string,
 ): {
   description: AdfDoc | null;
   managed: ManagedBlock | null;
@@ -306,17 +255,11 @@ export function synchronizeDescription(
 } {
   validateDescription(description);
   const doc: AdfDoc = description ?? { type: 'doc', version: 1, content: [] };
-  const tracked = managed && 'mode' in managed ? managed.references : [];
-  const owned = new Map<number, ManagedReference | null>();
-  if (managed && !('mode' in managed) && managed.localId !== legacyId)
-    throw new DescriptionError('Invalid legacy block record.');
+  const owned = new Set<number>();
+  if (managed && managed.localId !== blockId)
+    throw new DescriptionError('The saved Agent Prompts section belongs to another work item.');
   // A tracked block the user deleted in Jira: an empty selection forgets it (the caller then
   // clears only the field); anything that would add or refresh copies needs a fresh start.
-  const trackedIds = managed
-    ? 'mode' in managed
-      ? tracked.map((r) => r.localId)
-      : [managed.localId]
-    : [];
   const occurrences = (localId: string) => {
     let count = 0;
     const visit = (node: AdfNode): void => {
@@ -326,18 +269,18 @@ export function synchronizeDescription(
     doc.content.forEach(visit);
     return count;
   };
-  if (trackedIds.length && trackedIds.every((id) => occurrences(id) === 0)) {
+  if (managed && occurrences(managed.localId) === 0) {
     if (prompts.length)
       throw new DescriptionError(
-        'The Agent Prompts block was removed in Jira. Remove all prompts and save, then add them again.',
+        'The Agent Prompts section was removed in Jira. Remove all prompts and save, then add them again.',
       );
-    if (occurrences(legacyId))
+    if (occurrences(blockId))
       throw new DescriptionError(
-        'An untracked prompt container exists. Review the description before saving.',
+        'The description has an Agent Prompts section the app did not save. Review the description before saving.',
       );
     return { description, managed: null, shape: null, forgotten: true };
   }
-  function locate(localId: string, expected: string, type: string): number {
+  function locate(localId: string, expected: string): number {
     const found: { node: AdfNode; index: number | null }[] = [];
     function visit(n: AdfNode, index: number | null): void {
       if (n.attrs?.localId === localId) found.push({ node: n, index });
@@ -349,22 +292,16 @@ export function synchronizeDescription(
       found.length !== 1 ||
       !hit ||
       hit.index === null ||
-      hit.node.type !== type ||
+      hit.node.type !== 'expand' ||
       fingerprint(hit.node) !== expected
     )
       throw new DescriptionError(
-        'A linked description block was changed, moved or removed. Review the description before saving.',
+        'The Agent Prompts section was changed, moved or duplicated. Review the description before saving.',
       );
     return hit.index;
   }
-  if (managed && !('mode' in managed))
-    owned.set(locate(managed.localId, managed.fingerprint, 'expand'), null);
-  for (const ref of tracked) {
-    const index = locate(ref.localId, ref.fingerprint, 'syncBlock');
-    if (owned.has(index)) throw new DescriptionError('Duplicate linked block records.');
-    owned.set(index, ref);
-  }
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(legacyId))
+  if (managed) owned.add(locate(managed.localId, managed.fingerprint));
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(blockId))
     throw new DescriptionError('Invalid generated block identifier.');
   const seen = new Set<string>();
   for (const prompt of prompts) {
@@ -379,9 +316,9 @@ export function synchronizeDescription(
   }
   // Do not adopt a lookalike expander solely because its title matches ours.
   function collisions(node: AdfNode, index: number | null): void {
-    if (node.attrs?.localId === legacyId && (index === null || !owned.has(index)))
+    if (node.attrs?.localId === blockId && (index === null || !owned.has(index)))
       throw new DescriptionError(
-        'An untracked prompt container exists. Review the description before saving.',
+        'The description has an Agent Prompts section the app did not save. Review the description before saving.',
       );
     for (const child of node.content ?? []) collisions(child, null);
   }
@@ -390,7 +327,7 @@ export function synchronizeDescription(
   const block: AdfNode | null = prompts.length
     ? {
         type: 'expand',
-        attrs: { localId: legacyId, title: 'Agent Prompts' },
+        attrs: { localId: blockId, title: 'Agent Prompts' },
         content: prompts.flatMap((prompt) => [
           { type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: prompt.name }] },
           ...prompt.content,
@@ -411,7 +348,7 @@ export function synchronizeDescription(
   assertDoc(result);
   return {
     description: result,
-    managed: block ? { localId: legacyId, fingerprint: fingerprint(block) } : null,
+    managed: block ? { localId: blockId, fingerprint: fingerprint(block) } : null,
     shape: block ? blockShape(block) : null,
   };
 }

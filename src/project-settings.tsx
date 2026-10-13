@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import ForgeReconciler, { Text } from '@forge/react';
 import { call } from './client';
-import { Configuration } from './configuration';
+import { HealthProjects } from './health-ui';
 function ProjectSettings() {
   const [id, setId] = useState('');
   const [error, setError] = useState('');
@@ -11,6 +11,6 @@ function ProjectSettings() {
       (e) => setError(e.message),
     );
   }, []);
-  return id ? <Configuration projectId={id} /> : <Text>{error || 'Loading project…'}</Text>;
+  return id ? <HealthProjects projectId={id} /> : <Text>{error || 'Loading space…'}</Text>;
 }
 ForgeReconciler.render(<ProjectSettings />);

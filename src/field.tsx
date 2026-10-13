@@ -21,7 +21,9 @@ function retainSearchFocus(event: React.MouseEvent<HTMLButtonElement>) {
   event.preventDefault();
 }
 export function Field() {
-  const search = usePromptSearch('picker');
+  const search = usePromptSearch();
+  // Nothing to show: with a query that means no match; without one, the space has no prompts.
+  const empty = !search.busy && !search.error && !search.items.length;
   const retained = useRef(new Map<string, Prompt>());
   const [data, setData] = useState<Loaded>();
   const [ids, setIds] = useState<string[]>([]);
@@ -67,8 +69,9 @@ export function Field() {
       setData(value);
       resetSearch(value);
       retained.current = new Map(value.prompts.map((p) => [p.id, p]));
-      // A recovery check must not silently discard an existing draft.
-      if (!data) setIds(value.ids);
+      // A recovery check must not silently discard an existing draft; without one, show what is
+      // saved now (another tab or user may have changed it).
+      if (!data || JSON.stringify(ids) === JSON.stringify(data.ids)) setIds(value.ids);
       setRecovery(false);
       setMessage('Saved state checked. Review your selection before saving.');
     } catch (e) {
@@ -85,7 +88,7 @@ export function Field() {
       try {
         await router.reload();
       } catch {
-        setMessage('Saved. Reload the ticket to see the updated description.');
+        setMessage('Saved. Reload the work item to see the updated description.');
       }
     }
   }
@@ -112,18 +115,25 @@ export function Field() {
         const current = await call<Loaded>('load');
         setData(current);
         retained.current = new Map(current.prompts.map((p) => [p.id, p]));
+        // Keep a real draft. Without one (every Sync), show the saved selection: keeping the old
+        // list would turn it into a draft whose Save reverts someone else's newer save.
+        if (!dirty) setIds(current.ids);
         // Keep a typed query (the user is still choosing) but refresh its results.
         if (search.query.trim()) void search.refresh();
         else search.reset(current);
         setRecovery(false);
+        // The save's own response was lost, but the saved state matches the selection. That is
+        // saved, not a confirmed response, so the automatic reload is skipped.
         if (
           !refresh &&
           current.revision > data.revision &&
           JSON.stringify(current.ids) === JSON.stringify(ids)
         )
-          await saved(refresh, current.refreshAfterSave);
+          setMessage('Saved. Reload the work item to see the updated description.');
         else setMessage(error);
       } catch {
+        // Recovery starts from a fresh check, never from an earlier save's status.
+        setRecoveryStatus(undefined);
         setRecovery(true);
         setMessage('Could not verify the save. Reopen this field to check again.');
       }
@@ -154,13 +164,18 @@ export function Field() {
     <div className="prompt-field">
       {data && (
         <>
-          <label htmlFor="native-prompts">Agent Prompts</label>
+          <label htmlFor="agent-prompts">Agent Prompts</label>
           <Select<{ label: string; value: string }, true>
             filterOption={null}
             menuShouldScrollIntoView={false}
             maxMenuHeight={240}
             styles={{ menu: (base) => ({ ...base, position: 'relative' }) }}
-            noOptionsMessage={() => (search.busy ? 'Searching…' : 'No matching prompts')}
+            noOptionsMessage={() =>
+              search.busy
+                ? 'Searching…'
+                : search.error ||
+                  (search.query.trim() ? 'No matching prompts' : 'No prompts in this space yet.')
+            }
             isSearchable={!data.cleanupOnly}
             inputValue={search.query}
             onInputChange={(value, meta) => {
@@ -168,7 +183,7 @@ export function Field() {
                 search.change(value.slice(0, 200));
             }}
             isLoading={search.busy}
-            inputId="native-prompts"
+            inputId="agent-prompts"
             isMulti
             isDisabled={busy || !!recovery}
             isOptionDisabled={(option) => ids.length >= 5 && !ids.includes(option.value)}
@@ -185,24 +200,31 @@ export function Field() {
               setIds(value.map((v) => v.value));
               setMessage('');
             }}
-            placeholder="Search by name or ticket key…"
+            placeholder="Search by name or key…"
           />
           {!data.cleanupOnly && (
             <>
+              {/* A live region from the first render, so a failed or empty search is announced. */}
+              <p role="status">
+                {search.error ||
+                  (empty
+                    ? search.query.trim()
+                      ? 'No matching prompts'
+                      : 'No prompts in this space yet.'
+                    : '')}
+              </p>
               {search.error && (
-                <>
-                  <p>{search.error}</p>
-                  <Button
-                    onMouseDown={retainSearchFocus}
-                    isDisabled={search.busy || busy}
-                    onClick={search.nextCursor ? search.more : search.refresh}
-                  >
-                    Retry search
-                  </Button>
-                </>
+                <Button
+                  onMouseDown={retainSearchFocus}
+                  isDisabled={search.busy || busy}
+                  onClick={search.nextCursor ? search.more : search.refresh}
+                >
+                  Retry search
+                </Button>
               )}
-              {!search.busy && !search.error && !search.items.length && <p>No matching prompts</p>}
-              {!search.query && !search.error && <p>Newest prompts. Search to find others.</p>}
+              {!search.query && !search.error && !empty && (
+                <p>Newest prompts. Search to find others.</p>
+              )}
               {!!search.query.trim() && search.nextCursor && (
                 <Button
                   onMouseDown={retainSearchFocus}
@@ -216,8 +238,8 @@ export function Field() {
           )}
           {data.cleanupOnly && (
             <p>
-              This ticket now uses the prompt type. You can remove its existing links, but cannot
-              add new ones.
+              This work item is now a prompt. You can remove the prompts it already has, but cannot
+              add others.
             </p>
           )}
           <p>

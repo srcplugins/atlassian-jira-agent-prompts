@@ -1,13 +1,13 @@
 import './typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readProjects } from '../src/project-reads.ts';
-test('project reads overlap at most three requests, isolate failures and preserve selection order', async () => {
+import { readSpaces } from '../src/space-reads.ts';
+test('space reads overlap at most three requests, isolate failures and preserve selection order', async () => {
   const waiting = new Map();
   let active = 0,
     peak = 0;
   const snapshots = [];
-  const run = readProjects(
+  const run = readSpaces(
     ['1', '2', '3', '4', '5'],
     async (id) => {
       active++;

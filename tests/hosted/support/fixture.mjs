@@ -6,13 +6,13 @@ import {
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { registerProfile } from '@srcplugins/atlassian-forge-test-framework/jira';
 
-// Agent Prompts' fixture identity predates its agent-prompts slug. On-site project markers and
+// Agent Prompts' fixture identity predates its agent-prompts slug. On-site space markers and
 // run journals, including the retained scale journal, keep this name.
 export const agentPromptsFixture = 'native-prompt-links';
 
 /** The marker of an empty project created by the setup runner. */
-export const nativeSetupProject = (runId, index) =>
-  markers.acceptance('native setup', `${runId}/${index}. Empty synthetic project only.`);
+export const setupRunSpace = (runId, index) =>
+  markers.acceptance('setup run', `${runId}/${index}. Empty synthetic space only.`);
 
 // Second-site fixture profiles (see verify-lifecycle.mjs). Recovery uses the profile saved in a
 // run's journal, so every entry point that may open or recover such a run imports this module.
@@ -36,5 +36,5 @@ registerProfile('lifecycle-secondary', {
     if (app !== agentPromptsFixture || activeTarget().host !== siteFor('isolation'))
       throw Error('Secondary lifecycle fixture requires Agent Prompts on the isolation site');
   },
-  missing: 'Owned isolated fixture project required. Run prepare.',
+  missing: 'Owned isolated fixture space required. Run prepare.',
 });

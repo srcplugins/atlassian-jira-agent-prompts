@@ -9,9 +9,9 @@ import {
   client,
   allIssues,
   installation,
-  projectPage,
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
+import { spaceSettings } from './support/space-settings.mjs';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
 const host = activeTarget();
@@ -36,7 +36,7 @@ const record = (scale, operation, started, session) => {
   metrics.push({ scale, operation, ms: Math.round(performance.now() - started), session });
   saveFile('metrics', metrics);
 };
-console.log(`Native scale run ${run.state.runId}; evidence ${directory}`);
+console.log(`Scale run ${run.state.runId}; evidence ${directory}`);
 let browser;
 let released = false;
 try {
@@ -63,7 +63,7 @@ try {
     const setup = await observeAction(
       pages[0],
       'setup',
-      () => projectPage(pages[0], 'agent-prompts', owned.project.key),
+      () => spaceSettings(pages[0], owned.project.key),
       t,
     );
     assert.match(setup.type, /^[1-9]\d*$/);
@@ -101,7 +101,7 @@ try {
         );
     const search = async (page, query, scale, session, operation = 'search-visible') => {
       const started = performance.now();
-      const result = await observeAction(page, 'library', () => combo(page).fill(query), t);
+      const result = await observeAction(page, 'search', () => combo(page).fill(query), t);
       assert.ok(result.prompts.length);
       await combo(page).press('ArrowDown');
       const first = result.prompts[0];
@@ -179,7 +179,7 @@ try {
             const moreStarted = performance.now();
             const more = await observeAction(
               page,
-              'library',
+              'search',
               () => frame(page).getByRole('button', { name: 'Load more', exact: true }).click(),
               t,
             );
@@ -209,28 +209,18 @@ try {
         }
         console.log(`${scale} prompts: round ${round + 1}/3 passed in five browser sessions`);
       }
-      // Read every library page to prove discovery beyond the previous 120-source boundary.
-      await observeAction(
-        pages[0],
-        'setup',
-        () => projectPage(pages[0], 'agent-prompts', owned.project.key),
-        t,
-      );
+      // Read every picker page to prove discovery reaches the whole space, with no fixed ceiling.
+      // The first session's field is still open from the last round.
       const pagingStarted = performance.now();
-      let result = await observeAction(
-        pages[0],
-        'library',
-        () => pages[0].getByRole('textbox', { name: 'Search prompts', exact: true }).fill(term),
-        t,
-      );
+      let result = await observeAction(pages[0], 'search', () => combo(pages[0]).fill(term), t);
       const ids = result.prompts.map((x) => x.id);
       let pageCount = 1;
       while (result.nextCursor) {
-        assert.ok(pageCount < 55);
+        assert.ok(pageCount < 110);
         result = await observeAction(
           pages[0],
-          'library',
-          () => pages[0].getByRole('button', { name: 'Load more', exact: true }).click(),
+          'search',
+          () => frame(pages[0]).getByRole('button', { name: 'Load more', exact: true }).click(),
           t,
         );
         ids.push(...result.prompts.map((x) => x.id));
@@ -238,9 +228,9 @@ try {
       }
       assert.deepEqual(ids.slice().sort(), indexed.map((x) => x.id).sort());
       assert.equal(new Set(ids).size, scale);
-      record(scale, 'library-all-pages', pagingStarted, 0);
+      record(scale, 'picker-all-pages', pagingStarted, 0);
       console.log(
-        `${scale} prompts: all ${pageCount} library pages verified, no missing/duplicate prompts`,
+        `${scale} prompts: all ${pageCount} picker pages verified, no missing/duplicate prompts`,
       );
     }
     const field = (await api('/field')).find(
@@ -344,7 +334,7 @@ try {
         );
         record(1000, 'save-five-confirmed-api', started, session);
         if (loaded.refreshAfterSave) await expect(read(page)).toBeVisible();
-        record(1000, 'save-five-ticket-visible', started, session);
+        record(1000, 'save-five-work-item-visible', started, session);
         entry.expected.descriptionVariants = [entry.expected.description, actual.description];
         run.persist();
       }),

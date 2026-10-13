@@ -1,0 +1,10 @@
+{
+  "setup": {
+    "command": ["node", "tests/hosted/verify-setup.mjs", "cleanup"],
+    "env": { "NATIVE_SETUP_TESTS": "1" }
+  },
+  "access": {
+    "command": ["node", "tests/hosted/verify-access.mjs", "cleanup"],
+    "env": { "NATIVE_ACCESS_TESTS": "1" }
+  }
+}

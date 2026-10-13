@@ -11,6 +11,7 @@ function fixture({
   searchError,
   loadWarning,
   firstLoadFails,
+  failLoads = [],
   saveStatus = { pending: false },
 } = {}) {
   const calls = [];
@@ -44,7 +45,7 @@ function fixture({
     if (name === 'save-status') return saveStatus;
     assert.equal(name, 'load');
     loads++;
-    if (loadFails && loads === 2) throw Error('Load failed');
+    if ((loadFails && loads === 2) || failLoads.includes(loads)) throw Error('Load failed');
     if (firstLoadFails && loads === 1) throw Error(firstLoadFails);
     return {
       ids: committed && loads > 1 ? ['1', '2'] : ['1'],
@@ -102,7 +103,7 @@ function fixture({
     selected: () => Array.from(v.nodes('Select')[0].props.value, (value) => value?.value),
   };
 }
-test('failed save recovery preserves draft and existing saved links; only explicit discard resets selection', async () => {
+test('failed save recovery preserves draft and existing saved selection; only explicit discard resets selection', async () => {
   const f = fixture();
   await f.mount();
   f.select(['1', '2']);
@@ -117,6 +118,17 @@ test('failed save recovery preserves draft and existing saved links; only explic
   await f.click('Discard changes');
   assert.deepEqual(f.selected(), ['1']);
   assert.equal(f.calls.length, 3);
+});
+test('an empty space and an unmatched search each show one accurate message', async () => {
+  const f = fixture();
+  await f.mount();
+  f.results([]);
+  assert.match(f.text(), /No prompts in this space yet\./);
+  assert.doesNotMatch(f.text(), /No matching prompts|Newest prompts/);
+  f.nodes('Select')[0].props.onInputChange('review', { action: 'input-change' });
+  f.results([]);
+  assert.match(f.text(), /No matching prompts/);
+  assert.doesNotMatch(f.text(), /No prompts in this space yet|Newest prompts/);
 });
 test('failed discovery shows retry while preserving selected prompts and explicit removal', async () => {
   const f = fixture({ success: true, searchError: 'Could not load prompt suggestions.' });
@@ -136,27 +148,29 @@ test('an unavailable reload preference shows manual reload guidance without bloc
   const f = fixture({
     success: true,
     loadWarning:
-      'The ticket reload preference could not be checked. Reload the ticket manually after saving.',
+      'The work item reload preference could not be checked. Reload the work item manually after saving.',
   });
   await f.mount();
-  assert.match(f.text(), /Reload the ticket manually after saving/);
+  assert.match(f.text(), /Reload the work item manually after saving/);
   assert.equal(f.nodes('Select')[0].props.isDisabled, false);
   f.select([]);
   await f.click('Save');
   assert.match(f.text(), /Saved\./);
-  assert.match(f.text(), /Reload the ticket manually after saving/);
+  assert.match(f.text(), /Reload the work item manually after saving/);
   assert.equal(f.calls.filter((call) => call.name === 'reload').length, 0);
 });
-test('lost save response reconciles committed selection without repeating the write', async () => {
-  const f = fixture({ committed: true });
+test('lost save response reconciles committed selection without repeating the write or reloading', async () => {
+  // Even with the reload preference on, a save known only by reading it back is not reloaded.
+  const f = fixture({ committed: true, refreshAfterSave: true });
   await f.mount();
   f.select(['1', '2']);
   await f.click('Save');
   assert.deepEqual(f.selected(), ['1', '2']);
-  assert.match(f.text(), /Saved\./);
+  assert.match(f.text(), /Saved\. Reload the work item to see the updated description\./);
   assert.ok(f.nodes('Button').find((b) => b.props.children.join('') === 'Save').props.isDisabled);
   assert.ok(!f.nodes('Button').find((b) => b.props.children.join('') === 'Sync').props.isDisabled);
   assert.equal(f.calls.filter((c) => c.name === 'save').length, 1);
+  assert.equal(f.calls.filter((c) => c.name === 'reload').length, 0);
 });
 test('recovery keeps unavailable draft choices visible instead of passing undefined options', async () => {
   const f = fixture({ disappear: true });
@@ -179,6 +193,53 @@ test('Sync sends saved IDs without changing selection; unsaved choices disable i
   assert.doesNotMatch(f.text(), /Synced/);
   f.select(['1', '2']);
   assert.ok(f.nodes('Button').find((b) => b.props.children.join('') === 'Sync').props.isDisabled);
+});
+
+test('a failed Sync shows a newer selection saved elsewhere instead of a stale draft', async () => {
+  const f = fixture({ committed: true });
+  await f.mount();
+  await f.click('Sync');
+  assert.deepEqual(f.selected(), ['1', '2']);
+  assert.doesNotMatch(f.text(), /Unsaved changes/);
+  assert.equal(f.button('Save').props.isDisabled, true);
+});
+
+test('a recovery check without a draft shows the selection saved now', async () => {
+  const f = fixture({ committed: true, loadFails: true });
+  await f.mount();
+  await f.click('Sync');
+  assert.equal(f.nodes('SaveRecovery').length, 1);
+  await f.recover();
+  assert.deepEqual(f.selected(), ['1', '2']);
+  assert.doesNotMatch(f.text(), /Unsaved changes/);
+});
+
+test('recovery after a later failed save starts from a fresh check, not an earlier status', async () => {
+  const pending = { pending: true, administrator: true, unchanged: true, revision: 1 };
+  const f = fixture({ firstLoadFails: 'Unresolved save.', saveStatus: pending, failLoads: [3] });
+  await f.mount();
+  assert.deepEqual(f.nodes('SaveRecovery')[0].props.initialStatus, pending);
+  await f.recover();
+  f.select(['1', '2']);
+  await f.click('Save');
+  assert.match(f.text(), /Could not verify/);
+  assert.equal(f.nodes('SaveRecovery')[0].props.initialStatus, undefined);
+});
+
+test('the open menu says why it is empty: failed discovery, no match or no prompts yet', async () => {
+  const failed = fixture({ searchError: 'Could not load prompt suggestions.' });
+  await failed.mount();
+  failed.results([]);
+  assert.equal(
+    failed.nodes('Select')[0].props.noOptionsMessage(),
+    'Could not load prompt suggestions.',
+  );
+  const f = fixture();
+  await f.mount();
+  f.results([]);
+  assert.equal(f.nodes('Select')[0].props.noOptionsMessage(), 'No prompts in this space yet.');
+  f.nodes('Select')[0].props.onInputChange('review', { action: 'input-change' });
+  assert.equal(f.nodes('Select')[0].props.noOptionsMessage(), 'No matching prompts');
 });
 
 test('compact field reloads only after confirmed saves when enabled; reload failure stays saved', async () => {
@@ -251,20 +312,25 @@ test('the dropdown owns remote search; blur, menu close and selection events pre
   assert.equal(f.calls.at(-1).value.length, 200);
 });
 
-test('the status region exists before any outcome and announces save results', async () => {
+test('the status regions exist before any outcome and announce search and save results', async () => {
   const f = fixture({ success: true });
   await f.mount();
-  const status = () => f.nodes('p').find((p) => p.props.role === 'status');
-  const said = () => [status().props.children].flat().join('');
-  assert.ok(status());
-  assert.equal(said(), '');
+  // Two live regions from the first render: search outcomes first, save outcomes last.
+  const regions = () => f.nodes('p').filter((p) => p.props.role === 'status');
+  const said = (region) => [region.props.children].flat().join('');
+  assert.equal(regions().length, 2);
+  assert.deepEqual(regions().map(said), ['', '']);
   f.select(['1', '2']);
   await f.click('Save');
-  assert.equal(said(), 'Saved.');
+  assert.deepEqual(regions().map(said), ['', 'Saved.']);
+  const failed = fixture({ searchError: 'Could not load prompt suggestions.' });
+  await failed.mount();
+  const announced = failed.nodes('p').filter((p) => p.props.role === 'status');
+  assert.equal(said(announced[0]), 'Could not load prompt suggestions.');
 });
 
 test('a load failure without an unresolved save offers Try again instead of saved-state recovery', async () => {
-  const f = fixture({ firstLoadFails: 'Add the Agent Prompts field to this issue screen.' });
+  const f = fixture({ firstLoadFails: 'Add the Agent Prompts field to this work item’s screen.' });
   await f.mount();
   assert.equal(f.nodes('SaveRecovery').length, 0);
   assert.match(f.text(), /Add the Agent Prompts field/);

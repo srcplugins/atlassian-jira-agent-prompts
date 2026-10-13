@@ -1,13 +1,11 @@
-import { editor, snapshotJourney } from './support/native-snapshots.mjs';
+import { editor, snapshotJourney } from './support/snapshots.mjs';
 import {
   expect,
   installation,
-  projectPage,
   themeTest as test,
   textContrast,
   observeAction,
   client,
-  adf,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import {
   activeTarget,
@@ -16,17 +14,15 @@ import {
   markers,
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
-test.use({
-  fixtureApp: agentPromptsFixture,
-  themePage: { app: 'agent-prompts', project: fixtureProject(agentPromptsFixture) },
-});
+import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
+test.use({ fixtureApp: agentPromptsFixture });
 test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
   test.skip(
     process.env.NATIVE_IDENTITY_TESTS !== '1',
     'Explicit identity mode and saved consenting actors required',
   );
   const api = client(jiraRequest);
-  const project = await api('/project/PLSNATIVE');
+  const project = await api(`/project/${fixtureProject(agentPromptsFixture)}`);
   expect(isMarker(project.description, markers.browserProject(agentPromptsFixture))).toBe(true);
   const owner = await api('/myself');
   const actors = new Set([owner.accountId]);
@@ -46,46 +42,23 @@ test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser,
       expect(permissions.permissions.ADMINISTER.havePermission).toBe(false);
       expect(permissions.permissions.BROWSE_PROJECTS.havePermission).toBe(true);
       const page = await context.newPage();
-      const t = installation('agent-prompts');
+      await spaceSettings(page, project.key);
       try {
-        await observeAction(
-          page,
-          'setup',
-          () =>
-            page.goto(
-              `${activeTarget().site}/jira/software/projects/${project.key}/apps/${t.appId}/${t.environmentId}`,
-            ),
-          t,
-        );
+        await expectSpaceSettingsRefused(page, expect);
       } catch (error) {
         await page.screenshot({
-          path: `${activeTarget().directory}/${role}-native-eligibility.png`,
+          path: `${activeTarget().directory}/${role}-eligibility.png`,
           fullPage: true,
         });
         throw error;
       }
-      await expect(
-        observeAction(
-          page,
-          'settings-projects',
-          () => page.getByRole('button', { name: 'Project configuration', exact: true }).click(),
-          t,
-        ),
-      ).rejects.toMatchObject({ category: 'resolver-failed' });
-      await expect(
-        page.getByText('Missing Jira permission: ADMINISTER.', { exact: true }).first(),
-      ).toBeVisible();
-      await expect(
-        page.getByRole('button', { name: 'Configure selected', exact: true }),
-      ).toBeDisabled();
-      await expect(page.getByRole('button', { name: 'Apply changes', exact: true })).toHaveCount(0);
     } finally {
       await context.close();
     }
   }
 });
 for (const blank of [false, true]) {
-  test(`${blank ? 'NPL-03 blank Description round-trip' : 'NPL-01 prompt snapshots, explicit Sync and precise unlink'}`, async ({
+  test(`${blank ? 'NPL-03 blank Description round-trip' : 'NPL-01 prompt snapshots, explicit Sync and precise removal'}`, async ({
     page,
     owned,
   }, testInfo) => {
@@ -95,16 +68,15 @@ for (const blank of [false, true]) {
 
 async function configuration(page, owned, global = false) {
   const t = installation('agent-prompts');
-  if (!global) await projectPage(page, 'agent-prompts', owned.project.key);
   if (global)
     await page.goto(
       `${activeTarget().site}/jira/settings/apps/configure/${t.appId}/${t.environmentId}`,
     );
-  else await page.getByRole('button', { name: 'Project configuration', exact: true }).click();
-  await expect(page.getByRole('textbox', { name: 'Find a project', exact: true })).toBeEnabled({
+  else await spaceSettings(page, owned.project.key);
+  await expect(page.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled({
     timeout: 60000,
   });
-  await page.getByRole('textbox', { name: 'Find a project', exact: true }).fill(owned.project.key);
+  await page.getByRole('textbox', { name: 'Find a space', exact: true }).fill(owned.project.key);
   await page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }).click();
   const health = await observeAction(
     page,
@@ -123,36 +95,28 @@ async function details(page, key) {
     .click();
 }
 
-test('NPL-02 selected project health and cancelled modal preserve Jira', async ({
-  page,
-  owned,
-}) => {
+test('NPL-02 selected space health and cancelled modal preserve Jira', async ({ page, owned }) => {
   const t = installation('agent-prompts');
-  const issue = await owned.issue('Native setup read-only baseline');
+  const issue = await owned.issue('Setup read-only baseline');
   const before = await owned.api(`/issue/${issue.id}?fields=description,issuetype`);
   const health = await configuration(page, owned);
   expect(health.checks.every((c) => c.ok)).toBe(true);
   await details(page, owned.project.key);
   await expect(page.getByRole('dialog')).toBeVisible();
-  await expect(page.getByRole('textbox', { name: 'Issue key', exact: true })).toHaveCount(0);
   await expect(
     page.getByRole('heading', { name: 'Jira configuration', exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole('textbox', { name: 'Issue key', exact: true })).toHaveCount(0);
-  await expect(
-    page.getByRole('dialog').getByRole('link', { name: 'View in Jira', exact: true }),
-  ).toHaveCount(0);
-  await page.getByRole('button', { name: 'Reconfigure project', exact: true }).click();
+  await page.getByRole('button', { name: 'Reconfigure space', exact: true }).click();
   const plan = await observeAction(
     page,
-    'wizard-preview',
+    'configuration-preview',
     () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
     t,
   );
   expect(plan.type).toBe(health.state.data.type);
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
-  await expect(page.getByRole('textbox', { name: 'Find a project', exact: true })).toBeEnabled();
+  await expect(page.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled();
   await expect(
     page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }),
   ).toBeChecked();
@@ -244,7 +208,7 @@ test('NPL-11 details modal keeps focus, contrast and layout in dark theme and na
   );
 });
 
-test('NPL-05 unified global configuration checks selected projects and selects across pages', async ({
+test('NPL-05 unified global configuration checks selected spaces and selects across pages', async ({
   page,
   owned,
 }, testInfo) => {
@@ -260,20 +224,20 @@ test('NPL-05 unified global configuration checks selected projects and selects a
     }
   });
   await configuration(page, owned, true);
-  const search = page.getByRole('textbox', { name: 'Find a project', exact: true });
+  const search = page.getByRole('textbox', { name: 'Find a space', exact: true });
   await search.fill('');
-  const all = page.getByRole('checkbox', { name: 'Select all matching projects', exact: true });
+  const all = page.getByRole('checkbox', { name: 'Select all matching spaces', exact: true });
   await all.click();
   await expect(all).toBeChecked();
   const inventory = await observeAction(
     page,
-    'wizard-catalog',
+    'configuration-catalog',
     () => page.getByRole('button', { name: 'Configure selected', exact: true }).click(),
     t,
   );
   await expect(
     page.getByRole('heading', {
-      name: `Configure ${inventory.projects.length} projects`,
+      name: `Configure ${inventory.projects.length} spaces`,
       exact: true,
     }),
   ).toBeVisible();
@@ -291,7 +255,7 @@ test('NPL-05 unified global configuration checks selected projects and selects a
   await details(page, owned.project.key);
   await expect(page.getByRole('heading', { name: 'Configuration', exact: true })).toBeVisible();
   await page.screenshot({
-    path: testInfo.outputPath('project-configuration-details.png'),
+    path: testInfo.outputPath('space-configuration-details.png'),
     fullPage: true,
   });
   expect(
@@ -299,9 +263,9 @@ test('NPL-05 unified global configuration checks selected projects and selects a
       [
         'settings-projects',
         'settings-health',
-        'wizard-status',
-        'wizard-cancel-interrupted',
-        'wizard-catalog',
+        'configuration-status',
+        'configuration-cancel-interrupted',
+        'configuration-catalog',
       ].includes(c),
     ),
   ).toBe(true);
@@ -317,7 +281,7 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
   const setup = await observeAction(
     page,
     'setup',
-    () => projectPage(page, 'agent-prompts', owned.project.key),
+    () => spaceSettings(page, owned.project.key),
     installation('agent-prompts'),
   );
   const source = await owned.propertyIssue(
@@ -332,7 +296,7 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
   ];
   owned.run.persist();
   await owned.api(`/issue/${source.id}`, 'PUT', { fields: { description: null } });
-  const target = await owned.issue('Native prompt failed-save recovery');
+  const target = await owned.issue('Prompt failed-save recovery');
   const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,description,issuetype`);
   const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
   const t = installation('agent-prompts');
@@ -367,7 +331,7 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
   await expect(combo).toBeEnabled();
   await observeAction(
     page,
-    'library',
+    'search',
     () =>
       editor(page)
         .getByRole('combobox', { name: 'Agent Prompts', exact: true })
@@ -414,23 +378,18 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
   );
 });
 
-test('NPL-10 a prompt block deleted in Jira is forgotten by a field-only save', async ({
+test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-only save', async ({
   page,
   owned,
 }) => {
   const t = installation('agent-prompts');
-  const setup = await observeAction(
-    page,
-    'setup',
-    () => projectPage(page, 'agent-prompts', owned.project.key),
-    t,
-  );
+  const setup = await observeAction(page, 'setup', () => spaceSettings(page, owned.project.key), t);
   const source = await owned.propertyIssue(
     `Deleted block ${owned.run.state.runId.slice(0, 8)}`,
     'Instructions copied before the block is deleted.',
     setup.type,
   );
-  const target = await owned.issue('Native prompt deleted block');
+  const target = await owned.issue('Prompt deleted block');
   const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,issuetype`);
   const field = (await owned.api('/field')).find(
     (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
@@ -466,7 +425,7 @@ test('NPL-10 a prompt block deleted in Jira is forgotten by a field-only save', 
     );
   await open();
   const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
-  await observeAction(page, 'library', () => combo.fill(sourceIssue.key), t);
+  await observeAction(page, 'search', () => combo.fill(sourceIssue.key), t);
   await combo.press('ArrowDown');
   await editor(page)
     .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
@@ -477,7 +436,7 @@ test('NPL-10 a prompt block deleted in Jira is forgotten by a field-only save', 
   expect(linked.description.content.some((n) => n.attrs?.localId === `npl-${target.id}`)).toBe(
     true,
   );
-  // An editor deletes the whole Agent Prompts block in Jira and adds their own text.
+  // An editor deletes the whole Agent Prompts section in Jira and adds their own text.
   const deletedDescription = {
     type: 'doc',
     version: 1,
@@ -506,7 +465,9 @@ test('NPL-10 a prompt block deleted in Jira is forgotten by a field-only save', 
     ),
   ).rejects.toMatchObject({ category: 'resolver-failed' });
   await expect(
-    editor(page).getByText(/block was removed in Jira\. Remove all prompts and save/i),
+    editor(page).getByText(
+      /Agent Prompts section was removed in Jira\. Remove all prompts and save/i,
+    ),
   ).toBeVisible();
   expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
     afterEdit,
@@ -524,124 +485,7 @@ test('NPL-10 a prompt block deleted in Jira is forgotten by a field-only save', 
   owned.run.persist();
 });
 
-test('NPL-07 native Create uses the minimal Prompt form and ordinary instructions', async ({
-  page,
-  owned,
-}, testInfo) => {
-  const setup = await observeAction(
-    page,
-    'setup',
-    () => projectPage(page, 'agent-prompts', owned.project.key),
-    installation('agent-prompts'),
-  );
-  const open = async () => {
-    await page.getByRole('button', { name: 'Create a prompt ticket', exact: true }).click();
-    const dialog = page.getByRole('dialog', { name: 'Create Prompt', exact: true });
-    await expect(dialog.getByRole('textbox', { name: 'Summary', exact: true })).toBeVisible();
-    await expect(dialog.locator('[contenteditable="true"]')).toBeVisible();
-    await expect(dialog.getByRole('button', { name: /^Prompt available/ })).toBeVisible();
-    for (const label of [
-      'Assignee',
-      'Priority',
-      'Labels',
-      'Due date',
-      'Components',
-      'Fix versions',
-      'Parent',
-    ])
-      await expect(dialog.getByText(label, { exact: true })).toHaveCount(0);
-    return dialog;
-  };
-  let dialog = await open();
-  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
-  await expect(dialog).toHaveCount(0);
-  const marker = markers.runMarker(owned.run.state.runId, 0);
-  const summary = `Native Create ${owned.run.state.runId}`;
-  const body = `Ordinary reusable instructions. Synthetic ${marker}`;
-  const originalCreate = owned.run.adapters.issue.create;
-  dialog = await open();
-  owned.run.adapters.issue.create = async (expected) => {
-    await dialog.getByRole('textbox', { name: 'Summary', exact: true }).fill(expected.summary);
-    await dialog.locator('[contenteditable="true"]').fill(body);
-    await page.screenshot({
-      path: testInfo.outputPath('native-prompt-create.png'),
-      fullPage: true,
-    });
-    await dialog.getByRole('button', { name: 'Create', exact: true }).click();
-    await expect(dialog).toHaveCount(0);
-    // Observe the native creation by its exact unique title; never repeat Create.
-    let created;
-    await expect(async () => {
-      const found = await owned.api('/search/jql', 'POST', {
-        jql: `project = ${owned.project.id} AND issuetype = ${setup.type} ORDER BY id DESC`,
-        fields: ['summary'],
-        maxResults: 100,
-      });
-      const matches = found.issues.filter((issue) => issue.fields.summary === summary);
-      expect(matches).toHaveLength(1);
-      created = matches[0];
-    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
-    const entry = owned.run.state.resources.at(-1);
-    entry.id = created.id;
-    owned.run.persist();
-    const issue = await owned.api(
-      `/issue/${created.id}?fields=summary,description,project,issuetype`,
-    );
-    expect(issue.fields.project.id).toBe(owned.project.id);
-    expect(issue.fields.issuetype.id).toBe(setup.type);
-    expect(issue.fields.summary).toBe(summary);
-    const actual = structuredClone(issue.fields.description);
-    // Jira's native editor adds an optional paragraph localId; no other normalization.
-    const para = actual.content[0];
-    if (para.attrs) {
-      expect(Object.keys(para.attrs)).toEqual(['localId']);
-      expect(para.attrs.localId).toEqual(expect.any(String));
-      expect(para.attrs.localId.length).toBeGreaterThan(0);
-      delete para.attrs;
-    }
-    expect(actual).toEqual(adf(body));
-    entry.expected.descriptionVariants = [expected.description, issue.fields.description];
-    owned.run.persist();
-    await owned.api(`/issue/${created.id}/properties/${markers.fixtureProperty}`, 'PUT', {
-      marker,
-    });
-    return created;
-  };
-  try {
-    const source = await owned.run.create('issue', {
-      summary,
-      description: adf(body),
-      marker,
-      propertyMarker: marker,
-      labels: [],
-      comments: [],
-      typeId: setup.type,
-    });
-    expect((await owned.api(`/issue/${source.id}/transitions`)).transitions).toEqual([]);
-    expect(source.observedFields.status.name).toBe('Prompt available');
-    const createdTicket = await owned.api(`/issue/${source.id}?fields=summary`);
-    await page.goto(`${activeTarget().site}/browse/${createdTicket.key}`);
-    await expect(page.getByText('Prompt available', { exact: true }).first()).toBeVisible();
-    await expect(page.getByText(body, { exact: true }).first()).toBeVisible();
-    for (const name of [
-      'Assignee',
-      'Reporter',
-      'Priority',
-      'Labels',
-      'Due date',
-      'Story Points',
-      'Original estimate',
-      'Time tracking',
-    ])
-      await expect(page.getByText(name, { exact: true })).toHaveCount(0);
-    await page.screenshot({ path: testInfo.outputPath('native-prompt-view.png'), fullPage: true });
-    owned.run.check('native ordinary Create with minimal form and no transitions');
-  } finally {
-    owned.run.adapters.issue.create = originalCreate;
-  }
-});
-
-test('NPL-08 opt-in ticket reload follows confirmed linking and restores project preference', async ({
+test('NPL-08 opt-in work item reload follows a confirmed save and restores the space preference', async ({
   page,
   owned,
 }, testInfo) => {
@@ -659,7 +503,7 @@ test('NPL-08 opt-in ticket reload follows confirmed linking and restores project
     const current = await health();
     if ((current.state.data.refreshAfterSave === true) !== enabled) {
       const toggle = page.getByRole('checkbox', {
-        name: 'Reload ticket after saving prompts',
+        name: 'Reload work item after saving prompts',
         exact: true,
       });
       await toggle.click();
@@ -735,7 +579,7 @@ test('NPL-08 opt-in ticket reload follows confirmed linking and restores project
     expect(loaded.refreshAfterSave).toBe(true);
     await observeAction(
       page,
-      'library',
+      'search',
       () =>
         editor(page)
           .getByRole('combobox', { name: 'Agent Prompts', exact: true })
@@ -761,7 +605,7 @@ test('NPL-08 opt-in ticket reload follows confirmed linking and restores project
     await page.getByRole('button', { name: 'Agent Prompts', exact: true }).click();
     await expect(page.getByText('RELOAD-SENTINEL', { exact: false })).toBeVisible();
     await page.screenshot({
-      path: testInfo.outputPath('automatic-ticket-reload.png'),
+      path: testInfo.outputPath('automatic-work-item-reload.png'),
       fullPage: true,
     });
     // A second source exercises the user's add-more/remove-after-save sequence.
@@ -784,7 +628,7 @@ test('NPL-08 opt-in ticket reload follows confirmed linking and restores project
     await expect(picker).toBeEnabled();
     await observeAction(
       page,
-      'library',
+      'search',
       () =>
         editor(page)
           .getByRole('combobox', { name: 'Agent Prompts', exact: true })
@@ -841,12 +685,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
   theme,
 }) => {
   const t = installation('agent-prompts');
-  const setup = await observeAction(
-    page,
-    'setup',
-    () => projectPage(page, 'agent-prompts', owned.project.key),
-    t,
-  );
+  const setup = await observeAction(page, 'setup', () => spaceSettings(page, owned.project.key), t);
   const term = `Paging${owned.run.state.runId.replaceAll('-', '')}`;
   const sources = [];
   for (let i = 0; i < 21; i++)
@@ -865,28 +704,6 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
     expect(result.issues).toHaveLength(21);
     expected = result.issues;
   }).toPass({ timeout: 60000, intervals: [1000, 3000] });
-  const library = await observeAction(
-    page,
-    'library',
-    () => page.getByRole('textbox', { name: 'Search prompts', exact: true }).fill(term),
-    t,
-  );
-  expect(library.prompts.map((p) => p.id)).toEqual(expected.slice(0, 20).map((p) => p.id));
-  expect(library.nextCursor).toBeTruthy();
-  const next = await observeAction(
-    page,
-    'library',
-    () => page.getByRole('button', { name: 'Load more', exact: true }).click(),
-    t,
-  );
-  expect(next.prompts.map((p) => p.id)).toEqual([expected[20].id]);
-  expect(next.nextCursor).toBeUndefined();
-  await expect(
-    page.getByRole('link', {
-      name: `${expected[20].key} — ${expected[20].fields.summary}`,
-      exact: true,
-    }),
-  ).toBeVisible();
   await page.goto(`${activeTarget().site}/browse/${before.key}`);
   const readView = page
     .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
@@ -900,11 +717,11 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
   );
   expect(loaded.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
   const search = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
-  const first = await observeAction(page, 'library', () => search.fill(`prompt ${term}`), t);
+  const first = await observeAction(page, 'search', () => search.fill(`prompt ${term}`), t);
   expect(first.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
   const second = await observeAction(
     page,
-    'library',
+    'search',
     () => editor(page).getByRole('button', { name: 'Load more', exact: true }).click(),
     t,
   );
@@ -914,7 +731,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
   await editor(page)
     .getByText(`${expected[19].key} — ${expected[19].fields.summary}`, { exact: true })
     .click();
-  const exact = await observeAction(page, 'library', () => search.fill(expected[20].key), t);
+  const exact = await observeAction(page, 'search', () => search.fill(expected[20].key), t);
   expect(exact.prompts.map((p) => p.id)).toEqual([expected[20].id]);
   await expect(
     editor(page).getByText(`${expected[19].key} — ${expected[19].fields.summary}`, { exact: true }),
@@ -926,7 +743,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
   await expect(
     editor(page).getByText('2/5 selected · Unsaved changes', { exact: true }),
   ).toBeVisible();
-  await observeAction(page, 'library', () => search.fill(''), t);
+  await observeAction(page, 'search', () => search.fill(''), t);
   await expect(editor(page).getByRole('button', { name: 'Load more', exact: true })).toHaveCount(0);
   await expect(
     editor(page).getByText(`${expected[19].key} — ${expected[19].fields.summary}`, { exact: true }),

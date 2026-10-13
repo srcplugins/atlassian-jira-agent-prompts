@@ -3,6 +3,7 @@ import {
   numeric,
   JiraRejected,
   JiraUnavailable,
+  StorageUnavailable,
   UserError,
   type Context,
   type Ports,
@@ -11,7 +12,7 @@ import { JiraHttpError, requireCompanyManagedSoftware } from './shared/jira.mjs'
 
 /** A configuration step that provably changed nothing in Jira and left no claim in storage.
  * `retryable` means repeating the reviewed step can succeed (a brief outage); otherwise the
- * project needs a new review. */
+ * space needs a new review. */
 export class NotApplied extends UserError {
   readonly retryable: boolean;
   constructor(message: string, retryable: boolean) {
@@ -20,31 +21,32 @@ export class NotApplied extends UserError {
   }
 }
 const uncertainSetup =
-  'Configuration stopped with an uncertain or partial result. Use Check configuration, then Check outcome. No write was retried; do not create another type.';
-/** Jira or storage was briefly unavailable rather than refusing the request. */
+  'Configuration stopped with an uncertain or partial result. Check the space again, then choose Check outcome. No write was retried; do not create another type.';
+/** Jira or storage was briefly unavailable rather than refusing the request. An unclassified
+ * error is a defect, not an outage: repeating the step would fail the same way. */
 export function transient(error: unknown) {
   return (
     error instanceof JiraUnavailable ||
-    (error instanceof JiraHttpError && (error.status === 429 || error.status >= 500)) ||
-    !(error instanceof UserError)
+    error instanceof StorageUnavailable ||
+    (error instanceof JiraHttpError && (error.status === 429 || error.status >= 500))
   );
 }
 function notApplied(error: unknown, retryable: boolean) {
   const reason =
-    error instanceof UserError ? error.message : 'Jira or app storage could not be read.';
+    error instanceof UserError ? error.message : 'An unexpected error stopped this step.';
   return new NotApplied(
     /nothing was changed/i.test(reason) ? reason : `${reason} Nothing was changed.`,
     retryable,
   );
 }
-export interface TicketType {
+interface WorkType {
   id: string;
   name: string;
   subtask: boolean;
   hierarchyLevel?: number;
   scope?: unknown;
 }
-function eligible(type: TicketType) {
+function eligible(type: WorkType) {
   return type.hierarchyLevel === 0 && !type.subtask && !type.scope;
 }
 interface SettingsData {
@@ -63,11 +65,13 @@ interface Scheme {
   projectIds: string[];
   isDefault: boolean;
   projects?: { id: string; key?: string; name?: string }[];
+  /** False when Jira listed only part of a shared scheme's spaces: usable, never changed. */
+  complete?: false;
 }
 export interface SettingsPorts {
   get(project: string): Promise<SettingsRecord | undefined>;
   cas(project: string, revision: number, data: SettingsData): Promise<void>;
-  types(): Promise<TicketType[]>;
+  types(): Promise<WorkType[]>;
   scheme(project: string): Promise<Scheme>;
   create(name: string): Promise<string>;
   attach(scheme: string, type: string): Promise<void>;
@@ -103,28 +107,17 @@ export function createSettings(p: Ports, s: SettingsPorts) {
     const selected = types.find((t) => t.id === state.data.type);
     return { project, state, types, selected, scheme };
   }
-  async function unlink(c: Context, revision: number) {
+  /** Removing setup's checks against the reviewed revision, before its one storage write. */
+  async function removalTarget(c: Context, revision: number) {
     await admin(c);
     const current = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
-    if (
-      !Number.isSafeInteger(revision) ||
-      revision < 0 ||
-      !current ||
-      current.revision !== revision
-    )
-      throw new UserError('Configuration changed. Check configuration again.');
+    if (current.revision !== revision)
+      throw new UserError('Configuration changed. Check the space again.');
     if (current.data.pending)
-      throw new UserError('Resolve the unfinished configuration before unlinking this project.');
-    // Keep historical type identities so existing issue links can be recognized
-    // if the project is configured again. Never modify Jira issues or shared schemes.
-    const previousTypes = Array.from(
-      new Set([
-        ...(current.data.previousTypes ?? []),
-        ...(current.data.type ? [current.data.type] : []),
-      ]),
-    );
-    await s.cas(c.projectId, revision, { previousTypes });
-    return { saved: true };
+      throw new UserError(
+        'Resolve the unfinished configuration before removing this space’s setup.',
+      );
+    return current;
   }
   async function plan(c: Context, input: SettingsInput) {
     if (input.refreshAfterSave !== undefined && typeof input.refreshAfterSave !== 'boolean')
@@ -135,11 +128,13 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         input.name !== undefined ||
         input.refreshAfterSave !== undefined
       )
-        throw new UserError('Unlink cannot include a type or preference change.');
+        throw new UserError('Removing setup cannot include a type or preference change.');
       const project = await admin(c);
       const state = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
       if (state.data.pending)
-        throw new UserError('Resolve the unfinished configuration before unlinking this project.');
+        throw new UserError(
+          'Resolve the unfinished configuration before removing this space’s setup.',
+        );
       const result = {
         unlink: true,
         revision: state.revision,
@@ -152,9 +147,9 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         previousTypes: state.data.previousTypes ?? [],
         promptKeys: [] as string[],
         promptIncomplete: false,
-        linkedKeys: [] as string[],
-        linksIncomplete: false,
-        typeName: 'Unlink project',
+        usingKeys: [] as string[],
+        usingIncomplete: false,
+        typeName: 'Remove setup',
       };
       return { ...result, fingerprint: hash([c.accountId, result]) };
     }
@@ -167,23 +162,31 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       creating &&
       (!name || name.length > 60 || Array.from(name).some((char) => char.charCodeAt(0) < 32))
     )
-      throw new UserError('Choose a ticket type name of 1–60 characters.');
+      throw new UserError('Choose a work type name of 1–60 characters.');
     if (creating && input.type) throw new UserError('Create a type or choose an existing one.');
     if (creating && value.types.some((t) => t.name.toLowerCase() === name!.toLowerCase()))
       throw new UserError(
-        'That ticket type name already exists. Choose another name or select an eligible existing standard global type.',
+        'That work type name already exists. Choose another name or select an existing standard global work type.',
       );
     const type = creating ? undefined : numeric(input.type);
     if (type && !value.types.some((t) => t.id === type && eligible(t)))
-      throw new UserError('Choose an available standard global ticket type.');
+      throw new UserError('Choose an available standard global work type.');
     const attach = creating || !value.project.issueTypes.some((t) => t.id === type);
     if (attach && value.scheme.isDefault)
       throw new UserError(
-        'This project uses Jira’s default type scheme. Add the type in Jira settings, then select it here.',
+        'This space uses Jira’s default work type scheme. Add the type in Jira settings, then select it here.',
       );
-    if (!value.scheme.isDefault && !value.scheme.projectIds.includes(c.projectId))
+    if (attach && value.scheme.complete === false)
       throw new UserError(
-        'The scheme project association could not be confirmed. Review Jira settings.',
+        'This space’s work type scheme is shared with more spaces than Jira lists at once, so their impact can’t be reviewed. Add the type to the scheme in Jira settings, then select it here.',
+      );
+    if (
+      !value.scheme.isDefault &&
+      value.scheme.complete !== false &&
+      !value.scheme.projectIds.includes(c.projectId)
+    )
+      throw new UserError(
+        'The space’s scheme association could not be confirmed. Review Jira settings.',
       );
     const old = value.state.data.type;
     const changing = !!old && old !== type;
@@ -192,7 +195,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
     ).filter((id) => id !== type);
     if (previousTypes.length > 20)
       throw new UserError(
-        'Twenty previous type mappings are retained. Review existing links with an administrator before another replacement.',
+        'This space already has twenty previous prompt types, the most the app keeps. Keep the current type.',
       );
     const prompts =
       changing && value.selected
@@ -213,8 +216,8 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       previousTypes,
       promptKeys: prompts.prompts.map((t) => t.key),
       promptIncomplete: prompts.incomplete,
-      linkedKeys: links.keys,
-      linksIncomplete: links.incomplete,
+      usingKeys: links.keys,
+      usingIncomplete: links.incomplete,
       typeName: name ?? value.types.find((t) => t.id === type)!.name,
     };
     return { ...result, fingerprint: hash([c.accountId, result]) };
@@ -230,16 +233,13 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         throw new UserError('Invalid display preference.');
       const current = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
       if (current.revision !== input.revision || current.data.pending)
-        throw new UserError(
-          'Configuration changed or is unfinished. Reload Project configuration.',
-        );
+        throw new UserError('Configuration changed or is unfinished. Reload Space configuration.');
       await s.cas(c.projectId, current.revision, {
         ...current.data,
         refreshAfterSave: input.refreshAfterSave,
       });
       return { saved: true };
     },
-    unlink,
     async health(c: Context) {
       // Diagnostic failures must not hide a durable pending operation or its
       // manual recovery controls. Mutation planning still uses strict inspect.
@@ -258,24 +258,24 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         eligible(selected) &&
         project.issueTypes.some((t) => t.id === selected.id && !t.subtask);
       checks.push({
-        label: 'Ticket type',
+        label: 'Work type',
         ok: available,
         detail: !types
-          ? 'Ticket types could not be checked. Inspect Jira settings before resolving any pending operation, then check configuration again.'
+          ? 'Work types could not be checked. Inspect Jira settings before resolving any pending operation, then check the space again.'
           : !state.data.type
-            ? 'Choose or create a ticket type.'
+            ? 'Choose or create a work type.'
             : !selected || !eligible(selected)
-              ? 'The configured type is deleted, unavailable or no longer a standard global type. Choose a replacement.'
+              ? 'The configured type is deleted, unavailable or no longer a standard global work type. Choose a replacement.'
               : available
-                ? `${selected.name} is available in this project. Renames are supported.`
-                : `${selected.name} exists but is missing from this project. Select it below to review a repair.`,
+                ? `${selected.name} is available in this space. Renames are supported.`
+                : `${selected.name} exists but is missing from this space. Use Reconfigure space to review a repair.`,
       });
       if (!scheme)
         checks.push({
-          label: 'Type scheme',
+          label: 'Work type scheme',
           ok: false,
           detail:
-            'The project type scheme could not be checked completely. Inspect its association in Jira settings; new configuration changes remain blocked until this check succeeds.',
+            'The space’s work type scheme could not be checked completely. Inspect its association in Jira settings; new configuration changes remain blocked until this check succeeds.',
         });
       try {
         await p.field();
@@ -299,15 +299,15 @@ export function createSettings(p: Ports, s: SettingsPorts) {
             label: 'Prompt creation',
             ok,
             detail: ok
-              ? 'Summary and Description are available when creating this type.'
-              : 'Add Summary and Description to the type’s create screen in Jira settings.',
+              ? 'The summary and description fields are available when creating this type.'
+              : 'Add the summary and description fields to the type’s create screen in Jira settings.',
           });
         } catch {
           checks.push({
             label: 'Prompt creation',
             ok: false,
             detail:
-              'Could not verify create fields. Check Create Issues permission and the type’s screen configuration.',
+              'Could not verify create fields. Check Create work items permission and the type’s screen configuration.',
           });
         }
       }
@@ -335,16 +335,33 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       } catch (error) {
         throw notApplied(error, transient(error));
       }
-      // Unlink has one storage write; its failure stays uncertain.
-      if (input.unlink) return unlink(c, preview.revision);
+      // Removing setup has one storage write; only its failure stays uncertain.
+      if (input.unlink) {
+        let current: SettingsRecord;
+        try {
+          current = await removalTarget(c, preview.revision);
+        } catch (error) {
+          throw notApplied(error, transient(error));
+        }
+        // Keep previous type IDs so prompts already selected on work items stay removable if the
+        // space is set up again. Never modify Jira work items or shared schemes.
+        const previousTypes = Array.from(
+          new Set([
+            ...(current.data.previousTypes ?? []),
+            ...(current.data.type ? [current.data.type] : []),
+          ]),
+        );
+        await s.cas(c.projectId, current.revision, { previousTypes });
+        return { saved: true };
+      }
       let current: SettingsRecord;
       try {
         if (preview.attach && preview.scheme.projectIds.length > 1 && input.allowShared !== true)
-          throw new UserError('Confirm the shared scheme’s affected projects before applying.');
+          throw new UserError('Confirm the shared scheme’s affected spaces before applying.');
         current = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
         if (current.revision !== preview.revision)
           throw new UserError(
-            'Another administrator changed configuration. Check configuration again.',
+            'Another administrator changed configuration. Check the space again.',
           );
       } catch (error) {
         throw notApplied(error, transient(error));
@@ -374,7 +391,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         const fresh = await s.scheme(c.projectId);
         if (hash(fresh) !== hash(preview.scheme))
           throw new UserError(
-            'The project scheme changed during configuration, before any further Jira write. Review this project again.',
+            'The space scheme changed during configuration, before any further Jira write. Review this space again.',
           );
       }
       // Counted before each Jira write: only a failure before the first write, or a documented
@@ -428,28 +445,28 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       if (!pending.type)
         return {
           message:
-            'Creation outcome is unknown. Inspect Jira ticket types for the requested name, then acknowledge manual resolution below. Do not create a duplicate.',
+            'Creation outcome is unknown. Inspect Jira work types for the requested name, then acknowledge manual resolution below. Do not create a duplicate.',
         };
-      let types: TicketType[];
+      let types: WorkType[];
       try {
         types = await s.types();
       } catch {
         return {
           message:
-            'The recorded type could not be checked. Inspect Jira’s type list and the project association before acknowledging resolution. The outcome remains unknown; do not repeat its writes.',
+            'The recorded type could not be checked. Inspect Jira’s type list and the space association before acknowledging resolution. The outcome remains unknown; do not repeat its writes.',
         };
       }
       const type = types.find((t) => t.id === pending.type);
       if (type && !eligible(type))
         return {
           message:
-            'The recorded type exists but is no longer an eligible base-level global type. Inspect Jira settings before acknowledging resolution, then choose an eligible replacement. Do not repeat the earlier writes.',
+            'The recorded type exists but is no longer a standard global work type. Inspect Jira settings before acknowledging resolution, then choose a replacement. Do not repeat the earlier writes.',
         };
       const attached = project.issueTypes.some((t) => t.id === pending.type);
       return {
         message: type
           ? attached
-            ? 'The type exists and is attached. Acknowledge resolution, then select this type and review saving the mapping.'
+            ? 'The type exists and is attached. Acknowledge resolution, then select this type and review the change.'
             : 'The type exists but is not attached. Acknowledge resolution, then select it to review repairing the association.'
           : 'The recorded type is unavailable. Inspect Jira settings before acknowledging resolution.',
       };
@@ -458,7 +475,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       await admin(c);
       const current = await s.get(c.projectId);
       if (!current?.data.pending || current.revision !== revision)
-        throw new UserError('Configuration changed. Check configuration again.');
+        throw new UserError('Configuration changed. Check the space again.');
       // Do not unlock an active request. Forge resolver execution is bounded well below this delay.
       if (Date.now() - current.data.pending.started < 120_000)
         throw new UserError(

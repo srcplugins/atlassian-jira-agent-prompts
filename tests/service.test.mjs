@@ -1,8 +1,8 @@
 import './typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { createService, sourceContent, JiraRejected, UserError, hash } =
-  await import('../src/service.ts');
+const { createService, JiraRejected, UserError } = await import('../src/service.ts');
+const { sourceContent } = await import('../src/prompt-text.ts');
 const { createSettings } = await import('../src/settings.ts');
 const doc = (text) => ({
   type: 'doc',
@@ -38,6 +38,8 @@ function fixture() {
     },
   };
   const ports = {
+    refreshAfterSave: async () => false,
+    retainedTypes: async () => [],
     config: async () => '3',
     field: async () => 'customfield_1',
     allowed: async () => {},
@@ -69,7 +71,7 @@ function fixture() {
     },
   };
 }
-test('saved snapshots stay unchanged until an explicit refresh, then unlink preserves original ADF', async () => {
+test('saved snapshots stay unchanged until an explicit Sync, then removal preserves original ADF', async () => {
   const f = fixture();
   const original = structuredClone(f.target.fields.description);
   const loaded = await f.service.load(c);
@@ -88,7 +90,7 @@ test('saved snapshots stay unchanged until an explicit refresh, then unlink pres
   await f.service.save(c, { ...saved, ids: [] });
   assert.deepEqual(f.target.fields.description, original);
 });
-test('stale ticket, modified managed content and moved source stop writes', async () => {
+test('stale work item, modified managed content and moved source stop writes', async () => {
   for (const mode of ['stale', 'managed', 'moved']) {
     const f = fixture();
     let loaded = await f.service.load(c);
@@ -174,7 +176,7 @@ test('reordered Jira object keys do not prevent successful readback recovery', a
   assert.equal(f.calls(), 1);
 });
 
-test('type replacement preserves existing selected sources but rejects new links to previous types', async () => {
+test('type replacement preserves existing selected sources but rejects new selections of previous types', async () => {
   const f = fixture();
   const loaded = await f.service.load(c);
   await f.service.save(c, { ...loaded, ids: ['20'] });
@@ -230,7 +232,7 @@ test('unchanged saves never issue a write or publish a recoverable in-flight cla
   assert.deepEqual((await f.service.load(c)).ids, ['20']);
 });
 
-test('changing setup to a linked target type permits only cleanup without searching the new catalog', async () => {
+test('changing setup to a type whose prompts are selected permits only cleanup without searching the new catalog', async () => {
   const f = fixture();
   let config = { revision: 1, data: { type: '3' } };
   const types = ['2', '3'].map((id) => ({
@@ -292,10 +294,10 @@ test('changing setup to a linked target type permits only cleanup without search
   assert.deepEqual(f.target.fields.description, doc('Keep this'));
 });
 
-test('prompt targets without existing links still reject loading and forged save inputs', async () => {
+test('prompt targets without selected prompts still reject loading and forged save inputs', async () => {
   const f = fixture();
   f.target.fields.issuetype.id = '3';
-  await assert.rejects(f.service.load(c), /Prompt tickets cannot add/);
+  await assert.rejects(f.service.load(c), /cannot use other prompts/);
   for (const ids of [[], ['20']]) {
     await assert.rejects(
       f.service.save(c, { ids, revision: 0, fingerprint: 'unused' }),
@@ -315,11 +317,11 @@ test('cleanup after a target becomes a prompt preserves permission and block-own
     const loaded = await f.service.load(c);
     if (mode === 'denied')
       f.ports.allowed = async () => {
-        throw new UserError('Missing Edit Issues');
+        throw new UserError('Missing Edit work items');
       };
     await assert.rejects(
       f.service.save(c, { ...loaded, ids: [] }),
-      /Missing Edit Issues|changed, moved or removed/,
+      /Missing Edit work items|changed, moved or duplicated/,
     );
     assert.equal(f.calls(), 1);
     assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
@@ -425,7 +427,7 @@ test('unresolved source reference names the source and leaves Jira and stored li
   assert.equal(await f.ports.get(), undefined);
 });
 
-test('Jira dropping empty copied attributes cannot strand save, refresh, or unlink', async () => {
+test('Jira dropping empty copied attributes cannot strand save, Sync or removal', async () => {
   const f = fixture();
   f.source.fields.description.content[0].attrs = { localId: 'editor-source-id' };
   const update = f.ports.update;
@@ -442,48 +444,6 @@ test('Jira dropping empty copied attributes cannot strand save, refresh, or unli
   await f.service.save(c, { ...saved, ids: [] });
   assert.deepEqual(f.target.fields.description, doc('Keep this'));
   assert.equal((await f.ports.get('10')).data.pending, undefined);
-});
-
-// Migration test: remove once no site (development included) can hold a pre-fix pending receipt.
-test('pre-fix pending empty-attribute receipts reconcile exactly without another Jira write', async () => {
-  for (const altered of [false, 'body', 'outside', 'field', 'id', 'duplicate']) {
-    const f = fixture();
-    await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
-    const expected = structuredClone(f.target.fields.description);
-    expected.content[1].content[1].attrs = {};
-    const oldManaged = { localId: 'npl-10', fingerprint: hash(expected.content[1]) };
-    const state = await f.ports.get('10');
-    await f.ports.cas('10', state.revision, {
-      ids: [],
-      managed: null,
-      pending: {
-        before: hash([doc('Keep this'), []]),
-        after: hash([expected, ['TEST-20']]),
-        ids: ['20'],
-        managed: oldManaged,
-      },
-    });
-    if (altered === 'body')
-      f.target.fields.description.content[1].content[1].content[0].text = 'Changed';
-    if (altered === 'outside') f.target.fields.description.content[0].content[0].text = 'Changed';
-    if (altered === 'field') f.target.fields.customfield_1 = [];
-    if (altered === 'id') f.target.fields.description.content[1].attrs.localId = 'other';
-    if (altered === 'duplicate')
-      f.target.fields.description.content.push(
-        structuredClone(f.target.fields.description.content[1]),
-      );
-    if (altered) {
-      await assert.rejects(f.service.load(c), /previous save could not be verified/);
-      assert.ok((await f.ports.get('10')).data.pending);
-    } else {
-      const loaded = await f.service.load(c);
-      assert.deepEqual(loaded.ids, ['20']);
-      assert.equal((await f.ports.get('10')).data.pending, undefined);
-      assert.equal(f.calls(), 1);
-      await f.service.save(c, { ...loaded, ids: [] });
-      assert.deepEqual(f.target.fields.description, doc('Keep this'));
-    }
-  }
 });
 
 test('initial suggestions use one ten-summary search without fetching source bodies', async () => {
@@ -508,7 +468,7 @@ test('initial suggestions use one ten-summary search without fetching source bod
   assert.deepEqual(searches, [{ project: '1', type: '3', query: { limit: 10 } }]);
   assert.deepEqual(loaded.prompts, prompts);
   assert.deepEqual(reads, ['10']);
-  await f.service.library(c, { surface: 'picker', query: '' });
+  await f.service.search(c, { query: '' });
   assert.deepEqual(searches[1].query, { query: '', limit: 10 });
   assert.equal(f.calls(), 0);
 });

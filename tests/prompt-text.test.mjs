@@ -93,6 +93,8 @@ test('source text and formatted output have separate limits without accepting em
   const code = (text) => ({ type: 'codeBlock', content: [{ type: 'text', text }] });
   assert.equal(sourceContent(doc(code('x'.repeat(4000)))), `\`\`\`\n${'x'.repeat(4000)}\n\`\`\``);
   assert.throws(() => sourceContent(doc(code('x'.repeat(4001)))), /4000/);
+  assert.doesNotThrow(() => sourceContent(doc(code('😀'.repeat(4000)))));
+  assert.throws(() => sourceContent(doc(code('😀'.repeat(4001)))), /4000/);
   for (const value of [doc({ type: 'rule' }), doc(code('  '))])
     assert.throws(() => sourceContent(value), /4000/);
   let nested = paragraph('x\n'.repeat(2000));

@@ -1,5 +1,5 @@
 // Bound independent read-only requests; configuration writes keep their durable serial protocol.
-export async function readProjects<T>(
+export async function readSpaces<T>(
   ids: readonly string[],
   read: (id: string) => Promise<T>,
   update: (results: { id: string; value?: T; error?: string }[]) => void,
@@ -15,7 +15,7 @@ export async function readProjects<T>(
       } catch (e) {
         results[index] = {
           id,
-          error: e instanceof Error ? e.message : 'Project could not be checked.',
+          error: e instanceof Error ? e.message : 'Space could not be checked.',
         };
       }
       update(results.filter(Boolean));

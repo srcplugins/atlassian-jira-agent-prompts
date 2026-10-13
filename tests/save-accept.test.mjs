@@ -35,6 +35,8 @@ function fixture() {
     allowed: new Set(['ADMINISTER', 'EDIT_ISSUES']),
   };
   const p = {
+    refreshAfterSave: async () => false,
+    retainedTypes: async () => [],
     config: async () => '3',
     field: async () => FIELD,
     allowed: async (_project, permission) => {
@@ -146,7 +148,7 @@ test('a lost normalized save is adoptable after two minutes and accept writes on
   assert.equal(block(f.target.fields.description), undefined);
 });
 
-test('a lost Sync that never applied is not adoptable after a native edit in the old block', async () => {
+test('a lost Sync that never applied is not adoptable after a Jira edit in the old section', async () => {
   const f = fixture();
   await f.save(['20']);
   f.sources[20].text = 'Updated instructions';
@@ -198,29 +200,114 @@ test('a different field value, a duplicated block or a nested block is not adopt
   }
 });
 
-test('pre-save content is the release case, and keyless legacy records are never adoptable', async () => {
+test('pre-save content is the release case, never adoptable', async () => {
   const f = fixture();
   f.jira = () => ({});
   f.lose = true;
   await assert.rejects(f.save(['20']), /could not be confirmed/);
   f.age();
-  let status = await f.service.saveStatus(c);
+  const status = await f.service.saveStatus(c);
   assert.equal(status.unchanged, true);
   assert.equal(status.adoptable, false);
   await assert.rejects(f.service.acceptSave(c, { ...status, acknowledged: true }), /no longer/);
-  // A record written before receipts carried keys and a block skeleton.
-  const legacy = fixture();
-  legacy.jira = normalizeLocalIds;
-  legacy.lose = true;
-  await assert.rejects(legacy.save(['20']), /could not be confirmed/);
-  delete legacy.stored().data.pending.keys;
-  delete legacy.stored().data.pending.shape;
-  legacy.age();
-  status = await legacy.service.saveStatus(c);
-  assert.equal(status.adoptable, false);
 });
 
-test('accept requires Administer Jira, Edit Issues and the inspected revision and ticket', async () => {
+test('an unapplied save stays releasable after a Jira Description edit outside the section', async () => {
+  for (const sync of [false, true]) {
+    const f = fixture();
+    if (sync) {
+      await f.save(['20']);
+      f.sources[20].text = 'Updated instructions';
+    }
+    // The PUT never reaches Jira (a timeout or 5xx before processing).
+    f.jira = () => ({});
+    f.lose = true;
+    await assert.rejects(f.save(['20']), /could not be confirmed/);
+    // Ordinary team activity elsewhere in the Description.
+    f.target.fields.description.content.unshift(paragraph('Team note'));
+    f.target.fields.updated += 'n';
+    f.age();
+    const status = await f.service.saveStatus(c);
+    assert.equal(status.unchanged, true, sync ? 'sync' : 'save');
+    const writes = f.writes();
+    assert.deepEqual(await f.service.resolveSave(c, { ...status, acknowledged: true }), {
+      resolved: true,
+    });
+    assert.equal(f.writes(), writes);
+    f.lose = false;
+    f.jira = (fields) => fields;
+    assert.deepEqual((await f.service.load(c)).ids, sync ? ['20'] : []);
+    // The released record allows a new save that keeps the team note.
+    await f.save(['20']);
+    assert.equal(f.target.fields.description.content[0].content[0].text, 'Team note');
+  }
+});
+
+test('a save that did reach Jira is never released as unapplied, even after other edits', async () => {
+  for (const sync of [false, true]) {
+    const f = fixture();
+    if (sync) {
+      await f.save(['20']);
+      f.sources[20].text = 'Updated instructions';
+    }
+    // Jira applies the PUT and the response is lost.
+    f.lose = true;
+    await assert.rejects(f.save(['20']), /could not be confirmed/);
+    f.target.fields.description.content.unshift(paragraph('Team note'));
+    f.target.fields.updated += 'n';
+    f.age();
+    const status = await f.service.saveStatus(c);
+    assert.equal(status.unchanged, false, sync ? 'sync' : 'save');
+    assert.equal(status.adoptable, true);
+    await assert.rejects(
+      f.service.resolveSave(c, { ...status, acknowledged: true }),
+      /differs from the pre-save state/,
+    );
+  }
+});
+
+test('pending prompt keys are shown only to an administrator with Edit work items', async () => {
+  const f = fixture();
+  // The PUT never reaches Jira, so the save stays pending.
+  f.jira = () => ({});
+  f.lose = true;
+  await assert.rejects(f.save(['20']), /could not be confirmed/);
+  f.allowed = new Set(['EDIT_ISSUES']);
+  const viewer = await f.service.saveStatus(c);
+  assert.equal(viewer.administrator, false);
+  assert.equal('keys' in viewer, false);
+  f.allowed = new Set(['ADMINISTER', 'EDIT_ISSUES']);
+  assert.deepEqual((await f.service.saveStatus(c)).keys, ['TEST-20']);
+});
+
+test('a lost Sync that changed only a link and never landed is released, not accepted', async () => {
+  const f = fixture();
+  const link = (href) => ({
+    type: 'paragraph',
+    content: [{ type: 'text', text: 'Docs', marks: [{ type: 'link', attrs: { href } }] }],
+  });
+  const issue = f.p.issue;
+  let href = 'https://old.example';
+  f.p.issue = async (id) => {
+    const value = await issue(id);
+    if (id === '20') value.fields.description = doc(link(href));
+    return value;
+  };
+  await f.save(['20']);
+  href = 'https://new.example';
+  f.jira = () => ({});
+  f.lose = true;
+  await assert.rejects(f.save(['20']), /could not be confirmed/);
+  f.target.fields.description.content.unshift(paragraph('Team note'));
+  f.target.fields.updated += 'n';
+  f.age();
+  const status = await f.service.saveStatus(c);
+  assert.equal(status.adoptable, false);
+  assert.equal(status.unchanged, true);
+  await assert.rejects(f.service.acceptSave(c, { ...status, acknowledged: true }), /no longer/);
+});
+
+test('accept requires Administer Jira, Edit work items and the inspected revision and work item', async () => {
   const f = fixture();
   f.jira = normalizeLocalIds;
   f.lose = true;
@@ -265,9 +352,9 @@ test('deselecting a block the user deleted clears only the field and leaves Desc
   const loaded = await f.service.load(c);
   await assert.rejects(
     f.service.save(c, { ...loaded, ids: ['20', '21'] }),
-    /block was removed in Jira. Remove all prompts and save/,
+    /section was removed in Jira. Remove all prompts and save/,
   );
-  await assert.rejects(f.service.save(c, { ...loaded, ids: ['20'] }), /block was removed/);
+  await assert.rejects(f.service.save(c, { ...loaded, ids: ['20'] }), /section was removed/);
   assert.equal(f.writes(), 1);
   await f.service.save(c, { ...loaded, ids: [] });
   assert.deepEqual(f.sent.at(-1), { [FIELD]: [] });
@@ -289,7 +376,7 @@ test('forgetting a deleted block with an already empty field needs no Jira write
   assert.deepEqual(f.stored().data, { ids: [], managed: null });
 });
 
-test('a native Description edit racing the forget save survives and the field receipt settles', async () => {
+test('a Jira Description edit racing the forget save survives and the field receipt settles', async () => {
   const f = fixture();
   await f.save(['20']);
   f.target.fields.description = doc(paragraph('Original'));

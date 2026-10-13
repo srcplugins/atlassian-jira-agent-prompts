@@ -17,8 +17,8 @@ const sdk = (...responses) => ({
   kvs: { entity: () => ({ get: async () => undefined }) },
   fieldType: () => 'exact-field',
 });
-test('wizard inventory uses asUser live-software pagination and excludes team-managed projects', async () => {
-  const { createWizardPorts } = await import('../src/integration.ts');
+test('space inventory uses asUser live-software pagination and excludes team-managed spaces', async () => {
+  const { createBatchPorts } = await import('../src/integration.ts');
   const s = sdk(
     {
       body: {
@@ -38,7 +38,7 @@ test('wizard inventory uses asUser live-software pagination and excludes team-ma
       },
     },
   );
-  assert.deepEqual(await createWizardPorts(s).projects(), {
+  assert.deepEqual(await createBatchPorts(s).projects(), {
     projects: [
       { id: '1', key: 'ONE', name: 'One' },
       { id: '3', key: 'THREE', name: 'Three' },
@@ -51,17 +51,17 @@ test('wizard inventory uses asUser live-software pagination and excludes team-ma
   );
   assert.ok(s.calls.every((c) => c.actor === 'asUser'));
 });
-test('wizard malformed paging never claims a complete site inventory', async () => {
-  const { createWizardPorts } = await import('../src/integration.ts');
+test('malformed inventory paging never claims a complete site inventory', async () => {
+  const { createBatchPorts } = await import('../src/integration.ts');
   for (const body of [
     { startAt: 1, isLast: true, values: [] },
     { startAt: 0, isLast: false, values: [] },
     { startAt: 0, isLast: true, values: [{ id: '1', key: 'ONE', name: 'One' }] },
   ])
-    await assert.rejects(createWizardPorts(sdk({ body })).projects());
+    await assert.rejects(createBatchPorts(sdk({ body })).projects());
 });
-test('wizard handlers reject payload injection and recheck global administrator permission', async () => {
-  for (const action of ['wizard-catalog', 'wizard-cancel-interrupted']) {
+test('configuration handlers reject payload injection and recheck global administrator permission', async () => {
+  for (const action of ['configuration-catalog', 'configuration-cancel-interrupted']) {
     for (const payload of [{ projectId: '1' }, { accountId: 'admin' }]) {
       const s = sdk();
       assert.equal((await registerResolvers(s)[action]({ context, payload })).ok, false);
@@ -73,7 +73,7 @@ test('wizard handlers reject payload injection and recheck global administrator 
     assert.equal(s.calls[0].path, '/rest/api/3/mypermissions?permissions=ADMINISTER');
   }
 });
-test('actual setup handler verifies trusted project through asUser without loading prompts', async () => {
+test('actual setup handler verifies trusted space through asUser without loading prompts', async () => {
   const s = sdk({ body: project });
   const value = await registerResolvers(s).setup({ context, payload: {} });
   assert.equal(value.ok, true);
@@ -88,7 +88,7 @@ test('invalid context and target injection rejected before API calls', async () 
     assert.equal(s.calls.length, 0);
   }
 });
-test('issue recovery binds trusted target and refuses malformed or denied administrator release', async () => {
+test('work item recovery binds trusted target and refuses malformed or denied administrator release', async () => {
   const issueContext = { ...context, extension: { project: { id: '1' }, issue: { id: '10' } } };
   for (const name of ['save-status', 'resolve-save']) {
     for (const payload of [{ issueId: '20' }, { accountId: 'admin' }]) {
@@ -155,7 +155,7 @@ test('denial, malformed response and network failure return safe envelopes witho
     assert.equal(s.calls.length, 1);
   }
 });
-test('issue edits distinguish documented rejections from uncertain failures without retry', async () => {
+test('work item edits distinguish documented rejections from uncertain failures without retry', async () => {
   for (const status of [400, 401, 403, 404, 409, 422, 429]) {
     const s = sdk({ status, body: { errorMessages: ['PRIVATE'] } });
     await assert.rejects(createPorts(s).update('10', { description: null }), (error) => {
@@ -218,14 +218,74 @@ test('provisioning writes classify rejections per endpoint and keep other failur
   });
 });
 
-test('Rovo trusts hosted principal, rejects payload identity and returns bounded metadata', async () => {
+test('Rovo trusts the hosted principal, ignores payload identity and returns bounded metadata', async () => {
   const { registerRovo } = await import('../src/integration.ts');
   const denied = sdk();
+  // Without a principal nothing runs, whatever identity the payload claims.
   assert.equal(
     (await registerRovo(denied)({ projectKey: 'TEST', query: '', accountId: 'injected' }, {})).ok,
     false,
   );
   assert.equal(denied.calls.length, 0);
+  // With a principal, identity fields in the payload change nothing: every call is still asUser.
+  const injected = sdk({ body: project }, { body: { issues: [], isLast: true } });
+  injected.kvs.entity = () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) });
+  const ignored = await registerRovo(injected)(
+    { projectKey: 'TEST', query: 'x', accountId: 'injected', context: { accountId: 'injected' } },
+    { principal: { accountId: 'actor' } },
+  );
+  assert.equal(ignored.ok, true);
+  assert.ok(injected.calls.length > 0 && injected.calls.every((c) => c.actor === 'asUser'));
+  // A read needs a key-shaped promptKey; a numeric issue ID never reaches Jira.
+  const numericKey = sdk({ body: project });
+  const refused = await registerRovo(numericKey)(
+    { projectKey: 'TEST', query: '', promptKey: '20' },
+    { principal: { accountId: 'actor' } },
+  );
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /exact prompt key/);
+  assert.equal(numericKey.calls.length, 0);
+  // The whole request is validated before the space lookup.
+  for (const payload of [
+    { projectKey: 'TEST', promptKey: 'TEST-1;DROP' },
+    { projectKey: 'TEST', query: 7 },
+    { projectKey: 'TEST', query: 'x'.repeat(201) },
+  ]) {
+    const early = sdk({ body: project });
+    const result = await registerRovo(early)(payload, { principal: { accountId: 'actor' } });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /exact prompt key|search query/);
+    assert.equal(early.calls.length, 0);
+  }
+  // Jira keys are case-insensitive: a key typed in lower case reads the same prompt.
+  const lower = sdk(
+    { body: project },
+    {
+      expect: { path: /^\/rest\/api\/3\/issue\/TEST-2\?/ },
+      body: {
+        id: '2',
+        key: 'TEST-2',
+        fields: {
+          project: { id: '1' },
+          issuetype: { id: '3' },
+          summary: 'Check errors',
+          updated: '1',
+          description: {
+            type: 'doc',
+            version: 1,
+            content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Check errors.' }] }],
+          },
+        },
+      },
+    },
+  );
+  lower.kvs.entity = () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) });
+  const read = await registerRovo(lower)(
+    { projectKey: 'TEST', query: '', promptKey: ' test-2 ' },
+    { principal: { accountId: 'actor' } },
+  );
+  assert.equal(read.ok, true, read.error);
+  assert.equal(read.value.key, 'TEST-2');
   const s = sdk(
     { body: project },
     {
@@ -269,7 +329,7 @@ test('configuration impact scan remains bounded at 120 without loading source bo
   assert.ok(s.calls.every((c) => JSON.parse(c.body).fields.join(',') === 'summary'));
 });
 
-test('storage claims are per-ticket, conditional and non-expiring', async () => {
+test('storage claims are per-work-item, conditional and non-expiring', async () => {
   const writes = [];
   class Filter {
     and(...args) {
@@ -343,6 +403,30 @@ test('type adapter retains hierarchy and rejects malformed supplied levels', asy
     assert.equal(s.calls.length, 1);
   }
 });
+test('the work type cap counts global types only, not team-managed ones', async () => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  const scoped = (n) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: String(100 + i),
+      name: `Task ${i}`,
+      subtask: false,
+      hierarchyLevel: 0,
+      scope: { type: 'PROJECT', project: { id: String(1000 + i) } },
+    }));
+  const global = (n) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: String(10_000 + i),
+      name: `Global ${i}`,
+      subtask: false,
+      hierarchyLevel: 0,
+    }));
+  const many = await createSettingsPorts(sdk({ body: [...global(1), ...scoped(5000)] })).types();
+  assert.equal(many.length, 5001);
+  await assert.rejects(
+    createSettingsPorts(sdk({ body: [...global(2001), ...scoped(1)] })).types(),
+    /oversized/,
+  );
+});
 test('optional missing hierarchy stays unknown without rejecting valid types in the same list', async () => {
   const { createSettingsPorts } = await import('../src/integration.ts');
   const types = [
@@ -359,7 +443,7 @@ test('optional missing hierarchy stays unknown without rejecting valid types in 
   assert.deepEqual(await createSettingsPorts(s).types(), types);
   assert.equal(s.calls.length, 1);
 });
-test('scheme adapter verifies complete expanded project ownership, not filtered projectIds', async () => {
+test('scheme adapter verifies complete expanded space ownership, not filtered projectIds', async () => {
   const { createSettingsPorts } = await import('../src/integration.ts');
   const s = sdk(
     { body: { isLast: true, values: [{ issueTypeScheme: { id: '9' }, projectIds: ['1'] }] } },
@@ -379,7 +463,7 @@ test('scheme adapter verifies complete expanded project ownership, not filtered 
   assert.deepEqual((await createSettingsPorts(s).scheme('1')).projectIds, ['1', '2']);
   assert.equal(s.calls[1].path, '/rest/api/3/issuetypescheme?id=9&expand=projects');
 });
-test('settings handler checks administration on the selected project before configuration writes', async () => {
+test('settings handler checks administration on the selected space before configuration writes', async () => {
   const s = sdk();
   assert.equal(
     (await registerResolvers(s)['settings-health']({ context, payload: { projectId: '2' } })).ok,
@@ -405,7 +489,7 @@ test('field discovery is invocation-scoped, including recovery from a failed loo
   assert.equal(s.remaining(), 0);
 });
 
-test('health project inventory is admin-only and independent of type diagnostics or storage', async () => {
+test('health space inventory is admin-only and independent of type diagnostics or storage', async () => {
   const denied = sdk({ body: { permissions: { ADMINISTER: { havePermission: false } } } });
   assert.equal(
     (await registerResolvers(denied)['settings-projects']({ context, payload: {} })).ok,
@@ -457,12 +541,12 @@ test('preference and resolution resolvers reject extra authority fields, bad rev
     assert.equal((await registerResolvers(denied)[action]({ context, payload })).ok, false);
     assert.equal(denied.calls.length, 1);
   }
-  // Type changes and unlink run only through the reviewed wizard batch.
+  // Type changes and setup removal run only through the reviewed multi-space configuration.
   const definitions = registerResolvers(sdk());
   for (const removed of ['settings-preview', 'settings-apply', 'settings-unlink'])
     assert.equal(definitions[removed], undefined);
 });
-test('a settings project key is resolved only after the global administrator check', async () => {
+test('a settings space key is resolved only after the global administrator check', async () => {
   const denied = sdk({ body: { permissions: { ADMINISTER: { havePermission: false } } } });
   const result = await registerResolvers(denied)['settings-health']({
     context: { accountId: 'actor', extension: {} },
@@ -472,30 +556,33 @@ test('a settings project key is resolved only after the global administrator che
   assert.equal(denied.calls.length, 1);
   assert.match(denied.calls[0].path, /^\/rest\/api\/3\/mypermissions\?permissions=ADMINISTER/);
 });
-test('prompt search uses numeric project and configured type IDs without name injection', async () => {
-  const { promptSearchUrl } = await import('../src/navigation.ts');
-  const url = new URL(promptSearchUrl('10', '20'), 'https://example.atlassian.net');
-  assert.equal(url.pathname, '/issues/');
-  assert.equal(url.searchParams.get('jql'), 'project = 10 AND issuetype = 20 ORDER BY key ASC');
-  for (const input of ['Prompt', '10 OR project=20', ''])
-    assert.throws(() => promptSearchUrl('10', input));
-});
-
-test('shared impact rejects truncated, inconsistent, duplicate and nonmember project lists', async () => {
+test('a partly listed shared scheme is marked incomplete; inconsistent lists are refused', async () => {
   const { createSettingsPorts } = await import('../src/integration.ts');
-  for (const projects of [
-    { isLast: false, values: [{ id: '1' }] },
-    { isLast: true, total: 2, values: [{ id: '1' }] },
-    { isLast: true, values: [{ id: '1' }, { id: '1' }] },
-    { isLast: true, values: [{ id: '2' }] },
-  ]) {
-    const s = sdk(
+  const read = (projects) =>
+    sdk(
       { body: { isLast: true, values: [{ issueTypeScheme: { id: '9' } }] } },
       { body: { isLast: true, values: [{ id: '9', name: 'Shared', projects }] } },
     );
-    await assert.rejects(createSettingsPorts(s).scheme('1'), /incomplete|inconsistent/);
+  for (const projects of [
+    { isLast: false, values: [{ id: '2' }] },
+    { isLast: true, total: 2, values: [{ id: '2' }] },
+  ]) {
+    const s = read(projects);
+    assert.deepEqual(await createSettingsPorts(s).scheme('1'), {
+      id: '9',
+      name: 'Shared',
+      isDefault: false,
+      projectIds: [],
+      projects: [],
+      complete: false,
+    });
     assert.ok(s.calls.every((c) => c.method === 'GET'));
   }
+  for (const projects of [
+    { isLast: true, values: [{ id: '1' }, { id: '1' }] },
+    { isLast: true, values: [{ id: '2' }] },
+  ])
+    await assert.rejects(createSettingsPorts(read(projects)).scheme('1'), /inconsistent/);
 });
 
 test('discovery requests one newest-first page, scoped metadata, exact keys and bounded cursors', async () => {
@@ -549,6 +636,12 @@ test('search drops operator and stop words and treats Jira 400 as no match', asy
   // Without a query, a 400 is still an error (the configured scope itself was refused).
   const scope = sdk({ status: 400 });
   await assert.rejects(createPorts(scope).search('1', '3', { query: '', limit: 10 }), /HTTP 400/);
+  // A refused follow-up page (an expired cursor) is a failed page, not the end of the results.
+  const expired = sdk({ status: 400 });
+  await assert.rejects(
+    createPorts(expired).search('1', '3', { query: 'prompt', cursor: 'old', limit: 10 }),
+    /HTTP 400/,
+  );
 });
 test('discovery rejects malformed pages, duplicate IDs, foreign scope and repeated cursors', async () => {
   const issue = {
@@ -582,20 +675,20 @@ test('search text cannot inject JQL and invalid handler payloads never access Ji
     { body: { issues: [], isLast: true } },
   );
   const kvs = { entity: () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) }) };
-  const library = registerResolvers({ ...accepted, kvs }).library;
+  const search = registerResolvers({ ...accepted, kvs }).search;
   for (const payload of [{ query: 'x'.repeat(200) }, { cursor: 'c'.repeat(8192) }])
-    assert.equal((await library({ context, payload })).ok, true);
+    assert.equal((await search({ context, payload })).ok, true);
   accepted.assertDrained();
   for (const payload of [
     { query: 2 },
     { query: 'x'.repeat(201) },
     { cursor: '' },
     { cursor: 'x'.repeat(8193) },
-    { surface: 'admin' },
+    { surface: 'picker' },
     { projectId: '2' },
   ]) {
     const bad = sdk();
-    const result = await registerResolvers(bad).library({ context, payload });
+    const result = await registerResolvers(bad).search({ context, payload });
     assert.equal(result.ok, false);
     assert.equal(bad.calls.length, 0);
   }
@@ -632,7 +725,7 @@ test('discovery can continue beyond 120 without increasing any request size', as
 });
 
 test('storage refuses records over 190,000 bytes before any write', async () => {
-  const { createWizardPorts } = await import('../src/integration.ts');
+  const { createBatchPorts } = await import('../src/integration.ts');
   const writes = [];
   const s = {
     ...sdk(),
@@ -662,14 +755,11 @@ test('storage refuses records over 190,000 bytes before any write', async () => 
     createPorts(s).cas('10', 1, { ids: [], managed: null, pad: 'x'.repeat(190_001 - overhead) }),
     /too large/,
   );
-  await assert.rejects(
-    createWizardPorts(s).cas(0, { pad: 'x'.repeat(190_001) }),
-    /too many projects/,
-  );
+  await assert.rejects(createBatchPorts(s).cas(0, { pad: 'x'.repeat(190_001) }), /too many spaces/);
   assert.deepEqual(writes, ['issue-10']);
 });
 
-test('shared scheme membership accepts 1,000 associated projects and refuses 1,001', async () => {
+test('shared scheme membership lists 1,000 associated spaces and marks 1,001 incomplete', async () => {
   const { createSettingsPorts } = await import('../src/integration.ts');
   for (const [count, ok] of [
     [1000, true],
@@ -687,14 +777,14 @@ test('shared scheme membership accepts 1,000 associated projects and refuses 1,0
     );
     const result = createSettingsPorts(s).scheme('1');
     if (ok) assert.equal((await result).projectIds.length, 1000);
-    else await assert.rejects(result, /incomplete or inconsistent/);
+    else assert.equal((await result).complete, false);
   }
 });
 
-test('the project inventory treats a documented 404 as empty and stops paging after its time budget', async (t) => {
-  const { createWizardPorts } = await import('../src/integration.ts');
+test('the space inventory treats a documented 404 as empty and stops paging after its time budget', async (t) => {
+  const { createBatchPorts } = await import('../src/integration.ts');
   const empty = sdk({ status: 404 });
-  assert.deepEqual(await createWizardPorts(empty).projects(), { projects: [], incomplete: false });
+  assert.deepEqual(await createBatchPorts(empty).projects(), { projects: [], incomplete: false });
   // A 404 on a later page is not "no projects": it stays an error.
   const later = sdk(
     {
@@ -706,7 +796,7 @@ test('the project inventory treats a documented 404 as empty and stops paging af
     },
     { status: 404 },
   );
-  await assert.rejects(createWizardPorts(later).projects(), /HTTP 404/);
+  await assert.rejects(createBatchPorts(later).projects(), /HTTP 404/);
   // Slow pages of team-managed projects: report a partial inventory instead of timing out.
   let now = 1_000_000;
   t.mock.method(Date, 'now', () => now);
@@ -723,7 +813,7 @@ test('the project inventory treats a documented 404 as empty and stops paging af
     },
   });
   const slow = sdk(page(0), page(100), page(200));
-  const ports = createWizardPorts(slow);
+  const ports = createBatchPorts(slow);
   const original = slow.api.asUser;
   slow.api.asUser = () => {
     const user = original();
@@ -738,19 +828,19 @@ test('the project inventory treats a documented 404 as empty and stops paging af
   assert.equal(slow.calls.length, 2);
 });
 
-test('the Rovo project lookup returns clear errors and accepts only company-managed Software', async () => {
+test('the Rovo space lookup returns clear errors and accepts only company-managed Software', async () => {
   const { registerRovo } = await import('../src/integration.ts');
   const principal = { principal: { accountId: 'actor' } };
   const payload = { projectKey: 'TEST', query: '' };
   for (const [response, pattern] of [
-    [{ status: 404 }, /^Project is unavailable\.$/],
+    [{ status: 404 }, /^Space is unavailable\.$/],
     [{ status: 429 }, /limiting requests/],
     [{ status: 200, invalidJson: true }, /unreadable data/],
     [
       { body: { id: '1', key: 'TEST', projectTypeKey: 'software', style: 'next-gen' } },
       /Company-managed/,
     ],
-    [{ body: null }, /Project context does not match/],
+    [{ body: null }, /Space context does not match/],
   ]) {
     const s = sdk(response);
     const result = await registerRovo(s)(payload, principal);
@@ -782,4 +872,42 @@ test('Rovo search returns at most twenty matches and reports more', async () => 
   assert.equal(result.value.prompts.length, 20);
   assert.equal(result.value.incomplete, true);
   assert.equal(JSON.parse(s.calls[1].body).maxResults, 20);
+});
+
+test('one request reads a space settings record once, and a storage failure is an outage', async () => {
+  const { StorageUnavailable } = await import('../src/service.ts');
+  const reads = [];
+  const s = sdk();
+  s.kvs = {
+    entity: () => ({
+      get: async (key) => {
+        reads.push(key);
+        return { revision: 2, data: { type: '3', previousTypes: ['4'], refreshAfterSave: true } };
+      },
+    }),
+  };
+  const ports = createPorts(s);
+  assert.deepEqual(
+    await Promise.all([ports.config('1'), ports.retainedTypes('1'), ports.refreshAfterSave('1')]),
+    ['3', ['4'], true],
+  );
+  assert.deepEqual(reads, ['config-1']);
+  await ports.config('2');
+  assert.deepEqual(reads, ['config-1', 'config-2']);
+
+  const failing = sdk();
+  failing.kvs = {
+    entity: () => ({
+      get: async () => {
+        throw new Error('private storage detail');
+      },
+    }),
+  };
+  const broken = createPorts(failing);
+  for (const lookup of [broken.config, broken.retainedTypes, broken.refreshAfterSave])
+    await assert.rejects(lookup('1'), (error) => {
+      assert.ok(error instanceof StorageUnavailable);
+      assert.equal(error.message, 'App storage is unavailable. Try again shortly.');
+      return true;
+    });
 });

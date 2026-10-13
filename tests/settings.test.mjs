@@ -2,7 +2,8 @@ import './typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const { createSettings, NotApplied } = await import('../src/settings.ts');
-const { UserError, JiraRejected, JiraUnavailable } = await import('../src/service.ts');
+const { UserError, JiraRejected, JiraUnavailable, StorageUnavailable } =
+  await import('../src/service.ts');
 const c = { accountId: 'admin', projectId: '1' };
 function fixture() {
   let stored = { revision: 1, data: { type: '3' } };
@@ -76,13 +77,13 @@ test('type replacement previews bounded visible impact and retains old IDs witho
   const f = fixture();
   const plan = await f.settings.preview(c, { type: '4' });
   assert.deepEqual(plan.promptKeys, ['TEST-20']);
-  assert.deepEqual(plan.linkedKeys, ['TEST-10']);
-  assert.equal(plan.linksIncomplete, true);
+  assert.deepEqual(plan.usingKeys, ['TEST-10']);
+  assert.equal(plan.usingIncomplete, true);
   await f.settings.apply(c, { type: '4', fingerprint: plan.fingerprint });
   assert.deepEqual(f.state().data, { type: '4', previousTypes: ['3'] });
   assert.deepEqual(f.writes, ['config']);
 });
-test('concurrent mapping applies admit one claimant and stale preview is rejected', async () => {
+test('concurrent setup applies admit one claimant and stale preview is rejected', async () => {
   const f = fixture();
   const plan = await f.settings.preview(c, { type: '4' });
   const results = await Promise.allSettled(
@@ -94,7 +95,7 @@ test('concurrent mapping applies admit one claimant and stale preview is rejecte
     /changed/,
   );
 });
-test('creation claims before external writes, then attaches and confirms mapping', async () => {
+test('creation claims before external writes, then attaches and confirms setup', async () => {
   const f = fixture();
   const plan = await f.settings.preview(c, { name: 'Runbook' });
   await f.settings.apply(c, { name: 'Runbook', fingerprint: plan.fingerprint });
@@ -147,7 +148,7 @@ test('uncertain create remains locked; outcome check is read-only and does not r
   assert.equal(f.state().data.type, '3');
   assert.equal(f.state().data.pending, undefined);
 });
-test('deleted type can be replaced without claiming old tickets absent', async () => {
+test('deleted type can be replaced without claiming old work items absent', async () => {
   const f = fixture();
   f.types.shift();
   const plan = await f.settings.preview(c, { type: '4' });
@@ -217,16 +218,8 @@ test('another administrator must review their own setup change', async () => {
   assert.deepEqual(f.writes, []);
 });
 
-test('all setup endpoints enforce administrator permission and the requested project before writes', async () => {
-  for (const action of [
-    'health',
-    'preview',
-    'apply',
-    'recover',
-    'resolve',
-    'unlink',
-    'preferences',
-  ]) {
+test('all setup endpoints enforce administrator permission and the requested space before writes', async () => {
+  for (const action of ['health', 'preview', 'apply', 'recover', 'resolve', 'preferences']) {
     const denied = fixture();
     denied.p.allowed = async () => {
       throw new UserError('denied');
@@ -237,13 +230,13 @@ test('all setup endpoints enforce administrator permission and the requested pro
     other.project.id = '2';
     await assert.rejects(
       other.settings[action](c, { type: '4', fingerprint: 'bad' }),
-      /Project context does not match/,
+      /Space context does not match/,
     );
     assert.deepEqual(other.writes, []);
   }
 });
 
-test('provisioning faults preserve old mapping and never retry Jira writes', async () => {
+test('provisioning faults preserve old setup and never retry Jira writes', async () => {
   for (const failure of [
     'claim',
     'create-response',
@@ -306,7 +299,7 @@ test('concurrent creation and replay create and attach at most once', async () =
   assert.equal(f.writes.filter((w) => w === 'attach').length, 1);
 });
 
-test('an already-associated type on shared/default schemes changes only the app mapping', async () => {
+test('an already-associated type on shared/default schemes changes only the app setup', async () => {
   for (const mode of ['shared', 'default']) {
     const f = fixture();
     if (mode === 'shared') f.scheme.projectIds.push('2');
@@ -369,14 +362,14 @@ test('pending setup remains inspectable and manually resolvable when diagnostics
     });
     if (failure !== 'scheme')
       f.s.types = async () => {
-        throw new UserError('Ticket type lookup failed.');
+        throw new UserError('Work type lookup failed.');
       };
     let schemeReads = 0;
     f.s.scheme = async () => {
       schemeReads++;
       if (failure !== 'types')
         throw new UserError(
-          'Scheme project list is incomplete; no automatic changes are available.',
+          'The scheme’s space list is incomplete; no automatic changes are available.',
         );
       return structuredClone(f.scheme);
     };
@@ -436,8 +429,8 @@ test('recovery does not recommend selecting a pending type that became ineligibl
   const health = await f.settings.health(c);
   assert.ok(!health.types.some((type) => type.id === '4'));
   const outcome = await f.settings.recover(c);
-  assert.match(outcome.message, /no longer an eligible base-level global type/);
-  assert.match(outcome.message, /choose an eligible replacement/);
+  assert.match(outcome.message, /no longer a standard global work type/);
+  assert.match(outcome.message, /choose a replacement/);
   assert.doesNotMatch(outcome.message, /select this type/);
   assert.deepEqual(f.writes, []);
 });
@@ -511,12 +504,17 @@ test('direct shared scheme apply requires acknowledgment bound to unchanged revi
   assert.equal(f.writes.filter((w) => w === 'attach').length, 1);
 });
 
-test('unlink clears active mapping and preferences, preserves Jira and lets retained types be reused', async () => {
+async function removeSetup(f) {
+  const plan = await f.settings.preview(c, { unlink: true });
+  return f.settings.apply(c, { unlink: true, fingerprint: plan.fingerprint });
+}
+
+test('removing setup clears the type and preferences, preserves Jira and lets retained types be reused', async () => {
   const f = fixture();
   f.set({ revision: 8, data: { type: '3', previousTypes: ['4'], refreshAfterSave: true } });
   const stale = await f.settings.preview(c, { type: '4' });
   const before = structuredClone({ types: f.types, project: f.project, scheme: f.scheme });
-  await f.settings.unlink(c, 8);
+  await removeSetup(f);
   assert.deepEqual(f.state(), { revision: 9, data: { previousTypes: ['4', '3'] } });
   assert.deepEqual(f.writes, ['config']);
   assert.deepEqual({ types: f.types, project: f.project, scheme: f.scheme }, before);
@@ -529,18 +527,20 @@ test('unlink clears active mapping and preferences, preserves Jira and lets reta
   assert.deepEqual(f.state().data, { type: '3', previousTypes: ['4'] });
 });
 
-test('unlink rejects pending, invalid and stale requests and admits only one concurrent change', async () => {
-  for (const revision of [0, -1, '1', NaN]) {
-    const f = fixture();
-    await assert.rejects(f.settings.unlink(c, revision), /changed/);
-    assert.deepEqual(f.writes, []);
-  }
+test('removing setup rejects pending and stale requests and admits only one concurrent change', async () => {
   const f = fixture();
   f.set({ revision: 1, data: { type: '3', pending: { scheme: '9', started: 0 } } });
-  await assert.rejects(f.settings.unlink(c, 1), /unfinished/);
+  await assert.rejects(removeSetup(f), /unfinished/);
   assert.deepEqual(f.writes, []);
   f.set({ revision: 1, data: { type: '3' } });
-  const outcomes = await Promise.allSettled([f.settings.unlink(c, 1), f.settings.unlink(c, 1)]);
+  const plan = await f.settings.preview(c, { unlink: true });
+  f.set({ revision: 2, data: { type: '3' } });
+  await assert.rejects(
+    f.settings.apply(c, { unlink: true, fingerprint: plan.fingerprint }),
+    /changed/,
+  );
+  assert.deepEqual(f.writes, []);
+  const outcomes = await Promise.allSettled([removeSetup(f), removeSetup(f)]);
   assert.equal(outcomes.filter((r) => r.status === 'fulfilled').length, 1);
   assert.deepEqual(f.writes, ['config']);
 });
@@ -700,6 +700,37 @@ test('twenty previous types are retained and a twenty-first replacement is block
   // 19 retained + the current type = 20: allowed.
   assert.equal((await f.settings.preview(c, { type: '4' })).previousTypes.length, 20);
   f.set({ revision: 1, data: { type: '3', previousTypes: [...previous, '200'] } });
-  await assert.rejects(f.settings.preview(c, { type: '4' }), /Twenty previous type mappings/);
+  await assert.rejects(f.settings.preview(c, { type: '4' }), /twenty previous prompt types/);
   assert.deepEqual(f.writes, []);
+});
+
+test('a partly listed shared scheme allows selecting a type it has, never adding one', async () => {
+  const f = fixture();
+  Object.assign(f.scheme, { projectIds: [], projects: [], complete: false });
+  assert.equal((await f.settings.health(c)).canConfigure, true);
+  const plan = await f.settings.preview(c, { type: '4' });
+  assert.equal(plan.attach, false);
+  await f.settings.apply(c, { type: '4', fingerprint: plan.fingerprint });
+  assert.equal(f.state().data.type, '4');
+  await assert.rejects(f.settings.preview(c, { name: 'Runbook' }), /shared with more spaces/);
+  assert.deepEqual(f.writes, ['config']);
+});
+
+test('a setup removal check that fails before its write is not applied: an outage retries, a change stops', async () => {
+  for (const [failure, retryable] of [
+    [() => Promise.reject(new StorageUnavailable('App storage is unavailable.')), true],
+    [() => Promise.resolve({ revision: 5, data: { type: '3' } }), false],
+  ]) {
+    const f = fixture();
+    const plan = await f.settings.preview(c, { unlink: true });
+    let reads = 0;
+    const get = f.s.get;
+    // The second read (after apply's own review) is unlink's recheck.
+    f.s.get = (...args) => (++reads === 2 ? failure() : get(...args));
+    await assert.rejects(
+      f.settings.apply(c, { unlink: true, fingerprint: plan.fingerprint }),
+      (error) => error instanceof NotApplied && error.retryable === retryable,
+    );
+    assert.deepEqual(f.writes, []);
+  }
 });

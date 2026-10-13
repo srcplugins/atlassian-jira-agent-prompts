@@ -1,28 +1,29 @@
 // Second-site production, backed-up development lifecycle, and bidirectional tenant isolation.
 // Each journey requires independent Jira baselines and exact actor/environment checks.
 import assert from 'node:assert/strict';
-import { runIsolationProbe } from './support/native-isolation.mjs';
+import { runIsolationProbe } from './support/isolation.mjs';
 import { readFileSync } from 'node:fs';
 import { chromium, expect } from '@playwright/test';
 import {
   siteFor,
   activeTarget,
   browserTarget,
+  fixtureProject,
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import {
   lifecycleOptions,
   verifyLifecycleActors,
   verifyConfigurationPlan,
-} from './support/native-lifecycle.mjs';
+} from './support/lifecycle.mjs';
 import {
   tokenRequest,
   client,
   openRun,
   installation,
-  projectPage,
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
-import { snapshotJourney, editor, resumeLinkedJourney } from './support/native-snapshots.mjs';
+import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
+import { snapshotJourney, editor, resumeSavedJourney } from './support/snapshots.mjs';
 import { agentPromptsFixture } from './support/fixture.mjs';
 
 const options = lifecycleOptions(
@@ -48,8 +49,11 @@ try {
   assert.ok(process.env.NATIVE_LIFECYCLE_PROJECT === undefined || secondary);
   if (secondary) assert.equal(process.env.PLUGIN_TEST_ENVIRONMENT, 'development');
   const isolation = process.env.NATIVE_TENANT_ISOLATION === '1';
+  // Fixture space keys come from the private test configuration, never from source.
   const project = await api(
-    `/project/${isolation ? 'PLSISO' : secondary ? 'PLSSBOX' : 'PLSNATIVE'}`,
+    `/project/${fixtureProject(
+      isolation ? 'tenant-isolation' : secondary ? 'forge-sandbox' : agentPromptsFixture,
+    )}`,
   );
   assert.equal(project.style, 'classic');
   const observed = {};
@@ -84,7 +88,7 @@ try {
     recover: options.runId,
     profile: isolation ? 'tenant-isolation' : secondary ? 'lifecycle-secondary' : 'standard',
   });
-  assert.equal(owned.project.id, project.id, 'Recovery project selection mismatch');
+  assert.equal(owned.project.id, project.id, 'Recovery space selection mismatch');
   const state = owned.run.state;
   if (options.runId) {
     assert.equal(state.lifecycle?.environmentId, target.environmentId);
@@ -107,10 +111,10 @@ try {
     await admin.goto(
       `${activeTarget().site}/jira/settings/apps/configure/${target.appId}/${target.environmentId}`,
     );
-    await expect(admin.getByRole('textbox', { name: 'Find a project', exact: true })).toBeEnabled({
+    await expect(admin.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled({
       timeout: 60000,
     });
-    await admin.getByRole('textbox', { name: 'Find a project', exact: true }).fill(project.key);
+    await admin.getByRole('textbox', { name: 'Find a space', exact: true }).fill(project.key);
     const selected = admin.getByRole('checkbox', { name: `Select ${project.key}`, exact: true });
     await selected.click();
     await expect(selected).toBeChecked();
@@ -125,18 +129,20 @@ try {
   async function configure(type, unlink = false) {
     await admin.getByRole('button', { name: 'Configure selected', exact: true }).click();
     if (unlink) {
-      await admin.getByRole('combobox', { name: 'Prompt issue type', exact: true }).click();
-      await admin.getByRole('option', { name: 'Unlink selected projects', exact: true }).click();
+      await admin.getByRole('combobox', { name: 'Prompt work type', exact: true }).click();
+      await admin
+        .getByRole('option', { name: 'Remove setup from selected spaces', exact: true })
+        .click();
     } else {
       await admin.getByRole('combobox', { name: 'Existing type', exact: true }).click();
       await admin.getByRole('option', { name: type.name, exact: true }).click();
       await admin
-        .getByRole('checkbox', { name: 'Reload ticket after saving prompts', exact: true })
+        .getByRole('checkbox', { name: 'Reload work item after saving prompts', exact: true })
         .uncheck();
     }
     const plan = await observeAction(
       admin,
-      'wizard-preview',
+      'configuration-preview',
       () => admin.getByRole('button', { name: 'Review changes', exact: true }).click(),
       target,
     );
@@ -177,7 +183,7 @@ try {
         owned,
         blank: false,
         testInfo: { annotations: [] },
-        retainLinked: true,
+        retainSaved: true,
       });
       state.lifecycle.stage =
         options.mode === 'reinstall-prepare'
@@ -191,27 +197,18 @@ try {
       process.exitCode = 0;
     } else {
       const userPage = await contexts['nc-user'].newPage();
-      await observeAction(
-        userPage,
-        'setup',
-        () => projectPage(userPage, 'agent-prompts', project.key),
-        target,
-      );
-      await userPage.getByRole('button', { name: 'Project configuration', exact: true }).click();
-      await expect(
-        userPage.getByText('Missing Jira permission: ADMINISTER.', { exact: true }).first(),
-      ).toBeVisible({ timeout: 45000 });
-      await expect(
-        userPage.getByRole('button', { name: 'Configure selected', exact: true }),
-      ).toBeDisabled();
-      owned.run.check('nc-user ADMINISTER=false and app administration denied');
+      await spaceSettings(userPage, project.key);
+      await expectSpaceSettingsRefused(userPage, expect);
+      owned.run.check('nc-user ADMINISTER=false and space settings refused');
       for (const blank of [false, true]) {
-        state.lifecycle.stage = blank ? 'blank-round-trip' : 'link-sync-unlink';
+        state.lifecycle.stage = blank ? 'blank-round-trip' : 'add-sync-remove';
         owned.run.persist();
         const testInfo = { annotations: [] };
         await snapshotJourney({ page: userPage, owned, blank, testInfo });
         owned.run.check(
-          blank ? 'NPL-03 ordinary-user blank round trip' : 'NPL-01 ordinary-user link Sync unlink',
+          blank
+            ? 'NPL-03 ordinary-user blank round trip'
+            : 'NPL-01 ordinary-user add, Sync and remove',
           testInfo.annotations,
         );
       }
@@ -244,7 +241,7 @@ try {
       assert.deepEqual(
         (await health()).state,
         state.lifecycle.configuredState,
-        'Upgrade altered app mapping, revision or preference',
+        'Upgrade altered app setup, revision or preference',
       );
       assert.deepEqual(
         (await api(`/issue/${backup.targetId}?fields=description,${backup.fieldId}`)).fields,
@@ -256,11 +253,11 @@ try {
         backup.sourceFields,
       );
       owned.run.check(
-        'Upgrade preserved mapping, revision, reload preference and exact Jira source/field/ADF',
+        'Upgrade preserved app setup, revision, reload preference and exact Jira source/field/ADF',
       );
       const page = await contexts.owner.newPage();
-      await resumeLinkedJourney({ page, owned, backup });
-      owned.run.check('Pre-upgrade target Sync and unlink work after upgrade');
+      await resumeSavedJourney({ page, owned, backup });
+      owned.run.check('Pre-upgrade target Sync and removal work after upgrade');
       state.lifecycle.journeysPassed = true;
       owned.run.persist();
     }
@@ -284,7 +281,7 @@ try {
         backup.sourceFields,
       );
       owned.run.check(
-        'Jira source, copied Description and field survived reinstall; app mapping absent',
+        'Jira source, copied Description and field survived reinstall; app setup absent',
       );
       state.lifecycle.configurationIntent = null;
       state.lifecycle.configuredState = null;
@@ -316,7 +313,7 @@ try {
       await editor(page).getByRole('button', { name: 'Save', exact: true }).click();
       await expect(
         editor(page).getByText(
-          'An untracked prompt container exists. Review the description before saving.',
+          'The description has an Agent Prompts section the app did not save. Review the description before saving.',
           { exact: true },
         ),
       ).toBeVisible({ timeout: 45000 });
@@ -361,14 +358,14 @@ try {
       resource.expected.customField = { id: backup.fieldId, value: cleared[backup.fieldId] };
       owned.run.persist();
       owned.run.check(
-        'Explicit Jira copy repair allows linking and removing all prompts on original target',
+        'Explicit Jira copy repair allows adding and removing all prompts on original target',
       );
       await snapshotJourney({ page, owned, blank: false, testInfo: { annotations: [] } });
-      owned.run.check('Fresh link Sync unlink works after reconfiguration');
+      owned.run.check('Fresh add, Sync and remove work after reconfiguration');
       state.lifecycle.journeysPassed = true;
       owned.run.persist();
     }
-    // Read before restoring configuration; do not clear another actor's replacement mapping.
+    // Read before restoring configuration; do not clear another actor's replacement setup.
     const current = state.lifecycle.configurationIntent ? await health() : null;
     if (current?.state.data.type) {
       assert.ok(state.lifecycle.configurationIntent, 'No owned configuration intent');

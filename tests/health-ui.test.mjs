@@ -1,9 +1,10 @@
 import './typescript-loader.mjs';
-import { readProjects } from '../src/project-reads.ts';
+import { readSpaces } from '../src/space-reads.ts';
+import { finished } from '../src/batch-status.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { hookHost, load, standIns, view } from './support/ui-harness.mjs';
-function fixture(failInventory = false, progress = null, viewer = 'admin', beforeHealth) {
+function fixture(failInventory = false, progress = null, viewer = 'admin', beforeHealth, props) {
   const calls = [];
   const projects = Array.from({ length: 100 }, (_, i) => ({
     id: String(i + 1),
@@ -17,7 +18,7 @@ function fixture(failInventory = false, progress = null, viewer = 'admin', befor
         throw failInventory instanceof Error ? failInventory : Error('Inventory unavailable');
       return { projects, incomplete: false };
     }
-    if (name === 'wizard-status' || name === 'wizard-cancel-interrupted') {
+    if (name === 'configuration-status' || name === 'configuration-cancel-interrupted') {
       if (progress instanceof Error) throw progress;
       return progress;
     }
@@ -34,7 +35,8 @@ function fixture(failInventory = false, progress = null, viewer = 'admin', befor
   const hooks = hookHost();
   const { HealthProjects } = load('health-ui.tsx', {
     react: hooks.react,
-    './project-reads': { readProjects },
+    './space-reads': { readSpaces },
+    './batch-status': { finished },
     './settings-ui': { Settings: 'Settings' },
     './configuration-dialog': { ConfigurationDialog: 'ConfigurationDialog' },
     '@forge/react': {
@@ -63,7 +65,7 @@ function fixture(failInventory = false, progress = null, viewer = 'admin', befor
     },
     './client': { call },
   });
-  const v = view(hooks, () => HealthProjects(failInventory ? { projectId: '1' } : {}));
+  const v = view(hooks, () => HealthProjects(props ?? (failInventory ? { projectId: '1' } : {})));
   return {
     ...v,
     calls,
@@ -82,12 +84,12 @@ function fixture(failInventory = false, progress = null, viewer = 'admin', befor
     },
   };
 }
-test('opening 100 projects makes no health calls; checks only explicitly selected projects', async () => {
+test('opening 100 spaces makes no health calls; checks only explicitly selected spaces', async () => {
   const f = fixture();
   await f.mount();
   assert.deepEqual(
     f.calls.map((c) => c.name),
-    ['settings-projects', 'wizard-cancel-interrupted'],
+    ['settings-projects', 'configuration-cancel-interrupted'],
   );
   assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 100);
   assert.equal(
@@ -127,7 +129,7 @@ test('opening 100 projects makes no health calls; checks only explicitly selecte
 test('select all uses all filtered rows across pages, clears on search and sends exact selection to configuration', async () => {
   const f = fixture();
   await f.mount();
-  f.check('Select all matching projects', true);
+  f.check('Select all matching spaces', true);
   await f.click('Configure selected');
   assert.equal(f.nodes('ConfigurationDialog')[0].props.projects.length, 100);
   await f.nodes('ConfigurationDialog')[0].props.onClose();
@@ -137,11 +139,11 @@ test('select all uses all filtered rows across pages, clears on search and sends
     f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
     true,
   );
-  f.check('Select all matching projects', true);
+  f.check('Select all matching spaces', true);
   await f.click('Configure selected');
   assert.equal(f.nodes('ConfigurationDialog')[0].props.projects.length, 12);
 });
-test('opening a project reuses scan data and returning preserves the filtered list', async () => {
+test('opening a space reuses scan data and returning preserves the filtered list', async () => {
   const f = fixture();
   await f.mount();
   f.search('PR10');
@@ -158,7 +160,7 @@ test('opening a project reuses scan data and returning preserves the filtered li
   assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 2);
 });
 
-test('exact-project recovery stays available when project inventory fails', async () => {
+test('exact-space recovery stays available when space inventory fails', async () => {
   const f = fixture(true);
   await f.mount();
   assert.equal(f.calls.filter((c) => c.name === 'settings-health').length, 0);
@@ -192,7 +194,7 @@ test('closing configuration invalidates health without triggering any new checks
   assert.equal(f.calls.filter((c) => c.name === 'settings-health').length, 1);
 });
 
-test('refresh after a preference save keeps the details editor mounted by project', async () => {
+test('refresh after a preference save keeps the details editor mounted by space', async () => {
   const f = fixture();
   await f.mount();
   f.search('PR10');
@@ -215,18 +217,18 @@ test('refresh after a preference save keeps the details editor mounted by projec
   assert.equal(f.nodes('Settings')[0].props.key, settings.props.key);
 });
 
-test('Check selected includes matching rows across pagination but never unselected projects', async () => {
+test('Check selected includes matching rows across pagination but never unselected spaces', async () => {
   const f = fixture();
   await f.mount();
   f.search('PR1');
-  f.check('Select all matching projects', true);
+  f.check('Select all matching spaces', true);
   await f.click('Check selected');
   const checked = f.calls.filter((c) => c.name === 'settings-health').map((c) => c.p.projectId);
   assert.equal(checked.length, 12);
   assert.ok(checked.every((id) => id.startsWith('1')));
 });
 
-test('unchecked details checks only the opened project and reuses its result on reopening', async () => {
+test('unchecked details checks only the opened space and reuses its result on reopening', async () => {
   const f = fixture();
   await f.mount();
   f.search('PR10');
@@ -242,7 +244,7 @@ test('unchecked details checks only the opened project and reuses its result on 
   assert.equal(f.calls.filter((c) => c.name === 'settings-health').length, 1);
 });
 
-test('details remains available for an unconfigured project and a failed check can be retried', async () => {
+test('details remains available for an unconfigured space and a failed check can be retried', async () => {
   const f = fixture();
   await f.mount();
   f.search('PR3');
@@ -262,7 +264,7 @@ test('details remains available for an unconfigured project and a failed check c
   );
 });
 
-test('Configure checks only selected projects and cancelling preserves selection and cached health', async () => {
+test('Configure checks only selected spaces and cancelling preserves selection and cached health', async () => {
   const f = fixture();
   await f.mount();
   f.search('PR10');
@@ -297,10 +299,10 @@ test('historical cancellation stays quiet, fresh cancellation is dismissible and
   assert.equal(fresh.nodes('SectionMessage').length, 0);
   const pending = fixture(false, { ...record, data: { ...record.data, inspectProject: '1' } });
   await pending.mount();
-  assert.equal(pending.nodes('SectionMessage')[0].props.title, 'Project needs an outcome check');
+  assert.equal(pending.nodes('SectionMessage')[0].props.title, 'Space needs an outcome check');
 });
 
-test('Configure reuses completed health checks and reads only unchecked or failed projects', async () => {
+test('Configure reuses completed health checks and reads only unchecked or failed spaces', async () => {
   const f = fixture();
   await f.mount();
   for (const id of ['1', '2', '3', '4']) f.check(`Select PR${id}`, true);
@@ -327,7 +329,7 @@ test('Configure reuses completed health checks and reads only unchecked or faile
   );
 });
 
-test('status check shows a native spinner while pending and removes it on completion', async () => {
+test('status check shows a spinner while pending and removes it on completion', async () => {
   let release;
   const pending = new Promise((resolve) => {
     release = resolve;
@@ -355,7 +357,7 @@ test('a second Check selected click delivered before the host re-renders is igno
   assert.equal(f.calls.filter((c) => c.name === 'settings-health').length, 3);
 });
 
-test('another administrator’s batch stuck while cancelling stays reviewable for release', async () => {
+test('another administrator’s configuration stuck while cancelling stays reviewable for release', async () => {
   const stuck = {
     revision: 4,
     data: {
@@ -381,10 +383,10 @@ test('another administrator’s batch stuck while cancelling stays reviewable fo
 });
 
 test('permission denial survives a subsequent configuration-progress failure', async () => {
-  const denial = 'Missing Jira permission: ADMINISTER.';
+  const denial = 'This needs the Jira permission Administer Jira.';
   const f = fixture(Error(denial), Error(denial), 'ordinary-user');
   await f.mount();
-  assert.match(f.text(), /Missing Jira permission: ADMINISTER\./);
+  assert.match(f.text(), /This needs the Jira permission Administer Jira\./);
   assert.doesNotMatch(f.text(), /Saved configuration progress could not be checked/);
   assert.equal(
     f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
@@ -400,5 +402,35 @@ test('progress failure remains visible when inventory succeeds', async () => {
   assert.equal(
     f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
     true,
+  );
+});
+
+test('the space the page was opened from stays reachable when the inventory misses it', async () => {
+  const f = fixture(false, null, 'admin', undefined, { projectId: '500' });
+  await f.mount();
+  const rows = f.nodes('DynamicTable')[0].props.rows;
+  assert.equal(rows.length, 101);
+  assert.ok(rows.some((row) => row.key === '500'));
+  const listed = fixture(false, null, 'admin', undefined, { projectId: '5' });
+  await listed.mount();
+  assert.equal(listed.nodes('DynamicTable')[0].props.rows.length, 100);
+});
+
+test('a failed affected-space check stays with that space and never locks configuration', async () => {
+  const record = {
+    revision: 2,
+    data: { id: 'old', status: 'stopped', cancelRequested: true, inspectProject: '2' },
+  };
+  const f = fixture(false, record);
+  await f.mount();
+  await f.click('Check affected space');
+  // The failure is shown once, in that space's details, not as a page-level error.
+  assert.equal(f.text().match(/Access denied/g)?.length, 1);
+  assert.equal(f.nodes('Modal').length, 1);
+  assert.equal(f.nodes('Lozenge').filter((n) => n.props.children[0] === 'Check failed').length, 1);
+  f.check('Select PR5', true);
+  assert.equal(
+    f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
+    false,
   );
 });

@@ -1,4 +1,5 @@
 // Shared srcplugins file, synchronized across repositories.
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -259,6 +260,34 @@ export function handlerFindings(appDir) {
 export const nodeMajor = (directory) =>
   readFileSync(join(directory, '.nvmrc'), 'utf8').trim().split('.')[0];
 
+// Plugin repositories are public. Tracked files carry no agent instructions, no Atlassian site
+// host (example hosts are fine) and no Atlassian account ID; sites and accounts come from private
+// configuration. File names are reported, never the values.
+const agentFile =
+  /(?:^|\/)(?:CLAUDE\.md|AGENTS\.md|\.claude\/|\.codex\/|\.cursor\/|\.cursorrules$|\.github\/copilot-instructions\.md$)/;
+const siteHost = /\b([a-z0-9-]+)\.atlassian\.net\b/g;
+const accountId = /\b[0-9]{6}:[0-9a-f-]{36}\b|\b5[0-9a-f]{23}\b/;
+export function publicRepositoryFindingsIn(file, text) {
+  const findings = [];
+  if (agentFile.test(file)) findings.push(`${file}: agent instructions must not be committed`);
+  for (const [, name] of text.matchAll(siteHost))
+    if (!/example|owned/.test(name)) {
+      findings.push(`${file}: names an Atlassian site; use configuration instead`);
+      break;
+    }
+  if (accountId.test(text))
+    findings.push(`${file}: contains an Atlassian account ID; use configuration instead`);
+  return findings;
+}
+export function publicRepositoryFindings(appDir) {
+  const tracked = spawnSync('git', ['ls-files', '-z'], { cwd: appDir, encoding: 'utf8' });
+  if (tracked.status !== 0) return [];
+  return tracked.stdout
+    .split('\0')
+    .filter((file) => file && existsSync(join(appDir, file)))
+    .flatMap((file) => publicRepositoryFindingsIn(file, readFileSync(join(appDir, file), 'utf8')));
+}
+
 export function pluginFindings(appDir) {
   return [
     ...manifestFindings(readFileSync(join(appDir, 'manifest.yml'), 'utf8'), nodeMajor(appDir)).map(
@@ -269,6 +298,7 @@ export function pluginFindings(appDir) {
     ...themeFindings(appDir),
     ...handlerFindings(appDir),
     ...bundleHostFindings(appDir),
+    ...publicRepositoryFindings(appDir),
   ];
 }
 
@@ -278,6 +308,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (findings.length) process.exitCode = 1;
   else
     console.log(
-      'Manifest defaults and handlers, exact pins, README structure, theme rules and bundle hosts passed.',
+      'Manifest defaults and handlers, exact pins, README structure, theme rules, bundle hosts and public-repository rules passed.',
     );
 }

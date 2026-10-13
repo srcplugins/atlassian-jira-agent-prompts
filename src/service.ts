@@ -1,19 +1,22 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { sourceContent } from './prompt-text';
-export { sourceContent } from './prompt-text';
 import {
   snapshotContent,
-  recoverEmptyAttributes,
   observedManaged,
   matchesShape,
+  trackedBlock,
   DescriptionError,
   synchronizeDescription,
+  hash,
   type ManagedBlock,
 } from './description';
+export { hash };
 import { UserError, requireCompanyManagedSoftware } from './shared/jira.mjs';
 export { UserError };
 /** The request never got an HTTP response from Jira. */
 export class JiraUnavailable extends UserError {}
+/** Forge app storage failed to answer a read. Like JiraUnavailable, an outage, not a defect. */
+export class StorageUnavailable extends UserError {}
 /** Jira documented that it did not apply this write (see isDefinitiveRejection). */
 export class JiraRejected extends UserError {
   readonly status: number;
@@ -22,16 +25,6 @@ export class JiraRejected extends UserError {
     this.status = status;
   }
 }
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object')
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`)
-      .join(',')}}`;
-  return JSON.stringify(value);
-}
-export const hash = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex');
 export function numeric(value: unknown): string {
   if (typeof value !== 'string' || !/^[1-9]\d{0,19}$/.test(value))
     throw new UserError('Invalid Jira identifier.');
@@ -60,25 +53,34 @@ export interface Issue {
     [key: string]: unknown;
   };
 }
-export interface State {
+interface State {
   ids: string[];
   managed: ManagedBlock | null;
-  pending?: {
-    before: string;
-    after: string;
-    ids: string[];
-    managed: ManagedBlock | null;
-    attemptId?: string;
-    phase?: 'prepared' | 'submitted';
-    started?: number;
-    observed?: number;
-    /** Exact field value sent, and the requested block's skeleton (null when removed). */
-    keys?: string[];
-    shape?: string | null;
-    /** 'field': only the Agent Prompts field was written; hashes cover the field alone. */
-    scope?: 'field';
-  };
+  pending?: Receipt & { attemptId: string; phase: 'prepared' | 'submitted'; started: number };
 }
+/** What a save is about to write, recorded before it is sent so recovery can compare. */
+type Receipt = {
+  before: string;
+  after: string;
+  ids: string[];
+  managed: ManagedBlock | null;
+} & (
+  | {
+      /** Only the Agent Prompts field was written; hashes cover the field alone. */
+      scope: 'field';
+    }
+  | {
+      scope?: undefined;
+      /** Exact field value sent, and the requested block's skeleton (null when removed). */
+      keys: string[];
+      shape: string | null;
+      /** The field and the tracked block before the save, and the requested block (see
+       * `untouched`). */
+      beforeField: string;
+      beforeBlock: string;
+      afterBlock: string;
+    }
+);
 export interface Stored {
   revision: number;
   data: State;
@@ -89,31 +91,31 @@ export interface PromptPage {
   nextCursor?: string;
   searchError?: string;
 }
-export interface PromptQuery {
+interface PromptQuery {
   query?: string;
   cursor?: string;
   limit: 10 | 20;
 }
-export function promptQuery(
-  input: { query?: unknown; cursor?: unknown; surface?: unknown } = {},
+function promptQuery(
+  input: { query?: unknown; cursor?: unknown } = {},
+  limit: PromptQuery['limit'],
 ): PromptQuery {
   if (
     (input.query !== undefined && (typeof input.query !== 'string' || input.query.length > 200)) ||
     (input.cursor !== undefined &&
-      (typeof input.cursor !== 'string' || !input.cursor || input.cursor.length > 8192)) ||
-    (input.surface !== undefined && !['picker', 'library'].includes(String(input.surface)))
+      (typeof input.cursor !== 'string' || !input.cursor || input.cursor.length > 8192))
   )
     throw new UserError('Invalid prompt search. Use up to 200 characters.');
   const query = (input.query as string | undefined)?.trim() ?? '';
   return {
     query,
     ...(input.cursor ? { cursor: input.cursor as string } : {}),
-    limit: input.surface === 'picker' ? 10 : 20,
+    limit,
   };
 }
 export interface Ports {
-  refreshAfterSave?(project: string): Promise<boolean>;
-  retainedTypes?(project: string): Promise<string[]>;
+  refreshAfterSave(project: string): Promise<boolean>;
+  retainedTypes(project: string): Promise<string[]>;
   config(project: string): Promise<string | undefined>;
   project(id: string): Promise<{
     id: string;
@@ -122,7 +124,7 @@ export interface Ports {
     style: string;
     issueTypes: { id: string; name: string; subtask: boolean }[];
   }>;
-  allowed(project: string, permission: string, issue?: string): Promise<void>;
+  allowed(project: string, permission: 'ADMINISTER' | 'EDIT_ISSUES', issue?: string): Promise<void>;
   search(project: string, type: string, input?: PromptQuery): Promise<PromptPage>;
   issue(id: string, field?: string): Promise<Issue>;
   field(): Promise<string>;
@@ -136,8 +138,8 @@ const contentHash = (issue: Issue, field: string) =>
   hash([issue.fields.description, issue.fields[field] ?? []]);
 const fieldHash = (issue: Issue, field: string) => hash(['field', issue.fields[field] ?? []]);
 type Pending = NonNullable<State['pending']>;
-/** The hash a pending receipt's before/after values were computed with. */
-const receiptHash = (issue: Issue, field: string, pending: Pending) =>
+/** The hash a receipt's before/after values were computed with. */
+const receiptHash = (issue: Issue, field: string, pending: Receipt) =>
   pending.scope === 'field' ? fieldHash(issue, field) : contentHash(issue, field);
 const recoveryDelay = 120_000;
 function withoutPending(data: State): State {
@@ -149,16 +151,40 @@ function adoptable(issue: Issue, field: string, pending: Pending) {
   if (
     pending.scope === 'field' ||
     pending.phase === 'prepared' ||
-    !pending.keys ||
-    pending.shape === undefined ||
     contentHash(issue, field) === pending.before
   )
     return false;
   if (hash(issue.fields[field] ?? []) !== hash(pending.keys)) return false;
-  const localId =
-    pending.managed && !('mode' in pending.managed) ? pending.managed.localId : `npl-${issue.id}`;
+  const localId = pending.managed?.localId ?? `npl-${issue.id}`;
   try {
+    // The block is still exactly the pre-save one: the save never landed (a Sync that changed
+    // only attributes, such as a link, has the same skeleton), so it is released, not accepted.
+    if (
+      pending.afterBlock !== pending.beforeBlock &&
+      trackedBlock(issue.fields.description, `npl-${issue.id}`) === pending.beforeBlock
+    )
+      return false;
     return matchesShape(issue.fields.description, localId, pending.shape);
+  } catch {
+    return false;
+  }
+}
+/** Jira provably never applied this save: the whole work item is as it was, or the field and the
+ * tracked block are both still pre-save while the save would have changed at least one of them.
+ * Other description edits made since then don't matter. */
+function untouched(issue: Issue, field: string, pending: Receipt) {
+  if (receiptHash(issue, field, pending) === pending.before) return true;
+  if (
+    pending.scope === 'field' ||
+    (pending.beforeField === hash(['field', pending.keys]) &&
+      pending.beforeBlock === pending.afterBlock)
+  )
+    return false;
+  try {
+    return (
+      fieldHash(issue, field) === pending.beforeField &&
+      trackedBlock(issue.fields.description, `npl-${issue.id}`) === pending.beforeBlock
+    );
   } catch {
     return false;
   }
@@ -185,18 +211,18 @@ export function createService(p: Ports) {
     const type = await p.config(c.projectId);
     if (!type)
       throw new UserError(
-        'Open Agent Prompts for Jira → Project configuration to choose a ticket type first.',
+        'This space is not set up for Agent Prompts. Ask a Jira administrator to set it up in Space settings.',
       );
     return numeric(type);
   }
   async function target(c: Context, field: string) {
-    if (!c.issueId) throw new UserError('Open Agent Prompts on an existing ticket.');
+    if (!c.issueId) throw new UserError('Open Agent Prompts on an existing work item.');
     const issue = await p.issue(numeric(c.issueId), field);
     if (issue.id !== c.issueId || issue.fields.project.id !== c.projectId)
-      throw new UserError('Ticket context changed. Reopen the field.');
+      throw new UserError('Work item context changed. Reopen the field.');
     return issue;
   }
-  async function state(c: Context, issue: Issue, field: string, allowPending = false) {
+  async function state(issue: Issue, field: string, allowPending = false) {
     let stored = (await p.get(issue.id)) ?? { revision: 0, data: { ids: [], managed: null } };
     if (stored.data.pending?.phase === 'prepared') {
       // A sender must win another CAS before issuing its PUT. Cancelling a
@@ -207,14 +233,7 @@ export function createService(p: Ports) {
     }
     if (stored.data.pending) {
       const pending = stored.data.pending;
-      const reconstructed =
-        pending.scope === 'field'
-          ? undefined
-          : recoverEmptyAttributes(issue.fields.description, pending.managed);
-      if (
-        receiptHash(issue, field, pending) !== pending.after &&
-        (!reconstructed || hash([reconstructed, issue.fields[field] ?? []]) !== pending.after)
-      ) {
+      if (receiptHash(issue, field, pending) !== pending.after) {
         if (allowPending) return stored;
         throw new UserError(
           'The previous save could not be verified. Check saved state; a Jira administrator can investigate an unchanged outcome.',
@@ -230,20 +249,11 @@ export function createService(p: Ports) {
         data: { ids: pending.ids, managed },
       };
     }
-    // Older confirmed snapshots can also contain a fingerprint of empty attrs.
-    const reconstructed = recoverEmptyAttributes(issue.fields.description, stored.data.managed);
-    if (reconstructed) {
-      const managed = observedManaged(issue.fields.description, stored.data.managed);
-      if (hash(managed) !== hash(stored.data.managed)) {
-        await p.cas(issue.id, stored.revision, { ...stored.data, managed });
-        stored = { revision: stored.revision + 1, data: { ...stored.data, managed } };
-      }
-    }
     return stored;
   }
   /** Shared guards for administrator recovery of an unresolved save: Administer Jira and Edit
-   * Issues, explicit acknowledgement, the exact revision and ticket the administrator inspected,
-   * a submitted (or legacy) record, and two minutes since the save started or was first seen. */
+   * work items, explicit acknowledgement, the exact revision and work item the administrator
+   * inspected, a submitted record, and two minutes since the save started. */
   async function recoveryTarget(c: Context, input: RecoveryInput, action: string) {
     if (
       !Number.isSafeInteger(input.revision) ||
@@ -266,8 +276,7 @@ export function createService(p: Ports) {
       targetHash(issue, field) !== input.fingerprint
     )
       throw new UserError('Saved state changed. Check saved state again.');
-    const started = pending.started ?? pending.observed;
-    if (started === undefined || !Number.isFinite(started) || Date.now() - started < recoveryDelay)
+    if (Date.now() - pending.started < recoveryDelay)
       throw new UserError(`Wait two minutes and check saved state before ${action} this save.`);
     return { issue, field, stored, pending };
   }
@@ -282,8 +291,8 @@ export function createService(p: Ports) {
     async saveStatus(c: Context): Promise<SaveStatus> {
       const field = await p.field();
       const issue = await target(c, field);
-      let stored = await state(c, issue, field, true);
-      let pending = stored.data.pending;
+      const stored = await state(issue, field, true);
+      const pending = stored.data.pending;
       if (!pending) return { pending: false };
       let administrator = false;
       try {
@@ -293,30 +302,23 @@ export function createService(p: Ports) {
       } catch {
         // Failure to establish administrator/edit rights never enables recovery.
       }
-      if (administrator && pending.started === undefined && pending.observed === undefined) {
-        // Legacy receipts have no clock. Start an observation window rather than
-        // treating missing metadata as proof the original invocation has ended.
-        pending = { ...pending, observed: Date.now() };
-        await p.cas(issue.id, stored.revision, { ...stored.data, pending });
-        stored = { revision: stored.revision + 1, data: { ...stored.data, pending } };
-      }
-      const started = pending.started ?? pending.observed ?? Date.now();
       return {
         pending: true,
         revision: stored.revision,
         fingerprint: targetHash(issue, field),
-        unchanged: receiptHash(issue, field, pending) === pending.before,
+        unchanged: untouched(issue, field, pending),
         adoptable: adoptable(issue, field, pending),
-        ...(pending.keys ? { keys: pending.keys } : {}),
+        // The pending keys are for the administrator who inspects the save, not for every viewer.
+        ...(administrator && pending.scope !== 'field' ? { keys: pending.keys } : {}),
         administrator,
-        waitSeconds: Math.max(0, Math.ceil((started + recoveryDelay - Date.now()) / 1000)),
+        waitSeconds: Math.max(0, Math.ceil((pending.started + recoveryDelay - Date.now()) / 1000)),
       };
     },
     async resolveSave(c: Context, input: RecoveryInput) {
       const { issue, field, stored, pending } = await recoveryTarget(c, input, 'releasing');
-      if (receiptHash(issue, field, pending) !== pending.before)
+      if (!untouched(issue, field, pending))
         throw new UserError(
-          'The ticket differs from the pre-save state. Investigate in Jira; no recovery record was released.',
+          'The work item differs from the pre-save state. Investigate in Jira; no recovery record was released.',
         );
       await p.cas(issue.id, stored.revision, withoutPending(stored.data));
       return { resolved: true };
@@ -325,12 +327,13 @@ export function createService(p: Ports) {
       const { issue, field, stored, pending } = await recoveryTarget(c, input, 'accepting');
       if (!adoptable(issue, field, pending))
         throw new UserError(
-          'The ticket no longer matches the requested save. Investigate in Jira; nothing was accepted.',
+          'The work item no longer matches the requested save. Investigate in Jira; nothing was accepted.',
         );
       // Adopt Jira's representation of the requested block; never write Jira here.
-      const managed = pending.shape
-        ? observedManaged(issue.fields.description, pending.managed)
-        : null;
+      const managed =
+        pending.scope !== 'field' && pending.shape
+          ? observedManaged(issue.fields.description, pending.managed)
+          : null;
       await p.cas(issue.id, stored.revision, { ids: pending.ids, managed });
       return { accepted: true };
     },
@@ -339,15 +342,20 @@ export function createService(p: Ports) {
       requireCompanyManagedSoftware(project, c.projectId);
       return { project, type: await p.config(c.projectId) };
     },
-    async library(c: Context, input: Parameters<typeof promptQuery>[0] = {}) {
-      const query = promptQuery(input);
+    /** Ten results per picker page; Rovo's assistant asks for twenty. */
+    async search(
+      c: Context,
+      input: Parameters<typeof promptQuery>[0] = {},
+      limit: PromptQuery['limit'] = 10,
+    ) {
+      const query = promptQuery(input, limit);
       return p.search(c.projectId, await scope(c), query);
     },
     async read(c: Context, id: string) {
       const type = await scope(c);
       const issue = await p.issue(id);
       if (issue.fields.project.id !== c.projectId || issue.fields.issuetype.id !== type)
-        throw new UserError('This issue is not a prompt in the selected project.');
+        throw new UserError('This work item is not a prompt in the selected space.');
       return {
         id: issue.id,
         key: issue.key,
@@ -363,11 +371,11 @@ export function createService(p: Ports) {
       const type = await scope(c);
       const field = await p.field();
       const issue = await target(c, field);
-      const stored = await state(c, issue, field);
+      const stored = await state(issue, field);
       const cleanupOnly = issue.fields.issuetype.id === type;
       if (cleanupOnly && !stored.data.ids.length)
         throw new UserError(
-          'Prompt tickets cannot add other prompts; existing links can only be removed.',
+          'A prompt cannot use other prompts. It can only remove prompts it already has.',
         );
       let retainedUnavailable = false;
       let refreshUnavailable = false;
@@ -380,11 +388,11 @@ export function createService(p: Ports) {
               searchError:
                 'Could not load prompt suggestions. Your saved selections are still available. Retry search to find prompts.',
             })),
-        (p.retainedTypes?.(c.projectId) ?? Promise.resolve<string[]>([])).catch((): string[] => {
+        p.retainedTypes(c.projectId).catch((): string[] => {
           retainedUnavailable = true;
           return [];
         }),
-        (p.refreshAfterSave?.(c.projectId) ?? Promise.resolve(false)).catch(() => {
+        p.refreshAfterSave(c.projectId).catch(() => {
           refreshUnavailable = true;
           return false;
         }),
@@ -416,7 +424,7 @@ export function createService(p: Ports) {
           ? 'Previous prompt types could not be checked. Saved selections can still be removed.'
           : '',
         refreshUnavailable
-          ? 'The ticket reload preference could not be checked. Reload the ticket manually after saving.'
+          ? 'The work item reload preference could not be checked. Reload the work item manually after saving.'
           : '',
       ]
         .filter(Boolean)
@@ -445,15 +453,17 @@ export function createService(p: Ports) {
       const field = await p.field();
       const issue = await target(c, field);
       await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
-      if (input.ids.includes(issue.id)) throw new UserError('Prompts cannot link other prompts.');
-      const stored = await state(c, issue, field);
+      if (input.ids.includes(issue.id)) throw new UserError('A prompt cannot use itself.');
+      const stored = await state(issue, field);
       if (
         issue.fields.issuetype.id === type &&
         (!stored.data.ids.length || input.ids.some((id) => !stored.data.ids.includes(id)))
       )
-        throw new UserError('Prompt tickets can only remove their existing prompt links.');
+        throw new UserError(
+          'A prompt cannot use other prompts. It can only remove prompts it already has.',
+        );
       if (stored.revision !== input.revision || targetHash(issue, field) !== input.fingerprint)
-        throw new UserError('The ticket changed. Review your selection and save again.');
+        throw new UserError('The work item changed. Review your selection and save again.');
       const sources = await Promise.all(input.ids.map((id) => p.issue(id)));
       const needsRetainedType = sources.some(
         (source) =>
@@ -461,7 +471,7 @@ export function createService(p: Ports) {
           source.fields.issuetype.id !== type &&
           stored.data.ids.includes(source.id),
       );
-      const retained = needsRetainedType ? ((await p.retainedTypes?.(c.projectId)) ?? []) : [];
+      const retained = needsRetainedType ? await p.retainedTypes(c.projectId) : [];
       const prompts = sources.map((source) => {
         if (
           source.fields.project.id !== c.projectId ||
@@ -494,13 +504,13 @@ export function createService(p: Ports) {
       const keys = sources.map((s) => s.key);
       const fresh = await target(c, field);
       if (targetHash(fresh, field) !== input.fingerprint)
-        throw new UserError('The ticket changed. Review your selection and save again.');
+        throw new UserError('The work item changed. Review your selection and save again.');
       // A block the user already deleted is forgotten by clearing only the field: the
       // Description is never rewritten on that path.
       const fields = next.forgotten
         ? { [field]: keys }
         : { description: next.description, [field]: keys };
-      const pending: Pending = next.forgotten
+      const pending: Receipt = next.forgotten
         ? {
             before: fieldHash(issue, field),
             after: hash(['field', keys]),
@@ -515,6 +525,9 @@ export function createService(p: Ports) {
             managed: next.managed,
             keys,
             shape: next.shape,
+            beforeField: fieldHash(issue, field),
+            beforeBlock: trackedBlock(issue.fields.description, `npl-${issue.id}`),
+            afterBlock: trackedBlock(next.description, `npl-${issue.id}`),
           };
       // An unchanged write cannot be distinguished from an in-flight write by
       // recovery. Never publish such a claim or send a redundant Jira update.
@@ -566,11 +579,12 @@ export function createService(p: Ports) {
       if (receiptHash(observed, field, pending) !== pending.after) {
         // Jira confirmed the write (2xx) but returned another representation. While this
         // invocation still holds the claim, adopt it if the field and block skeleton match.
-        if (!adoptable(observed, field, { ...pending, phase: 'submitted' }))
-          throw new UserError('The saved ticket did not match the requested change.');
-        managed = pending.shape
-          ? observedManaged(observed.fields.description, pending.managed)
-          : null;
+        if (!adoptable(observed, field, { ...prepared, phase: 'submitted' }))
+          throw new UserError('The saved work item did not match the requested change.');
+        managed =
+          pending.scope !== 'field' && pending.shape
+            ? observedManaged(observed.fields.description, pending.managed)
+            : null;
       }
       await p.cas(issue.id, stored.revision + 2, { ids: input.ids, managed });
       return {

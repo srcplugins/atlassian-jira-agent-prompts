@@ -7,13 +7,14 @@ import {
   type SettingsPorts,
 } from './settings';
 import { hash, numeric, UserError, type Ports } from './service';
+import { finished } from './batch-status';
 
-export interface WizardProject {
+export interface InventoryProject {
   id: string;
   key: string;
   name: string;
 }
-export interface WizardData {
+export interface BatchData {
   id: string;
   actor: string;
   input: SettingsInput;
@@ -32,19 +33,19 @@ export interface WizardData {
   cancelRequested?: boolean;
   inspectProject?: string;
 }
-export interface WizardRecord {
+export interface BatchRecord {
   revision: number;
-  data: WizardData;
+  data: BatchData;
 }
-export interface WizardPorts {
+export interface BatchPorts {
   admin(): Promise<void>;
-  projects(): Promise<{ projects: WizardProject[]; incomplete: boolean }>;
-  get(): Promise<WizardRecord | undefined>;
-  cas(revision: number, data: WizardData): Promise<void>;
+  projects(): Promise<{ projects: InventoryProject[]; incomplete: boolean }>;
+  get(): Promise<BatchRecord | undefined>;
+  cas(revision: number, data: BatchData): Promise<void>;
 }
-function wizardInput(input: SettingsInput): SettingsInput {
+function batchInput(input: SettingsInput): SettingsInput {
   if (input.unlink !== undefined && typeof input.unlink !== 'boolean')
-    throw new UserError('Invalid unlink option.');
+    throw new UserError('Invalid setup removal option.');
   if (input.refreshAfterSave !== undefined && typeof input.refreshAfterSave !== 'boolean')
     throw new UserError('Invalid display preference.');
   if (input.unlink) {
@@ -54,7 +55,7 @@ function wizardInput(input: SettingsInput): SettingsInput {
       input.refreshAfterSave !== undefined ||
       input.allowShared
     )
-      throw new UserError('Unlink cannot include configuration changes.');
+      throw new UserError('Removing setup cannot include configuration changes.');
     return { unlink: true };
   }
   const preference =
@@ -65,12 +66,12 @@ function wizardInput(input: SettingsInput): SettingsInput {
   if (input.type !== undefined) return { type: numeric(input.type), ...shared, ...preference };
   const name = input.name!.trim();
   if (!name || name.length > 60 || Array.from(name).some((char) => char.charCodeAt(0) < 32))
-    throw new UserError('Choose a ticket type name of 1–60 characters.');
+    throw new UserError('Choose a work type name of 1–60 characters.');
   return { name, ...shared, ...preference };
 }
-export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
+export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPorts) {
   const settings = createSettings(p, s);
-  const active = (r?: WizardRecord) => r && !['complete', 'stopped'].includes(r.data.status);
+  const active = (r?: BatchRecord) => !!r && !finished(r.data.status);
   async function current(id: string, revision: number) {
     await w.admin();
     const value = await w.get();
@@ -84,12 +85,12 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
     async catalog() {
       await w.admin();
       // Neither diagnostic inventory is required to observe a saved run or
-      // unlink an explicitly selected project. Keep their failures separate.
+      // remove setup from an explicitly selected space. Keep their failures separate.
       const [projects, types] = await Promise.allSettled([w.projects(), s.types()]);
       return {
         ...(projects.status === 'fulfilled'
           ? projects.value
-          : { projects: [] as WizardProject[], incomplete: true }),
+          : { projects: [] as InventoryProject[], incomplete: true }),
         inventoryAvailable: projects.status === 'fulfilled',
         typesAvailable: types.status === 'fulfilled',
         types:
@@ -102,12 +103,16 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
       await w.admin();
       return (await w.get()) ?? null;
     },
-    async cancelInterrupted(actor: string) {
+    /** `only`: a polling view names the batch it is waiting for, so a later batch is never
+     * cancelled by an older view's timer. */
+    async cancelInterrupted(actor: string, only?: string) {
       await w.admin();
       let r = await w.get();
+      if (only !== undefined && r?.data.id !== only)
+        return r ? { ...r, cancelledNow: false } : null;
       const id = r?.data.id;
       const cancelling = !!active(r) && r?.data.actor === actor;
-      const response = (value?: WizardRecord) =>
+      const response = (value?: BatchRecord) =>
         value
           ? {
               ...value,
@@ -117,19 +122,19 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
           : null;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (!r || r.data.id !== id || !active(r) || r.data.actor !== actor) return response(r);
-        // Keep the lock while the current resolver can still be completing its project.
+        // Keep the lock while the current resolver can still be completing its space.
         const waiting = r.data.status === 'running' && Date.now() - r.data.started < 120_000;
         if (waiting && r.data.cancelRequested) return response(r);
         const uncertain = ['running', 'attention'].includes(r.data.status);
         const project = uncertain ? r.data.entries[r.data.index]?.projectId : undefined;
-        const data: WizardData = {
+        const data: BatchData = {
           ...r.data,
           cancelRequested: true,
           status: waiting ? 'running' : 'stopped',
           ...(project ? { inspectProject: project } : {}),
           message: waiting
-            ? 'Cancelling the previous configuration. Waiting for the current project to finish.'
-            : 'Interrupted configuration cancelled. Completed changes were kept. You can configure projects again.',
+            ? 'Cancelling the previous configuration. Waiting for the current space to finish.'
+            : 'Interrupted configuration cancelled. Completed changes were kept. You can configure spaces again.',
         };
         try {
           await w.cas(r.revision, data);
@@ -147,7 +152,7 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
       await w.admin();
       return settings.preview(
         { accountId: actor, projectId: numeric(projectId) },
-        wizardInput(input),
+        batchInput(input),
       );
     },
     async start(
@@ -160,7 +165,7 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
       const old = await w.get();
       if (active(old))
         throw new UserError(
-          'An earlier configuration is unfinished. Check saved progress or resolve it in Project configuration.',
+          'An earlier configuration is unfinished. Check saved progress or resolve it in Space configuration.',
         );
       if ((old?.revision ?? 0) !== revision)
         throw new UserError('Configuration progress changed. Reopen the configuration dialog.');
@@ -173,11 +178,11 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
           (e) => !e || typeof e.fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(e.fingerprint),
         )
       )
-        throw new UserError('Review one to 200 distinct projects before confirming.');
-      const data: WizardData = {
+        throw new UserError('Review one to 200 distinct spaces before confirming.');
+      const data: BatchData = {
         id: randomUUID(),
         actor,
-        input: wizardInput(input),
+        input: batchInput(input),
         entries: entries.map((e) => ({
           projectId: numeric(e.projectId),
           fingerprint: e.fingerprint,
@@ -207,9 +212,9 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
           'Saved configuration progress is incomplete. Inspect it before continuing.',
         );
       const c = { accountId: actor, projectId: entry.projectId };
-      // For later projects, compare the newly created type against the original
+      // For later spaces, compare the newly created type against the original
       // name-based review. Only the known type identity changes; impact and scheme
-      // facts must still match. No new projects are discovered during execution.
+      // facts must still match. No new spaces are discovered during execution.
       const input = d.type
         ? {
             type: d.type,
@@ -231,7 +236,7 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
         if (effect && (effect.fingerprint !== hash(fresh.scheme) || fresh.attach))
           throw new UserError('The updated shared scheme changed.');
         // Only an association committed by this run can explain an attach:true → false change.
-        // Keep every other reviewed fact (including all affected projects) unchanged.
+        // Keep every other reviewed fact (including all affected spaces) unchanged.
         // The created type's identity is pinned by d.type; its Jira name may be normalized.
         let reviewed =
           d.input.name && d.type
@@ -240,29 +245,29 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
         if (hash([actor, reviewed]) !== entry.fingerprint && effect)
           reviewed = { ...reviewed, attach: true };
         if (hash([actor, reviewed]) !== entry.fingerprint)
-          throw new UserError('This project changed after review.');
+          throw new UserError('This space changed after review.');
         if (fresh.attach && fresh.scheme.projectIds.length > 1 && !d.input.allowShared)
-          throw new UserError('Confirm the shared scheme’s affected projects before applying.');
+          throw new UserError('Confirm the shared scheme’s affected spaces before applying.');
       } catch (error) {
         if (!(error instanceof UserError) || transient(error)) throw error;
-        const stopped: WizardData = {
+        const stopped: BatchData = {
           ...d,
           entries: d.entries.map((e, i) => (i === d.index ? { ...e, message: error.message } : e)),
           status: 'stopped',
-          message: `Nothing was changed for this project: ${error.message} Completed projects remain configured. Review the remaining projects again.`,
+          message: `Nothing was changed for this space: ${error.message} Completed spaces remain configured. Review the remaining spaces again.`,
         };
         await w.cas(revision, stopped);
         return { revision: revision + 1, data: stopped };
       }
-      const running: WizardData = { ...d, status: 'running', started: Date.now() };
-      const attention: WizardData = {
+      const running: BatchData = { ...d, status: 'running', started: Date.now() };
+      const attention: BatchData = {
         ...running,
         status: 'attention',
         message:
-          'This project may be partially configured. Use Project configuration to inspect its saved mapping and Jira state. No write was retried.',
+          'This space may be partially configured. Use Space configuration to inspect its saved setup and Jira state. No write was retried.',
       };
       await w.cas(revision, running);
-      async function finish(data: WizardData) {
+      async function finish(data: BatchData) {
         const latest = await w.get();
         if (
           !latest ||
@@ -272,10 +277,8 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
           (latest.revision !== revision + 1 &&
             !(latest.revision === revision + 2 && latest.data.cancelRequested))
         )
-          throw new UserError(
-            'Configuration progress changed. No further projects were configured.',
-          );
-        const next: WizardData = latest.data.cancelRequested
+          throw new UserError('Configuration progress changed. No further spaces were configured.');
+        const next: BatchData = latest.data.cancelRequested
           ? {
               ...data,
               cancelRequested: true,
@@ -284,7 +287,7 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
               message:
                 data.status === 'stopped' && data.message
                   ? data.message
-                  : 'Interrupted configuration cancelled. Completed changes were kept. You can configure projects again.',
+                  : 'Interrupted configuration cancelled. Completed changes were kept. You can configure spaces again.',
             }
           : data;
         await w.cas(latest.revision, next);
@@ -294,7 +297,7 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
         await settings.apply(c, { ...input, fingerprint: fresh.fingerprint });
       } catch (error) {
         if (error instanceof NotApplied) {
-          // Jira and the project's configuration are unchanged, so no outcome check is needed.
+          // Jira and the space's configuration are unchanged, so no outcome check is needed.
           const entries = d.entries.map((e, i) =>
             i === d.index ? { ...e, message: error.message } : e,
           );
@@ -311,7 +314,7 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
                   ...running,
                   entries,
                   status: 'stopped',
-                  message: `${error.message} Completed projects remain configured. Review the remaining projects again.`,
+                  message: `${error.message} Completed spaces remain configured. Review the remaining spaces again.`,
                 },
           );
         }
@@ -324,13 +327,17 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
           result.data.pending ||
           (d.input.unlink ? !!result.data.type : !result.data.type)
         )
-          throw new UserError('Project configuration requires an outcome check.');
+          throw new UserError('Space configuration requires an outcome check.');
         const entries = d.entries.map((e, i) =>
           i === d.index
-            ? { ...e, status: 'done' as const, message: d.input.unlink ? 'Unlinked' : 'Configured' }
+            ? {
+                ...e,
+                status: 'done' as const,
+                message: d.input.unlink ? 'Setup removed' : 'Configured',
+              }
             : e,
         );
-        const next: WizardData = {
+        const next: BatchData = {
           ...d,
           entries,
           ...(result.data.type ? { type: result.data.type } : {}),
@@ -354,24 +361,26 @@ export function createWizard(p: Ports, s: SettingsPorts, w: WizardPorts) {
       // Releasing another administrator's batch always needs an explicit acknowledgement;
       // an in-flight or uncertain step also needs the two-minute wait.
       if (r.data.actor !== actor && !acknowledged)
-        throw new UserError('Acknowledge that this batch is abandoned before releasing it.');
+        throw new UserError(
+          'Acknowledge that this configuration is abandoned before releasing it.',
+        );
       if (
         ['running', 'attention'].includes(r.data.status) &&
         (!acknowledged || Date.now() - r.data.started < 120_000)
       )
         throw new UserError(
-          'Wait two minutes, inspect the affected project in Project configuration, and acknowledge its outcome before releasing this batch.',
+          'Wait two minutes, inspect the affected space in Space configuration, and acknowledge its outcome before releasing this configuration.',
         );
       const inspectProject = ['running', 'attention'].includes(r.data.status)
         ? r.data.entries[r.data.index]?.projectId
         : undefined;
-      const data: WizardData = {
+      const data: BatchData = {
         ...r.data,
         status: 'stopped',
         cancelRequested: true,
         ...(inspectProject ? { inspectProject } : {}),
         message:
-          'Batch released. Completed projects remain configured. Review unfinished projects in a new configuration; reuse any type already created.',
+          'Configuration released. Completed spaces remain configured. Review unfinished spaces in a new configuration; reuse any type already created.',
       };
       await w.cas(revision, data);
       return { revision: revision + 1, data };

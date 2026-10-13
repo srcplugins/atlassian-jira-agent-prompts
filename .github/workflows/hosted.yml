@@ -9,7 +9,8 @@ name: Hosted
 
 on:
   push:
-    branches-ignore: [main]
+    # Dependabot branches get no environment secrets, so the suite could not run there.
+    branches-ignore: [main, 'dependabot/**']
   workflow_dispatch:
     inputs:
       suite:
@@ -19,8 +20,9 @@ on:
         default: full
       cleanup:
         description: >-
-          Instead of the suite, after inspecting a failed run: one guarded cleanup, for example
-          "node tests/hosted/verify-setup.mjs cleanup <run-uuid>" or "npx forge-test cleanup native-prompt-links <run-uuid>"
+          Instead of the suite, after inspecting a failed run: one guarded cleanup as "<target> <run-uuid>".
+          The target is a runner listed in tests/hosted/cleanup.json or a fixture app for
+          "npx forge-test cleanup", for example "native-prompt-links <run-uuid>"
         required: false
         default: ''
   # Publish runs the release suite on its tagged build.
@@ -40,6 +42,11 @@ permissions:
   contents: read
   actions: read
 
+# An explicit bash adds pipefail: a failed command inside a pipe fails its step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   hosted:
     name: Hosted suite
@@ -55,9 +62,6 @@ jobs:
       SUITE: ${{ inputs.suite || 'full' }}
       CLEANUP: ${{ inputs.cleanup }}
       DEPLOY_TAG: ${{ inputs.deploy_tag }}
-      FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
-      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -75,9 +79,13 @@ jobs:
         run: |
           node config/prepare-forge-cli.mjs
           npm ci --no-audit --no-fund
+          sudo apt-get update > /dev/null
           sudo apt-get install -y --no-install-recommends age > /dev/null
+      # Site configuration and credentials are scoped to the steps that use them, never to
+      # the install step.
       - name: Restore sessions and mask private values
         env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
           JIRA_SESSION_ADMIN: ${{ secrets.JIRA_SESSION_ADMIN }}
           JIRA_SESSION_ADMIN2: ${{ secrets.JIRA_SESSION_ADMIN2 }}
           JIRA_SESSION_MEMBER: ${{ secrets.JIRA_SESSION_MEMBER }}
@@ -94,33 +102,69 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
+          OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
         run: |
-          # The API doesn't list newest first; runs are serial, so the newest state is current.
-          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-state&per_page=100" \
-            --jq '[.artifacts[] | select(.expired | not)] | max_by(.created_at) | .id // empty')
+          # Fail before the suite if this run's journals could not be encrypted afterwards.
+          [ -n "$OWNER" ] || { echo "::error::OWNER_AGE_RECIPIENT is not set"; exit 1; }
+          printf x | age -r "$OWNER" > /dev/null || { echo "::error::OWNER_AGE_RECIPIENT is not an age recipient"; exit 1; }
+          # The API doesn't list newest first and pages at 100; runs are serial, so the newest
+          # unexpired state is current.
+          # gh refuses --slurp with its own --jq, so the merged pages go through jq.
+          id=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-state&per_page=100" |
+            jq -r '[.[].artifacts[] | select(.expired | not)] | max_by(.created_at) | .id // empty')
           if [ -z "$id" ]; then echo "::warning::No earlier run journals; starting without them."; exit 0; fi
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/state.zip"
           unzip -o -q "$RUNNER_TEMP/state.zip" -d "$RUNNER_TEMP/state"
           age -d -i <(printf '%s' "$CI_AGE_KEY") "$RUNNER_TEMP/state/journals.tar.age" | tar -xz -C .local
           echo "Restored run journals from artifact $id."
       - name: Forge CLI settings
+        # The guarded wrapper requires credentials for every Forge command.
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
         run: node config/forge.mjs settings set usage-analytics false
       - name: Deploy the published build to development
         if: env.DEPLOY_TAG != ''
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
         run: node config/forge.mjs deploy --tag "$DEPLOY_TAG" -e development --non-interactive
       - name: Hosted suite
         if: env.CLEANUP == ''
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
         run: npx forge-test suite "$SUITE"
       - name: Guarded cleanup of a failed run
         if: env.CLEANUP != ''
         env:
-          NATIVE_SETUP_TESTS: '1'
-          NATIVE_ACCESS_TESTS: '1'
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        # A plugin lists its own runners' cleanup in tests/hosted/cleanup.json:
+        # { "<target>": { "command": ["node", "<runner>", "cleanup"], "env": { "NAME": "value" } } }.
+        # The run UUID is appended to the command. Any other target is a fixture app.
         run: |
-          pattern='^(npx forge-test cleanup [a-z][a-z0-9-]*|node tests/hosted/verify-(setup|access)\.mjs cleanup) [0-9a-f-]{36}$'
-          [[ "$CLEANUP" =~ $pattern ]] || { echo "::error::Unsupported cleanup command"; exit 1; }
-          read -r -a command <<< "$CLEANUP"
-          "${command[@]}"
+          [[ "$CLEANUP" =~ ^([a-z][a-z0-9-]*)\ ([0-9a-f-]{36})$ ]] ||
+            { echo "::error::Expected \"<target> <run-uuid>\""; exit 1; }
+          target=${BASH_REMATCH[1]}
+          run=${BASH_REMATCH[2]}
+          runners=tests/hosted/cleanup.json
+          if [ -f "$runners" ] && jq -e --arg t "$target" 'has($t)' "$runners" > /dev/null; then
+            command=()
+            while IFS= read -r part; do command+=("$part"); done < <(jq -r --arg t "$target" '.[$t].command[]' "$runners")
+            while IFS= read -r variable; do
+              # Plain opt-in flags only; never credentials, Forge guards or the toolchain.
+              [[ "$variable" =~ ^[A-Z][A-Z0-9_]*=[^[:space:]]*$ && ! "$variable" =~ ^(FORGE_|JIRA_|GITHUB_|RUNNER_|NODE_|NPM_|PATH=) ]] ||
+                { echo "::error::Unsupported environment entry for $target"; exit 1; }
+              export "$variable"
+            done < <(jq -r --arg t "$target" '.[$t].env // {} | to_entries[] | "\(.key)=\(.value)"' "$runners")
+            [ "${#command[@]}" -gt 0 ] || { echo "::error::No cleanup command for $target"; exit 1; }
+            "${command[@]}" "$run"
+          else
+            npx forge-test cleanup "$target" "$run"
+          fi
       - name: Encrypt journals and evidence
         if: always() && steps.state.outcome == 'success'
         env:

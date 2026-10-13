@@ -5,3 +5,6 @@ static/
 .container-service-assets/
 .local/
 coverage/
+*.key
+*.age
+.DS_Store

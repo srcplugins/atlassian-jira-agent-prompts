@@ -1,9 +1,10 @@
 import './typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wizardFixture as fixture } from './wizard-fixture.mjs';
-const { UserError, JiraRejected, JiraUnavailable } = await import('../src/service.ts');
-test('wizard creates one global type for the exact reviewed projects and can later reuse it', async () => {
+import { batchFixture as fixture } from './batch-fixture.mjs';
+const { UserError, JiraRejected, JiraUnavailable, StorageUnavailable } =
+  await import('../src/service.ts');
+test('configuration creates one global type for the exact reviewed spaces and can later reuse it', async () => {
   const f = fixture();
   let r = await f.start();
   assert.deepEqual(f.writes, []);
@@ -20,7 +21,7 @@ test('wizard creates one global type for the exact reviewed projects and can lat
   assert.equal(r.data.status, 'complete');
   assert.equal(f.writes.filter((x) => x === 'create').length, 1);
 });
-test('wizard rejects case-insensitive name overlaps including ineligible types without writes', async () => {
+test('configuration rejects case-insensitive name overlaps including ineligible types without writes', async () => {
   const f = fixture();
   f.types.push({ id: '9', name: 'PROMPT', hierarchyLevel: -1, subtask: true });
   await assert.rejects(f.start(), /already exists/);
@@ -37,14 +38,14 @@ async function refused(f, r, pattern) {
   const writes = [...f.writes];
   const stopped = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(stopped.data.status, 'stopped');
-  assert.match(stopped.data.message, /^Nothing was changed for this project: /);
+  assert.match(stopped.data.message, /^Nothing was changed for this space: /);
   assert.match(stopped.data.message, pattern);
   assert.match(stopped.data.entries[stopped.data.index].message, pattern);
   assert.deepEqual(f.writes, writes);
   assert.equal((await f.api.status()).revision, stopped.revision);
   return stopped;
 }
-test('shared scheme changes require explicit approval before any native write or project claim', async () => {
+test('shared scheme changes require explicit approval before any Jira write or space claim', async () => {
   const f = sharedFixture();
   const r = await f.start();
   await refused(f, r, /Confirm the shared/);
@@ -52,7 +53,7 @@ test('shared scheme changes require explicit approval before any native write or
   assert.equal(f.configs.size, 0);
   assert.equal(f.state().data.status, 'stopped');
 });
-test('shared scheme is updated once, including after response loss; only selected projects get app mappings', async () => {
+test('shared scheme is updated once, including after response loss; only selected spaces get app setup', async () => {
   for (const existing of [false, true]) {
     const f = sharedFixture();
     if (existing) f.types.push({ id: '5', name: 'Prompt', hierarchyLevel: 0, subtask: false });
@@ -116,7 +117,7 @@ test('lost browser response recovers saved cursor without repeating creation', a
   await f.api.advance('admin', saved.data.id, saved.revision);
   assert.equal(f.writes.filter((x) => x === 'create').length, 1);
 });
-test('unknown Jira creation outcome stops the batch and keeps both recovery claims', async () => {
+test('unknown Jira creation outcome stops the run and keeps both recovery claims', async () => {
   const f = fixture();
   f.s.create = async () => {
     f.writes.push('create');
@@ -140,14 +141,14 @@ test('unknown Jira creation outcome stops the batch and keeps both recovery clai
   await assert.rejects(f.api.stop('admin', r.data.id, r.revision, true), /two minutes/);
   assert.deepEqual(f.writes, ['create']);
 });
-test('review fingerprint prevents applying a changed mapping even with a valid type', async () => {
+test('review fingerprint prevents applying a changed setup even with a valid type', async () => {
   const f = fixture();
   let r = await f.start({ type: '3' }, ['1']);
   f.configs.set('1', { revision: 1, data: { type: '3' } });
   await refused(f, r, /changed after review/);
   assert.deepEqual(f.writes, []);
 });
-test('a briefly unavailable Jira before the claim keeps the batch ready for Continue', async () => {
+test('a briefly unavailable Jira before the claim keeps the run ready for Continue', async () => {
   const f = fixture();
   const r = await f.start();
   const scheme = f.s.scheme;
@@ -162,7 +163,7 @@ test('a briefly unavailable Jira before the claim keeps the batch ready for Cont
   f.s.scheme = scheme;
   assert.equal((await f.api.advance('admin', r.data.id, r.revision)).data.index, 1);
 });
-test('global admin denial precedes inventory and all wizard mutations', async () => {
+test('global admin denial precedes inventory and all configuration mutations', async () => {
   const f = fixture();
   f.w.admin = async () => {
     throw new UserError('Denied');
@@ -178,7 +179,7 @@ test('global admin denial precedes inventory and all wizard mutations', async ()
   assert.deepEqual(f.writes, []);
 });
 
-test('storage uncertainty after project success preserves progress or blocks without repeating Jira writes', async () => {
+test('storage uncertainty after space success preserves progress or blocks without repeating Jira writes', async () => {
   for (const committed of [false, true]) {
     const f = fixture();
     const r = await f.start();
@@ -201,7 +202,7 @@ test('storage uncertainty after project success preserves progress or blocks wit
     assert.equal(f.writes.filter((x) => x === 'create').length, 1);
   }
 });
-test('a failed global claim performs no native writes; acknowledged stop retains completed projects', async () => {
+test('a failed global claim performs no Jira writes; acknowledged stop retains completed spaces', async () => {
   const f = fixture();
   let r = await f.start();
   const cas = f.w.cas;
@@ -224,7 +225,7 @@ test('a failed global claim performs no native writes; acknowledged stop retains
   assert.ok(f.configs.get('2').data.pending);
 });
 
-test('new configuration visit cancels own interrupted ready batch, retaining completed changes', async () => {
+test('new configuration visit cancels own interrupted ready run, retaining completed changes', async () => {
   const f = fixture();
   let r = await f.start();
   r = await f.api.advance('admin', r.data.id, r.revision);
@@ -240,7 +241,7 @@ test('new configuration visit cancels own interrupted ready batch, retaining com
   assert.equal((await f.start({ type: '5' }, ['2'])).data.status, 'ready');
 });
 
-test('cancellation waits for in-flight project commit, then prevents the next project', async () => {
+test('cancellation waits for in-flight space commit, then prevents the next space', async () => {
   const f = fixture();
   let release;
   let entered;
@@ -273,7 +274,7 @@ test('cancellation waits for in-flight project commit, then prevents the next pr
   await assert.rejects(f.api.advance('admin', stopped.data.id, stopped.revision), /interrupted/);
 });
 
-test('expired running and uncertain attempts cancel without clearing project safety claims or retrying writes', async () => {
+test('expired running and uncertain attempts cancel without clearing space safety claims or retrying writes', async () => {
   for (const status of ['running', 'attention']) {
     const f = fixture();
     f.s.create = async () => {
@@ -295,7 +296,7 @@ test('expired running and uncertain attempts cancel without clearing project saf
   }
 });
 
-test('opening another administrator’s page cannot cancel their batch; denied admins cannot cancel', async () => {
+test('opening another administrator’s page cannot cancel their run; denied admins cannot cancel', async () => {
   const f = fixture();
   const r = await f.start();
   assert.equal((await f.api.cancelInterrupted('other')).revision, r.revision);
@@ -306,7 +307,7 @@ test('opening another administrator’s page cannot cancel their batch; denied a
   await assert.rejects(f.api.cancelInterrupted('admin'), /Denied/);
 });
 
-test('a late callback cannot overwrite an expired cancelled batch or a new run', async () => {
+test('a late callback cannot overwrite an expired cancelled run or a new run', async () => {
   const f = fixture();
   let release;
   let entered;
@@ -363,7 +364,7 @@ test('interrupted cancellation never cancels a replacement run after a conflict'
   assert.deepEqual(f.writes, []);
 });
 
-test('interrupted bulk unlink retains completed clears and leaves remaining projects configured', async () => {
+test('interrupted bulk setup removal retains completed removals and leaves remaining spaces configured', async () => {
   const f = fixture();
   for (const id of ['1', '2'])
     f.configs.set(id, { revision: 1, data: { type: '3', refreshAfterSave: true } });
@@ -404,7 +405,7 @@ test('cancellation notice describes this visit rather than replaying historical 
   assert.equal((await f.api.cancelInterrupted('admin')).cancelledNow, false);
 });
 
-test('catalog reports independent discovery failures without hiding saved state or blocking unlink', async () => {
+test('catalog reports independent discovery failures without hiding saved state or blocking setup removal', async () => {
   for (const failure of ['types', 'inventory', 'both']) {
     const f = fixture();
     const r = await f.start({ type: '3' }, ['1']);
@@ -442,7 +443,7 @@ test('stale abandoned-run release cannot overwrite a competing continuation', as
   assert.deepEqual(f.writes, ['create', 'attach 91']);
 });
 
-test('a brief outage before any write returns the batch to ready at the same project', async () => {
+test('a brief outage before any write returns the run to ready at the same space', async () => {
   const f = fixture();
   let r = await f.start();
   const types = f.s.types;
@@ -464,7 +465,7 @@ test('a brief outage before any write returns the batch to ready at the same pro
   assert.deepEqual(f.writes, ['create', 'attach 91']);
 });
 
-test('a rejected creation stops the batch without an outcome check and never creates again', async () => {
+test('a rejected creation stops the run without an outcome check and never creates again', async () => {
   const f = fixture();
   let r = await f.start();
   f.s.create = async () => {
@@ -474,7 +475,7 @@ test('a rejected creation stops the batch without an outcome check and never cre
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'stopped');
   assert.equal(r.data.inspectProject, undefined);
-  assert.match(r.data.message, /HTTP 409.*Nothing was changed.*Review the remaining projects/);
+  assert.match(r.data.message, /HTTP 409.*Nothing was changed.*Review the remaining spaces/);
   assert.equal(f.configs.get('1')?.data.pending, undefined);
   assert.deepEqual(f.writes, ['create']);
   // The run has ended on its own; a new review can start.
@@ -495,7 +496,7 @@ test('a not-applied outcome during cancellation keeps its reason and needs no ou
   assert.match(r.data.message, /HTTP 403/);
 });
 
-test('a later project proceeds when Jira stores the created type under a normalized name', async () => {
+test('a later space proceeds when Jira stores the created type under a normalized name', async () => {
   const f = fixture();
   let r = await f.start({ name: 'Prompt' }, ['1', '2']);
   const create = f.s.create;
@@ -510,18 +511,71 @@ test('a later project proceeds when Jira stores the created type under a normali
   assert.equal(f.writes.filter((w) => w === 'create').length, 1);
 });
 
-test('releasing another administrator’s ready batch needs acknowledgement; the owner’s does not', async () => {
+test('releasing another administrator’s ready run needs acknowledgement; the owner’s does not', async () => {
   const f = fixture();
   let r = await f.start();
   await assert.rejects(f.api.stop('other-admin', r.data.id, r.revision, false), /Acknowledge/);
   assert.equal(f.state().data.status, 'ready');
   r = await f.api.stop('other-admin', r.data.id, r.revision, true);
   assert.equal(r.data.status, 'stopped');
-  assert.match(r.data.message, /^Batch released/);
+  assert.match(r.data.message, /^Configuration released/);
   const g = fixture();
   const own = await g.start();
   assert.equal(
     (await g.api.stop('admin', own.data.id, own.revision, false)).data.status,
     'stopped',
   );
+});
+
+test('a storage outage before any write keeps the run ready; a defect stops it honestly', async () => {
+  // Storage briefly unavailable during apply's own review: an outage, so the step can be
+  // continued later.
+  let f = fixture();
+  let r = await f.start();
+  const types = f.s.types;
+  let reads = 0;
+  f.s.types = async () => {
+    if (++reads === 2)
+      throw new StorageUnavailable('App storage is unavailable. Try again shortly.');
+    return types();
+  };
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready');
+  assert.equal(r.data.index, 0);
+  assert.equal(
+    r.data.entries[0].message,
+    'App storage is unavailable. Try again shortly. Nothing was changed.',
+  );
+  assert.deepEqual(f.writes, []);
+
+  // A defect in the same place is not an outage: repeating it would fail the same way, so the
+  // batch stops with a message that says so, and still writes nothing.
+  f = fixture();
+  r = await f.start();
+  reads = 0;
+  f.s.types = async () => {
+    if (++reads === 2) throw new TypeError('private defect detail');
+    return f.types;
+  };
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'stopped');
+  assert.equal(
+    r.data.entries[0].message,
+    'An unexpected error stopped this step. Nothing was changed.',
+  );
+  assert.doesNotMatch(JSON.stringify(r.data), /private defect detail|could not be read/);
+  assert.deepEqual(f.writes, []);
+});
+
+test('a polling view that names an older run never cancels a newer one', async () => {
+  const f = fixture();
+  const old = await f.start();
+  const stopped = await f.api.cancelInterrupted('admin');
+  assert.equal(stopped.data.status, 'stopped');
+  const next = await f.start({ type: '3' }, ['2']);
+  const polled = await f.api.cancelInterrupted('admin', old.data.id);
+  assert.equal(polled.data.id, next.data.id);
+  assert.equal(polled.data.status, 'ready');
+  assert.equal(polled.cancelledNow, false);
+  assert.equal(f.state().revision, next.revision);
 });

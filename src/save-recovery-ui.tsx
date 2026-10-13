@@ -31,7 +31,7 @@ export function SaveRecovery({
       setBusy(false);
     }
   }
-  // Release keeps the pre-save ticket; accept keeps Jira's version of the requested save.
+  // Release keeps the pre-save state; accept keeps Jira's version of the requested save.
   // Neither writes Jira or cancels a delayed request.
   async function finish(action: 'resolve-save' | 'accept-save', done: string) {
     if (!status?.pending || !status.administrator || status.waitSeconds !== 0 || !acknowledged)
@@ -85,12 +85,12 @@ export function SaveRecovery({
         <>
           <p>The previous save is unresolved. Checking does not repeat the Jira write.</p>
           {!status.administrator ? (
-            <p>A Jira administrator with Edit Issues permission must inspect this save.</p>
+            <p>A Jira administrator with Edit work items permission must inspect this save.</p>
           ) : status.unchanged ? (
             <>
               <p>
-                Jira still has the pre-save Description and prompt field. Releasing this record
-                keeps those fields and allows a new reviewed save. It does not cancel a delayed Jira
+                Jira still has the pre-save prompt field and Agent Prompts block. Releasing this
+                record keeps them and allows a new reviewed save. It does not cancel a delayed Jira
                 request.
               </p>
               {acknowledgement}
@@ -111,7 +111,7 @@ export function SaveRecovery({
               <p>
                 Jira holds the requested save ({status.keys?.join(', ') || 'no prompts'}) with its
                 text and structure intact, in a slightly different format. Accepting records it as
-                saved without changing the ticket.
+                saved without changing the work item.
               </p>
               {acknowledgement}
               <Button
@@ -119,17 +119,17 @@ export function SaveRecovery({
                 onClick={() =>
                   void finish(
                     'accept-save',
-                    'Saved ticket accepted. Check saved state again if prompts do not reload.',
+                    'Saved work item accepted. Check saved state again if prompts do not reload.',
                   )
                 }
               >
-                Accept saved ticket
+                Accept saved work item
               </Button>
             </>
           ) : (
             <p>
-              The ticket differs from both its pre-save state and the requested save. Investigate in
-              Jira before making further changes.
+              The work item differs from both its pre-save state and the requested save. Investigate
+              in Jira before making further changes.
             </p>
           )}
         </>

@@ -104,26 +104,26 @@ test('accepting a normalized save needs an administrator, the elapsed guard and 
   ]) {
     const f = fixture([status]);
     await f.click('Check saved state');
-    assert.equal(f.button('Accept saved ticket'), undefined);
+    assert.equal(f.button('Accept saved work item'), undefined);
     assert.equal(f.button('Release unchanged save'), undefined);
   }
   const waiting = fixture([{ ...normalized, waitSeconds: 30 }]);
   await waiting.click('Check saved state');
-  assert.equal(waiting.button('Accept saved ticket').props.isDisabled, true);
+  assert.equal(waiting.button('Accept saved work item').props.isDisabled, true);
   assert.match(waiting.text('p'), /Wait 30 seconds/);
   const f = fixture([normalized, { accepted: true }]);
   await f.click('Check saved state');
   assert.match(f.text('p'), /TEST-20/);
-  assert.equal(f.button('Accept saved ticket').props.isDisabled, true);
+  assert.equal(f.button('Accept saved work item').props.isDisabled, true);
   f.acknowledge();
-  await f.click('Accept saved ticket');
+  await f.click('Accept saved work item');
   assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))), {
     name: 'accept-save',
     payload: { revision: 7, fingerprint: 'reviewed-target', acknowledged: true },
   });
   assert.equal(f.recovered(), 1);
-  assert.equal(f.button('Accept saved ticket'), undefined);
-  assert.match(f.text('p'), /Saved ticket accepted/);
+  assert.equal(f.button('Accept saved work item'), undefined);
+  assert.match(f.text('p'), /Saved work item accepted/);
 });
 
 test('recovery outcomes are announced in a status region present from the start', async () => {

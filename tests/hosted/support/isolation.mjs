@@ -5,13 +5,11 @@ import {
   siteFor,
   activeTarget,
   browserTarget,
+  fixtureProject,
 } from '@srcplugins/atlassian-forge-test-framework/core';
-import {
-  client,
-  observeAction,
-  projectPage,
-} from '@srcplugins/atlassian-forge-test-framework/jira';
-import { editor, snapshotJourney } from './native-snapshots.mjs';
+import { client, observeAction } from '@srcplugins/atlassian-forge-test-framework/jira';
+import { editor, snapshotJourney } from './snapshots.mjs';
+import { spaceSettings } from './space-settings.mjs';
 
 // Keep the source journal live while probing the other installation. All writes go through
 // the destination's owned fixture journal; the peer client is used only for independent reads.
@@ -43,7 +41,7 @@ export async function runIsolationProbe({
   assert.equal(peer.lifecycle.environmentId, target.environmentId);
   assert.equal(peer.lifecycle.actors.owner.accountId, expected.owner);
   const foreign = peer.lifecycle.reinstallBackup;
-  assert.ok(foreign.sourceKey.startsWith('PLSISO-'));
+  assert.ok(foreign.sourceKey.startsWith(`${fixtureProject('tenant-isolation')}-`));
   const peerApi = client(request, `https://${peerHost}`);
   assert.equal((await peerApi('/myself')).accountId, expected.owner);
   const verifyPeer = async () => {
@@ -65,7 +63,7 @@ export async function runIsolationProbe({
     assert.notEqual(
       collision.fields.project.id,
       project.id,
-      'Foreign ID is also a local fixture issue; negative control is ambiguous',
+      'Foreign ID is also a local fixture work item; negative control is ambiguous',
     );
     assert.notEqual(collision.fields.summary, foreign.sourceFields.summary);
   }
@@ -80,17 +78,10 @@ export async function runIsolationProbe({
   state.lifecycle.peer = { host: peerHost, runId: peer.runId, sourceId: foreign.sourceId };
   owned.run.persist();
   const page = await contexts.owner.newPage();
-  const setup = await observeAction(
-    page,
-    'setup',
-    () => projectPage(page, 'agent-prompts', project.key),
-    target,
-  );
+  const setup = await observeAction(page, 'setup', () => spaceSettings(page, project.key), target);
   assert.ok(!setup.type, 'Unconfigured destination adopted peer type');
   assert.ok(!(await page.locator('body').innerText()).includes(foreign.sourceFields.summary));
-  owned.run.check(
-    'Same project key on another tenant does not inherit configuration or source name',
-  );
+  owned.run.check('Same space key on another tenant does not inherit configuration or source name');
   const type = project.issueTypes.find((t) => !t.subtask && t.name === 'Story');
   assert.ok(type);
   state.lifecycle.type = type;
@@ -104,26 +95,10 @@ export async function runIsolationProbe({
     owned,
     blank: false,
     testInfo: { annotations: [] },
-    retainLinked: true,
+    retainSaved: true,
   });
   state.lifecycle.localBackup = local;
   owned.run.persist();
-  await observeAction(page, 'setup', () => projectPage(page, 'agent-prompts', project.key), target);
-  const search = page.getByRole('textbox', { name: 'Search prompts', exact: true });
-  for (const query of [foreign.sourceFields.summary, local.sourceKey]) {
-    const found = await observeAction(page, 'library', () => search.fill(query), target);
-    assert.ok(
-      !found.prompts.some(
-        (p) => p.id === foreign.sourceId || p.name === foreign.sourceFields.summary,
-      ),
-    );
-    if (query === local.sourceKey)
-      assert.ok(
-        found.prompts.some((p) => p.id === local.sourceId),
-        'Local library positive control',
-      );
-  }
-  assert.ok(!(await page.locator('body').innerText()).includes(foreign.sourceFields.summary));
   await page.goto(`${activeTarget().site}/browse/${local.targetKey}`);
   const readView = page
     .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
@@ -142,17 +117,19 @@ export async function runIsolationProbe({
     ),
   );
   const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
-  const found = await observeAction(
-    page,
-    'library',
-    () => combo.fill(foreign.sourceFields.summary),
-    target,
-  );
-  assert.ok(
-    !found.prompts.some(
-      (p) => p.id === foreign.sourceId || p.name === foreign.sourceFields.summary,
-    ),
-  );
+  for (const query of [foreign.sourceFields.summary, local.sourceKey]) {
+    const found = await observeAction(page, 'search', () => combo.fill(query), target);
+    assert.ok(
+      !found.prompts.some(
+        (p) => p.id === foreign.sourceId || p.name === foreign.sourceFields.summary,
+      ),
+    );
+    if (query === local.sourceKey)
+      assert.ok(
+        found.prompts.some((p) => p.id === local.sourceId),
+        'Local search positive control',
+      );
+  }
   await editor(page)
     .getByRole('button', { name: /remove.*Error handling/i })
     .click();

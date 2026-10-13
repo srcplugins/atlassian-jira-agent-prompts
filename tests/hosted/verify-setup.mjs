@@ -1,4 +1,4 @@
-// Hosted acceptance for project setup on an owned development site.
+// Hosted acceptance for space setup on an owned development site.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { verifyTypeMappings } from './support/agent-prompts-setup.mjs';
@@ -12,26 +12,30 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { chromium, expect } from '@playwright/test';
-import { activeTarget, siteFor } from '@srcplugins/atlassian-forge-test-framework/core';
+import {
+  activeTarget,
+  fixtureProject,
+  siteFor,
+} from '@srcplugins/atlassian-forge-test-framework/core';
 import {
   tokenRequest,
   client,
   installation,
-  projectPage,
   observeAction,
   dismissOnboarding,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
-import { nativeSetupProject } from './support/fixture.mjs';
+import { spaceSettings } from './support/space-settings.mjs';
+import { agentPromptsFixture, setupRunSpace } from './support/fixture.mjs';
 
 const [mode, recoveryId] = process.argv.slice(2);
 const fault = process.env.NATIVE_SETUP_FAULT;
 assert.ok(!fault || ['concurrent', 'lost-response'].includes(fault));
-// Abandoned mode: admin A leaves a reviewed batch ready after its first project; a second
+// Abandoned mode: admin A leaves a reviewed configuration ready after its first space; a second
 // administrator (saved admin2 session) must be able to review and release it.
 const abandoned = process.env.NATIVE_SETUP_ABANDONED === '1';
-// Bulk mode: configure both projects with an existing type, reload off then on, then bulk unlink.
+// Bulk mode: configure both spaces with an existing type, reload off then on, then remove setup from both.
 const bulk = process.env.NATIVE_SETUP_BULK === '1';
-// Rejected mode: a type with the reviewed new name is created natively before Apply.
+// Rejected mode: a type with the reviewed new name is created directly in Jira before Apply.
 const rejected = process.env.NATIVE_SETUP_REJECTED === '1';
 assert.ok([abandoned, bulk, rejected].filter(Boolean).length <= 1, 'Choose one mode');
 assert.ok(!(abandoned || bulk || rejected) || (!fault && process.env.NATIVE_SETUP_SHARED !== '1'));
@@ -75,7 +79,7 @@ const j =
         shared: process.env.NATIVE_SETUP_SHARED === '1',
         fixtures: (process.env.NATIVE_SETUP_SHARED === '1' ? [0, 1, 2] : [0, 1]).map((n) => ({
           key: `NP${id.replaceAll('-', '').slice(0, 7).toUpperCase()}${n}`,
-          marker: nativeSetupProject(id, n),
+          marker: setupRunSpace(id, n),
         })),
         typeName: `Setup ${id}`,
         stage: 'preflight',
@@ -110,7 +114,7 @@ async function applyWithFault(page, target) {
       return route.continue();
     }
     if (
-      input?.payload?.call?.functionKey !== 'wizard-advance' ||
+      input?.payload?.call?.functionKey !== 'configuration-advance' ||
       input.payload.context?.environmentId !== target.environmentId ||
       !input.extensionId?.includes(target.appId)
     )
@@ -319,19 +323,14 @@ try {
     assert.equal((await client(context.request)('/myself')).accountId, owner.accountId);
     let page = await context.newPage();
     page.setDefaultTimeout(30000);
-    // App eligibility is checked against the retained fixture before any creation.
-    await observeAction(
-      page,
-      'setup',
-      () => projectPage(page, 'agent-prompts', 'PLSNATIVE'),
-      installation('agent-prompts'),
-    );
     const t = installation('agent-prompts');
-    // Opening Project configuration cancels this actor's own interrupted batch and returns progress.
+    // Space configuration renders only for an eligible space, so opening it on the retained
+    // fixture checks app eligibility before any creation. Opening it also cancels this actor's own
+    // interrupted configuration and returns progress.
     const before = await observeAction(
       page,
-      'wizard-cancel-interrupted',
-      () => page.getByRole('button', { name: 'Project configuration', exact: true }).click(),
+      'configuration-cancel-interrupted',
+      () => spaceSettings(page, fixtureProject(agentPromptsFixture)),
       t,
     );
     assert.ok(
@@ -341,12 +340,12 @@ try {
 
     for (const [index, f] of j.fixtures.entries()) {
       assert.equal(await api(`/project/${f.key}`), null);
-      stage(`create-project-${index}`);
+      stage(`create-space-${index}`);
       f.projectIntent = true;
       persist();
       f.project = await api('/project', 'POST', {
         key: f.key,
-        name: `Native setup ${id.slice(0, 8)} ${index}`,
+        name: `Setup run ${id.slice(0, 8)} ${index}`,
         description: f.marker,
         projectTypeKey: 'software',
         projectTemplateKey: 'com.pyxis.greenhopper.jira:gh-simplified-kanban-classic',
@@ -386,9 +385,8 @@ try {
     j.mappingBaseline = await mappings();
     persist();
     async function openConfiguration(f = primary) {
-      await projectPage(page, 'agent-prompts', f.key);
-      await page.getByRole('button', { name: 'Project configuration', exact: true }).click();
-      const search = page.getByRole('textbox', { name: 'Find a project', exact: true });
+      await spaceSettings(page, f.key);
+      const search = page.getByRole('textbox', { name: 'Find a space', exact: true });
       await expect(search).toBeEnabled({ timeout: 60000 });
       await search.fill(f.key);
       await page.getByRole('checkbox', { name: `Select ${f.key}`, exact: true }).click();
@@ -403,16 +401,16 @@ try {
       return health;
     }
     async function dialog(query) {
-      await page.getByRole('textbox', { name: 'Find a project', exact: true }).fill(query);
+      await page.getByRole('textbox', { name: 'Find a space', exact: true }).fill(query);
       await expect(
-        page.getByRole('table', { name: 'Project configuration', exact: true }).getByRole('row'),
+        page.getByRole('table', { name: 'Space configuration', exact: true }).getByRole('row'),
       ).toHaveCount(query === primary.key ? 2 : j.fixtures.length + 1);
-      const all = page.getByRole('checkbox', { name: 'Select all matching projects', exact: true });
+      const all = page.getByRole('checkbox', { name: 'Select all matching spaces', exact: true });
       await all.click();
       await expect(all).toBeChecked();
       if (j.shared && query !== primary.key) {
         const excluded = page
-          .getByRole('table', { name: 'Project configuration', exact: true })
+          .getByRole('table', { name: 'Space configuration', exact: true })
           .getByRole('row')
           .filter({ hasText: j.fixtures[2].key })
           .getByRole('checkbox');
@@ -421,7 +419,7 @@ try {
       }
       return observeAction(
         page,
-        'wizard-catalog',
+        'configuration-catalog',
         () => page.getByRole('button', { name: 'Configure selected', exact: true }).click(),
         t,
       );
@@ -436,14 +434,14 @@ try {
       ).toBeVisible({ timeout: 60000 });
       return observeAction(
         page,
-        'wizard-status',
+        'configuration-status',
         () => page.getByRole('button', { name: 'Done', exact: true }).click(),
         t,
       );
     }
     async function acknowledgeShared(required = false) {
       const ack = page.getByRole('checkbox', {
-        name: 'I approve the shared scheme changes for all listed affected projects.',
+        name: 'I approve the shared scheme changes for all listed affected spaces.',
         exact: true,
       });
       if (required) await expect(ack).toBeVisible();
@@ -463,7 +461,7 @@ try {
       await chooseExisting(name);
       const plan = await observeAction(
         page,
-        'wizard-preview',
+        'configuration-preview',
         () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
         t,
       );
@@ -473,7 +471,7 @@ try {
       return plan;
     }
     async function chooseMode(name) {
-      await page.getByRole('combobox', { name: 'Prompt issue type', exact: true }).click();
+      await page.getByRole('combobox', { name: 'Prompt work type', exact: true }).click();
       await page.getByRole('option', { name, exact: true }).click();
     }
     async function configured(f) {
@@ -492,7 +490,7 @@ try {
         await dialog(primary.key.slice(0, -1));
         await chooseExisting(task.name);
         const box = page.getByRole('checkbox', {
-          name: 'Reload ticket after saving prompts',
+          name: 'Reload work item after saving prompts',
           exact: true,
         });
         if ((await box.isChecked()) !== reload) await box.click();
@@ -511,29 +509,27 @@ try {
           assert.deepEqual(await configured(f), { type: task.id, reload });
         assert.deepEqual(known(await mappings()), j.mappingBaseline);
       }
-      stage('bulk-unlink-cancel');
+      stage('bulk-remove-setup-cancel');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
-      await chooseMode('Unlink selected projects');
+      await chooseMode('Remove setup from selected spaces');
       await expect(
-        page.getByRole('checkbox', { name: 'Reload ticket after saving prompts', exact: true }),
+        page.getByRole('checkbox', { name: 'Reload work item after saving prompts', exact: true }),
       ).toHaveCount(0);
       await page.getByRole('button', { name: 'Review changes', exact: true }).click();
-      await expect(
-        page.getByText('Clear app configuration and preferences', { exact: true }),
-      ).toHaveCount(2);
+      await expect(page.getByText('Remove setup and preferences', { exact: true })).toHaveCount(2);
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
       for (const f of j.fixtures)
         assert.deepEqual(await configured(f), { type: task.id, reload: true });
-      stage('bulk-unlink');
+      stage('bulk-remove-setup');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
-      await chooseMode('Unlink selected projects');
+      await chooseMode('Remove setup from selected spaces');
       await page.getByRole('button', { name: 'Review changes', exact: true }).click();
       await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
-      const unlinked = await finish();
-      assert.equal(unlinked.data.input.unlink, true);
-      assert.ok(unlinked.data.entries.every((e) => e.status === 'done'));
+      const removed = await finish();
+      assert.equal(removed.data.input.unlink, true);
+      assert.ok(removed.data.entries.every((e) => e.status === 'done'));
       for (const f of j.fixtures)
         assert.deepEqual(await configured(f), { type: undefined, reload: false });
       assert.deepEqual(known(await mappings()), j.mappingBaseline);
@@ -547,7 +543,7 @@ try {
       await finish();
       for (const f of j.fixtures) assert.equal((await configured(f)).type, task.id);
       assert.deepEqual(known(await mappings()), j.mappingBaseline);
-      j.bulkVerified = { projects: 2, reloadOff: true, reloadOn: true, unlinked: true };
+      j.bulkVerified = { projects: 2, reloadOff: true, reloadOn: true, setupRemoved: true };
       j.passed = true;
       persist();
     } else if (rejected) {
@@ -559,7 +555,7 @@ try {
       await page.getByRole('button', { name: 'Review changes', exact: true }).click();
       await expect(page.getByRole('button', { name: 'Apply changes', exact: true })).toBeEnabled();
       // Someone creates the same name in Jira between review and Apply.
-      stage('rejected-native-type');
+      stage('rejected-type');
       assert.ok(!(await api('/issuetype')).some((x) => x.name === j.typeName));
       j.typeIntent = true;
       persist();
@@ -576,7 +572,7 @@ try {
       ).toBeVisible({ timeout: 60000 });
       await expect(page.getByText(/Nothing was changed/).first()).toBeVisible();
       await expect(
-        page.getByRole('button', { name: 'Check affected project', exact: true }),
+        page.getByRole('button', { name: 'Check affected space', exact: true }),
       ).toHaveCount(0);
       await page.screenshot({ path: `${directory}/${id}-rejected.png`, fullPage: true });
       const named = (await api('/issuetype')).filter((x) => x.name === j.typeName);
@@ -593,7 +589,7 @@ try {
       });
       assert.ok(
         j.fixtures.every((f) => !after.includes(`${f.scheme.id}:${j.type.id}`)),
-        'Rejected batch attached the type',
+        'Rejected configuration attached the type',
       );
       for (const f of j.fixtures) assert.equal((await configured(f)).type, undefined);
       stage('rejected-select-existing');
@@ -602,7 +598,7 @@ try {
       await chooseExisting(j.typeName);
       const plan = await observeAction(
         page,
-        'wizard-preview',
+        'configuration-preview',
         () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
         t,
       );
@@ -629,11 +625,11 @@ try {
       await chooseExisting(existing.name);
       await observeAction(
         page,
-        'wizard-preview',
+        'configuration-preview',
         () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
         t,
       );
-      // Admin A walks away after the first project: the second step never reaches the app.
+      // Admin A walks away after the first space: the second step never reaches the app.
       const pattern = '**/gateway/api/graphql/**';
       let advances = 0;
       await page.route(pattern, async (route) => {
@@ -644,7 +640,7 @@ try {
           return route.continue();
         }
         if (
-          input?.payload?.call?.functionKey === 'wizard-advance' &&
+          input?.payload?.call?.functionKey === 'configuration-advance' &&
           input.extensionId?.includes(t.appId) &&
           ++advances === 2
         )
@@ -673,12 +669,11 @@ try {
         b.setDefaultTimeout(30000);
         // A freshly signed-in administrator meets Jira's first-run dialog over the page.
         await dismissOnboarding(b);
-        await projectPage(b, 'agent-prompts', primary.key);
-        // Opening the view must not cancel another administrator's batch.
+        // Opening the view must not cancel another administrator's configuration.
         const seen = await observeAction(
           b,
-          'wizard-cancel-interrupted',
-          () => b.getByRole('button', { name: 'Project configuration', exact: true }).click(),
+          'configuration-cancel-interrupted',
+          () => spaceSettings(b, primary.key),
           t,
         );
         assert.equal(seen.data.actor, owner.accountId);
@@ -686,25 +681,27 @@ try {
         assert.equal(seen.data.index, 1);
         assert.notEqual(seen.data.cancelRequested, true);
         await b.getByRole('button', { name: 'Review saved configuration', exact: true }).click();
-        const release = b.getByRole('button', { name: 'Release abandoned batch', exact: true });
+        const release = b.getByRole('button', {
+          name: 'Release abandoned configuration',
+          exact: true,
+        });
         await expect(release).toBeDisabled();
         await expect(
           b.getByRole('button', { name: 'Continue reviewed changes', exact: true }),
         ).toHaveCount(0);
         await b
           .getByRole('checkbox', {
-            name: 'I confirmed this batch is abandoned and inspected its affected Jira changes.',
+            name: 'I confirmed this configuration is abandoned and inspected its affected Jira changes.',
             exact: true,
           })
           .click();
-        const released = await observeAction(b, 'wizard-stop', () => release.click(), t);
+        const released = await observeAction(b, 'configuration-stop', () => release.click(), t);
         assert.equal(released.data.status, 'stopped');
         assert.equal(released.data.inspectProject, undefined);
         assert.deepEqual(known(await mappings()), j.mappingBaseline);
-        // The second administrator configures the remaining project alone.
-        await projectPage(b, 'agent-prompts', primary.key);
-        await b.getByRole('button', { name: 'Project configuration', exact: true }).click();
-        const search = b.getByRole('textbox', { name: 'Find a project', exact: true });
+        // The second administrator configures the remaining space alone.
+        await spaceSettings(b, primary.key);
+        const search = b.getByRole('textbox', { name: 'Find a space', exact: true });
         await expect(search).toBeEnabled({ timeout: 60000 });
         await search.fill(j.fixtures[1].key);
         await b.getByRole('checkbox', { name: `Select ${j.fixtures[1].key}`, exact: true }).click();
@@ -736,10 +733,10 @@ try {
       const catalog = await dialog(primary.key.slice(0, -1));
       for (const f of j.fixtures) assert.ok(catalog.projects.some((p) => p.id === f.project.id));
       await expect(
-        page.getByRole('heading', { name: 'Configure 2 projects', exact: true }),
+        page.getByRole('heading', { name: 'Configure 2 spaces', exact: true }),
       ).toBeVisible();
       assert.ok(!(await api('/issuetype')).some((x) => x.name === j.typeName));
-      await page.getByRole('combobox', { name: 'Prompt issue type', exact: true }).click();
+      await page.getByRole('combobox', { name: 'Prompt work type', exact: true }).click();
       await page.getByRole('option', { name: 'Create a new type', exact: true }).click();
       await page.getByRole('textbox', { name: 'New type name', exact: true }).fill(j.typeName);
       await page.getByRole('button', { name: 'Review changes', exact: true }).click();
@@ -774,7 +771,7 @@ try {
       ) {
         progress = await observeAction(
           page,
-          'wizard-status',
+          'configuration-status',
           () => page.getByRole('button', { name: 'Check saved progress', exact: true }).click(),
           t,
         );
@@ -793,7 +790,7 @@ try {
       );
       assert.equal(progress.data.status, 'complete');
       assert.ok(progress.data.entries.every((e) => e.status === 'done'));
-      j.wizard = { id: progress.data.id, revision: progress.revision };
+      j.batch = { id: progress.data.id, revision: progress.revision };
       persist();
       let health = await openConfiguration();
       const created = (await api('/issuetype')).filter((x) => x.name === j.typeName);
@@ -871,7 +868,7 @@ try {
   }
   stage('cleanup');
   await cleanup();
-  console.log(`Native setup ${id}: ${j.passed ? 'passed' : 'recovered'}; cleanup verified.`);
+  console.log(`Setup run ${id}: ${j.passed ? 'passed' : 'recovered'}; cleanup verified.`);
 } catch (error) {
   writeFileSync(
     `${directory}/${id}-failure.txt`,
@@ -881,7 +878,7 @@ try {
   j.failedAt = j.stage;
   persist();
   console.error(
-    `Native setup ${id} stopped at ${j.stage}; inspect private journal. No automatic write retry.`,
+    `Setup run ${id} stopped at ${j.stage}; inspect private journal. No automatic write retry.`,
   );
   process.exitCode = 1;
 } finally {

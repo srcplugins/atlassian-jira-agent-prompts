@@ -17,7 +17,7 @@ export function sourceContent(description: unknown): string {
             'This prompt uses formatting that cannot be safely represented as plain text. Read it in Jira.',
           );
         const text = String(node.text);
-        textLength += text.length;
+        textLength += Array.from(text).length;
         hasText ||= !!text.trim();
         return text;
       }

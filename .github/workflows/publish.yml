@@ -4,9 +4,9 @@ name: Publish
 # Manual release to Forge production with verifiable provenance. Run it for a pushed vX.Y.Z tag
 # on main: it checks the tag and source, uploads one Forge build tagged with the commit (stamped
 # into the app's settings page), attests that bundle, runs the release suite against exactly that
-# build on development, then, with the owner's approval of the `production` environment, deploys
-# the same build to production and writes the GitHub release notes. `production: false` rehearses
-# everything except the production deployment.
+# build on development, then deploys the same build to production and writes the GitHub release
+# notes. By default it rehearses: set `production` to deploy, which then waits for the owner's
+# approval of the `production` environment.
 
 on:
   workflow_dispatch:
@@ -15,9 +15,9 @@ on:
         description: Release tag (vX.Y.Z), already pushed and on main
         required: true
       production:
-        description: Deploy the tested build to production (off rehearses)
+        description: Deploy the tested build to production (leave off to rehearse)
         type: boolean
-        default: true
+        default: false
       approve_major:
         description: Approve a major version (scope or egress change) after reviewing the manifest diff
         type: boolean
@@ -25,6 +25,11 @@ on:
 
 permissions:
   contents: read
+
+# An explicit bash adds pipefail: a failed command inside a pipe fails its step.
+defaults:
+  run:
+    shell: bash
 
 concurrency:
   group: publish
@@ -46,8 +51,6 @@ jobs:
       attestation: ${{ steps.attest.outputs.attestation-url }}
     env:
       TAG: ${{ inputs.tag }}
-      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -75,10 +78,13 @@ jobs:
           node config/prepare-forge-cli.mjs
           npm ci --no-audit --no-fund
           npm run check
+      # Credentials are scoped to the Forge steps, never to the install and check steps.
       - name: Upload one Forge build of the tagged commit
         id: build
         env:
           SHA: ${{ steps.source.outputs.sha }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
         run: |
           sed -i "s/^export const build = 'development';$/export const build = '${SHA::12}';/" src/build-info.ts
           grep -q "'${SHA::12}'" src/build-info.ts || { echo "::error::Build stamp failed"; exit 1; }
@@ -101,9 +107,14 @@ jobs:
   test:
     name: Release suite on the build
     needs: build
+    # A called workflow gets only what the calling job grants; hosted.yml reads artifacts.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/hosted.yml
     with:
-      ref: refs/tags/${{ inputs.tag }}
+      # The commit that was built and attested, even if the tag moves meanwhile.
+      ref: ${{ needs.build.outputs.sha }}
       deploy_tag: ${{ needs.build.outputs.build }}
       suite: release
     secrets: inherit
@@ -120,12 +131,10 @@ jobs:
     env:
       TAG: ${{ inputs.tag }}
       BUILD: ${{ needs.build.outputs.build }}
-      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-      JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ needs.build.outputs.sha }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -143,6 +152,8 @@ jobs:
         env:
           FORGE_ALLOW_PRODUCTION: '1'
           APPROVE_MAJOR: ${{ inputs.approve_major }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
         run: |
           node config/forge.mjs settings set usage-analytics false
           approve=()

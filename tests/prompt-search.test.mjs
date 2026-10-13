@@ -13,7 +13,7 @@ function fixture() {
   });
   let hook;
   const render = () => {
-    hook = hooks.render(() => usePromptSearch('picker'));
+    hook = hooks.render(() => usePromptSearch());
   };
   render();
   hooks.effects.forEach((fn) => fn());

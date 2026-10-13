@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 
 // The hosted journey registry: every journey names its fixture, its independent assertion and its
 // cleanup, points at lower-level tests that exist, and matches an actual hosted test or runner.
@@ -32,6 +32,30 @@ test('every hosted journey declares its fixture, independent assertion and clean
   }
   for (const journey of registry.scriptedJourneys)
     assert.ok(existsSync(journey.script), `${journey.id}: ${journey.script}`);
+});
+
+test('every hosted runner is registered, and the ones the suites run are marked unattended', () => {
+  const scripts = readdirSync('tests/hosted')
+    .filter((name) => /^verify-[a-z-]+\.mjs$/.test(name))
+    .map((name) => `tests/hosted/${name}`);
+  const registered = new Set(registry.scriptedJourneys.map((journey) => journey.script));
+  for (const script of scripts) assert.ok(registered.has(script), `${script} is not registered`);
+  // forge-test.mjs names its runners as runner('<name>', …) or through setup(…), which runs
+  // verify-setup.mjs; those run in the full and release suites, so their registry entries must
+  // say so.
+  const suites = readFileSync('forge-test.mjs', 'utf8');
+  const inSuites = new Set(
+    [...suites.matchAll(/runner\('([a-z-]+)'/g)].map(
+      ([, name]) => `tests/hosted/verify-${name}.mjs`,
+    ),
+  );
+  assert.ok(inSuites.size >= 3, 'the suite definition names its runners');
+  for (const journey of registry.scriptedJourneys)
+    assert.equal(
+      journey.unattended,
+      inSuites.has(journey.script),
+      `${journey.id}: unattended must match whether forge-test.mjs runs ${journey.script}`,
+    );
 });
 
 test('the public registry carries no site, account or private path', () => {

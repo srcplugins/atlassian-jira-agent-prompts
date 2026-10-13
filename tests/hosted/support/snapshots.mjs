@@ -2,12 +2,12 @@ import { gunzipSync } from 'node:zlib';
 import {
   expect,
   installation,
-  projectPage,
   observeAction,
   dismissOnboarding,
   adf,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { activeTarget, markers } from '@srcplugins/atlassian-forge-test-framework/core';
+import { spaceSettings } from './space-settings.mjs';
 export function editor(page) {
   const t = installation('agent-prompts');
   return page.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
@@ -48,7 +48,7 @@ function watchAppEgress(page) {
   const seen = [];
   // Positive control: the iframe's own assets must be observed, or zero telemetry proves nothing.
   seen.appRequests = 0;
-  // The app's project page URL contains the app ID too, so exclude Jira's own main frame.
+  // The app's space page URL contains the app ID too, so exclude Jira's own main frame.
   const fromApp = (request) => {
     const frame = request.frame();
     return !!frame && frame !== page.mainFrame() && frame.url().includes(appId);
@@ -69,13 +69,13 @@ function watchAppEgress(page) {
   return seen;
 }
 
-export async function snapshotJourney({ page, owned, blank, testInfo, retainLinked = false }) {
+export async function snapshotJourney({ page, owned, blank, testInfo, retainSaved = false }) {
   const egress = watchAppEgress(page);
   await dismissOnboarding(page);
   const setup = await observeAction(
     page,
     'setup',
-    () => projectPage(page, 'agent-prompts', owned.project.key),
+    () => spaceSettings(page, owned.project.key),
     installation('agent-prompts'),
   );
   const source = await owned.propertyIssue(
@@ -83,22 +83,16 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
     `SNAPSHOT-PROMPT-${owned.run.state.runId}`,
     setup.type,
   );
-  const searchLink = page.getByRole('link', { name: 'View in Jira', exact: true });
-  await expect(searchLink).toHaveAttribute('href', new RegExp('jql='));
-  const searchUrl = new URL(await searchLink.getAttribute('href'), activeTarget().site);
-  expect(searchUrl.searchParams.get('jql')).toBe(
-    `project = ${owned.project.id} AND issuetype = ${setup.type} ORDER BY key ASC`,
-  );
   const marker = markers.runMarker(owned.run.state.runId, owned.run.state.resources.length);
   const target = blank
     ? await owned.run.create('issue', {
-        summary: 'Native blank Description round-trip',
+        summary: 'Blank Description round-trip',
         labels: [marker],
         description: null,
         marker,
         comments: [],
       })
-    : await owned.issue('Native synced prompt comparison');
+    : await owned.issue('Synced prompt comparison');
   const editorSource = structuredClone(source.expected.description);
   editorSource.content[0].attrs = { localId: `editor-${owned.run.state.runId}` };
   source.expected.descriptionVariants = [source.expected.description, editorSource];
@@ -157,13 +151,13 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
   expect(loaded.prompts.map((p) => p.id)).toContain(source.id);
   const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
   await expect(combo).toBeEnabled();
-  owned.run.state.nativePickerMs = Date.now() - started;
+  owned.run.state.pickerMs = Date.now() - started;
   await expect(editor(page).getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
   await expect(editor(page).getByRole('button', { name: 'Sync', exact: true })).toBeDisabled();
 
   await observeAction(
     page,
-    'library',
+    'search',
     () =>
       editor(page)
         .getByRole('combobox', { name: 'Agent Prompts', exact: true })
@@ -174,7 +168,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
   await editor(page)
     .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
     .click();
-  expect(calls).toContain('library');
+  expect(calls).toContain('search');
   async function save(action = 'Save') {
     const click = () => editor(page).getByRole('button', { name: action, exact: true }).click();
     if (loaded.refreshAfterSave) {
@@ -237,7 +231,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
   target.expected.descriptionVariants = [target.expected.description, linked.description];
   target.expected.customField = { id: field.id, value: linked[field.id] };
   owned.run.persist();
-  if (retainLinked) {
+  if (retainSaved) {
     return {
       sourceId: source.id,
       sourceKey: sourceIssue.key,
@@ -253,7 +247,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
   await page.reload();
   await page.getByRole('button', { name: 'Agent Prompts', exact: true }).click();
   await expect(page.getByText(sentinel, { exact: false })).toBeVisible();
-  // Ordinary API edits are now sufficient: no native synced-block publishing.
+  // Ordinary API edits are now sufficient: no synced-block publishing.
   const updated = adf(`${sentinel}-UPDATED`);
   source.expected.descriptionVariants = [...source.expected.descriptionVariants, updated];
   owned.run.persist();
@@ -279,14 +273,14 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
   await editor(page)
     .getByRole('button', { name: /remove.*Error handling/i })
     .click();
-  const unlinkedDescription = blank
+  const removedDescription = blank
     ? { type: 'doc', version: 1, content: [] }
     : target.expected.description;
-  target.expected.descriptionVariants.push(unlinkedDescription);
+  target.expected.descriptionVariants.push(removedDescription);
   owned.run.persist();
   await save();
   const cleared = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
-  expect(cleared.description).toEqual(unlinkedDescription);
+  expect(cleared.description).toEqual(removedDescription);
   expect(cleared[field.id] ?? []).toEqual([]);
   target.expected.customField = { id: field.id, value: cleared[field.id] };
   owned.run.persist();
@@ -306,7 +300,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainLink
 }
 
 // Resume a pre-upgrade target: prove the old stored ownership still supports Sync and removal.
-export async function resumeLinkedJourney({ page, owned, backup }) {
+export async function resumeSavedJourney({ page, owned, backup }) {
   const target = owned.run.state.resources.find((r) => r.id === backup.targetId);
   const source = owned.run.state.resources.find((r) => r.id === backup.sourceId);
   expect(target && source).toBeTruthy();

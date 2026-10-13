@@ -124,7 +124,6 @@ Production dependencies included in this app and its UI bundles.
 | @forge/bridge | 7.0.0 | SEE LICENSE IN LICENSE.txt |
 | @forge/egress | 3.0.0 | SEE LICENSE IN LICENSE.txt |
 | @forge/i18n | 1.0.0 | SEE LICENSE IN LICENSE.txt |
-| @forge/jira-bridge | 1.2.0 | SEE LICENSE IN LICENSE.txt |
 | @forge/kvs | 2.0.6 | SEE LICENSE IN LICENSE.txt |
 | @forge/manifest | 13.5.0 | SEE LICENSE IN LICENSE.txt |
 | @forge/manifest | 13.6.0 | SEE LICENSE IN LICENSE.txt |

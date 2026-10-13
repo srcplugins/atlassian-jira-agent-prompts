@@ -19,11 +19,16 @@ import {
   useProductContext,
 } from '@forge/react';
 import { call } from './client';
-import { readProjects } from './project-reads';
+import { readSpaces } from './space-reads';
+import { finished } from './batch-status';
 import { createLatch } from './shared/latch.mjs';
-import type { createWizard, WizardRecord, WizardProject } from './wizard';
+import type {
+  createConfigurationBatch,
+  BatchRecord,
+  InventoryProject,
+} from './configuration-batch';
 import type { createSettings } from './settings';
-type Catalog = Awaited<ReturnType<ReturnType<typeof createWizard>['catalog']>>;
+type Catalog = Awaited<ReturnType<ReturnType<typeof createConfigurationBatch>['catalog']>>;
 type Plan = Awaited<ReturnType<ReturnType<typeof createSettings>['preview']>>;
 type Reviewed = { id: string; value?: Plan; error?: string };
 export function ConfigurationDialog({
@@ -32,7 +37,7 @@ export function ConfigurationDialog({
   onClose,
   onBusy,
 }: {
-  projects: WizardProject[];
+  projects: InventoryProject[];
   initialType?: string;
   onClose: (mutated: boolean) => void;
   onBusy: (value: boolean) => void;
@@ -45,7 +50,7 @@ export function ConfigurationDialog({
   const [name, setName] = useState('');
   const [refreshAfterSave, setRefreshAfterSave] = useState(false);
   const [plans, setPlans] = useState<Reviewed[]>([]);
-  const [record, setRecord] = useState<WizardRecord | null>(null);
+  const [record, setRecord] = useState<BatchRecord | null>(null);
   const [busy, setBusy] = useState(false);
   const [uncertain, setUncertain] = useState(false);
   const [message, setMessage] = useState('');
@@ -54,7 +59,7 @@ export function ConfigurationDialog({
   const [abandonedAck, setAbandonedAck] = useState(false);
   // UI Kit can deliver a second click before the disabled tree reaches the host.
   const latch = useRef(createLatch()).current;
-  const active = !!record && !['complete', 'stopped'].includes(record.data.status);
+  const active = !!record && !finished(record.data.status);
   const foreignRun = !!accountId && !!record && record.data.actor !== accountId;
   const input =
     mode === 'unlink'
@@ -70,7 +75,7 @@ export function ConfigurationDialog({
   const affectedLabel = (scheme: Plan['scheme'], id: string) => {
     const p =
       scheme.projects?.find((p) => p.id === id) ?? catalog?.projects.find((p) => p.id === id);
-    return p?.key ? `${p.key}${p.name ? ` — ${p.name}` : ''}` : `Project ID ${id}`;
+    return p?.key ? `${p.key}${p.name ? ` — ${p.name}` : ''}` : `Space ID ${id}`;
   };
 
   function run(fn: () => Promise<void>) {
@@ -95,7 +100,7 @@ export function ConfigurationDialog({
       await Promise.all([
         (async () => {
           try {
-            const c = await call<Catalog>('wizard-catalog', {});
+            const c = await call<Catalog>('configuration-catalog', {});
             setCatalog(c);
             setType(
               c.types.find((t) => t.id === initialType)?.id ??
@@ -114,9 +119,9 @@ export function ConfigurationDialog({
         })(),
         (async () => {
           try {
-            const current = await call<WizardRecord | null>('wizard-status', {});
+            const current = await call<BatchRecord | null>('configuration-status', {});
             setRecord(current);
-            setAttempted(!!current && !['complete', 'stopped'].includes(current.data.status));
+            setAttempted(!!current && !finished(current.data.status));
           } catch {
             setUncertain(true);
             setMessage(
@@ -128,34 +133,44 @@ export function ConfigurationDialog({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Catalog is loaded once per modal; subsequent recovery is explicitly read-only.
   }, []);
+  // A space outside the loaded inventory (or the stand-in used when the inventory failed, whose
+  // key is its ID) is labelled by ID rather than shown as a bare number.
   const label = (id: string) => {
     const p = catalog?.projects.find((p) => p.id === id) ?? projects.find((p) => p.id === id);
-    return p ? `${p.key} — ${p.name}` : id;
+    return p && p.key !== p.id ? `${p.key} — ${p.name}` : `Space ID ${id}`;
   };
   async function observe() {
-    const current = await call<WizardRecord | null>('wizard-status', {});
+    const current = await call<BatchRecord | null>('configuration-status', {});
     setRecord(current);
-    if (current && !['complete', 'stopped'].includes(current.data.status)) setAttempted(true);
+    if (current && !finished(current.data.status)) setAttempted(true);
     setUncertain(false);
     setPlans([]);
     setSharedAck(false);
     setAbandonedAck(false);
     if (!current) setMessage('No saved configuration run. Review changes before applying.');
   }
-  async function advance(start: WizardRecord) {
+  async function advance(start: BatchRecord) {
     let current = start;
     while (current.data.status === 'ready') {
-      current = await call<WizardRecord>('wizard-advance', {
+      const next = await call<BatchRecord>('configuration-advance', {
         id: current.data.id,
         revision: current.revision,
       });
-      setRecord(current);
+      setRecord(next);
+      // A step that applied nothing (a brief outage before its claim) leaves the batch ready at
+      // the same space. Stop instead of retrying it automatically: Continue reviewed changes
+      // is the explicit way on.
+      if (next.data.status === 'ready' && next.data.index === current.data.index) {
+        setMessage(next.data.entries[next.data.index]?.message ?? next.data.message ?? '');
+        return;
+      }
+      current = next;
     }
   }
   async function apply() {
     setAttempted(true);
     setUncertain(true);
-    const current = await call<WizardRecord>('wizard-start', {
+    const current = await call<BatchRecord>('configuration-start', {
       ...input,
       ...(shared.length && sharedAck ? { allowShared: true } : {}),
       entries: plans.map((p) => ({ projectId: p.id, fingerprint: p.value!.fingerprint })),
@@ -167,7 +182,7 @@ export function ConfigurationDialog({
     await advance(current);
     setUncertain(false);
   }
-  const done = attempted && !!record && ['complete', 'stopped'].includes(record.data.status);
+  const done = attempted && !!record && finished(record.data.status);
   return (
     <Modal
       width="large"
@@ -182,7 +197,7 @@ export function ConfigurationDialog({
             ? 'Configuration progress'
             : done
               ? 'Configuration results'
-              : `Configure ${ids.length} project${ids.length === 1 ? '' : 's'}`}
+              : `Configure ${ids.length} space${ids.length === 1 ? '' : 's'}`}
         </ModalTitle>
       </ModalHeader>
       <ModalBody>
@@ -191,17 +206,17 @@ export function ConfigurationDialog({
             <>
               {!catalog.typesAvailable && (
                 <Text>
-                  Ticket types could not be loaded. You can still choose Unlink selected projects.
-                  Reopen this dialog to retry type configuration.
+                  Work types could not be loaded. You can still remove setup from the selected
+                  spaces. Reopen this dialog to retry type configuration.
                 </Text>
               )}
               {!catalog.inventoryAvailable && (
                 <Text>
-                  The project inventory could not be refreshed. Changes are limited to the projects
-                  you selected before opening this dialog.
+                  The space inventory could not be refreshed. Changes are limited to the spaces you
+                  selected before opening this dialog.
                 </Text>
               )}
-              <Label labelFor="configuration-mode">Prompt issue type</Label>
+              <Label labelFor="configuration-mode">Prompt work type</Label>
               <Select
                 inputId="configuration-mode"
                 isDisabled={busy}
@@ -216,7 +231,7 @@ export function ConfigurationDialog({
                     label: 'Create a new type',
                     isDisabled: !catalog.typesAvailable,
                   },
-                  { value: 'unlink', label: 'Unlink selected projects' },
+                  { value: 'unlink', label: 'Remove setup from selected spaces' },
                 ]}
                 value={{
                   value: mode,
@@ -224,7 +239,7 @@ export function ConfigurationDialog({
                     mode === 'existing'
                       ? 'Use an existing type'
                       : mode === 'unlink'
-                        ? 'Unlink selected projects'
+                        ? 'Remove setup from selected spaces'
                         : 'Create a new type',
                 }}
                 onChange={(o) => {
@@ -271,19 +286,19 @@ export function ConfigurationDialog({
                     }}
                   />
                   <Text>
-                    Creates one global Jira ticket type. Review its availability in default/shared
-                    schemes; other projects may be affected.
+                    Creates one global Jira work type. Review its availability in default/shared
+                    schemes; other spaces may be affected.
                   </Text>
                 </>
               ) : (
                 <Text>
-                  Clears Agent Prompts configuration and preferences for the selected projects.
-                  Existing issues, prompt links, descriptions and Jira issue types stay in place.
+                  Clears the app’s setup and preferences for the selected spaces. Work items, their
+                  selected prompts, copied instructions and Jira work types stay in place.
                 </Text>
               )}
               {mode !== 'unlink' && (
                 <Checkbox
-                  label="Reload ticket after saving prompts"
+                  label="Reload work item after saving prompts"
                   isChecked={refreshAfterSave}
                   isDisabled={busy}
                   onChange={(event) => {
@@ -294,14 +309,14 @@ export function ConfigurationDialog({
                 />
               )}
               <Heading as="h3" size="small">
-                {plans.length ? 'Review changes' : 'Selected projects'}
+                {plans.length ? 'Review changes' : 'Selected spaces'}
               </Heading>
               <DynamicTable
                 label="Configuration review"
                 rowsPerPage={5}
                 head={{
                   cells: [
-                    { key: 'project', content: 'Project' },
+                    { key: 'project', content: 'Space' },
                     { key: 'change', content: plans.length ? 'Proposed change' : 'Selection' },
                   ],
                 }}
@@ -318,8 +333,8 @@ export function ConfigurationDialog({
                               ? `Blocked: ${p.error}`
                               : p?.value
                                 ? mode === 'unlink'
-                                  ? 'Clear app configuration and preferences'
-                                  : `${p.value.typeName}${p.value.attach ? ` — add to ${p.value.scheme.name}` : ' — already available; save mapping'}`
+                                  ? 'Remove setup and preferences'
+                                  : `${p.value.typeName}${p.value.attach ? ` — add to ${p.value.scheme.name}` : ' — already in this space'}`
                                 : 'Selected'}
                           </Text>
                         ),
@@ -335,15 +350,15 @@ export function ConfigurationDialog({
                   </Heading>
                   {shared.map((scheme) => (
                     <Text key={scheme.id}>
-                      {scheme.name} · {scheme.projectIds.length} projects ·{' '}
+                      {scheme.name} · {scheme.projectIds.length} spaces ·{' '}
                       {scheme.projectIds.filter((id) => ids.includes(id)).length} selected ·{' '}
-                      {scheme.projectIds.filter((id) => !ids.includes(id)).length} additional
-                      projects affected
+                      {scheme.projectIds.filter((id) => !ids.includes(id)).length} additional spaces
+                      affected
                     </Text>
                   ))}
                   <Text>
-                    The prompt type will become available in every listed project. Agent Prompts
-                    configuration changes only for your selected projects. Each shared scheme is
+                    The prompt type will become available in every listed space. Agent Prompts
+                    configuration changes only for your selected spaces. Each shared scheme is
                     updated once.
                   </Text>
                   <DynamicTable
@@ -352,7 +367,7 @@ export function ConfigurationDialog({
                     head={{
                       cells: [
                         { key: 'scheme', content: 'Scheme' },
-                        { key: 'project', content: 'Affected project' },
+                        { key: 'project', content: 'Affected space' },
                         { key: 'effect', content: 'Change' },
                       ],
                     }}
@@ -376,7 +391,7 @@ export function ConfigurationDialog({
                     )}
                   />
                   <Checkbox
-                    label="I approve the shared scheme changes for all listed affected projects."
+                    label="I approve the shared scheme changes for all listed affected spaces."
                     isChecked={sharedAck}
                     isDisabled={busy}
                     onChange={(e) => setSharedAck(e.target.checked === true)}
@@ -386,7 +401,7 @@ export function ConfigurationDialog({
               {plans.some((p) => p.error) && (
                 <>
                   <Text>
-                    Resolve or exclude blocked projects before applying. No changes have been made.
+                    Resolve or exclude blocked spaces before applying. No changes have been made.
                   </Text>
                   <Button
                     isDisabled={busy}
@@ -396,31 +411,32 @@ export function ConfigurationDialog({
                       setSharedAck(false);
                     }}
                   >
-                    Exclude blocked projects
+                    Exclude blocked spaces
                   </Button>
                 </>
               )}
               {plans.length > 0 && mode !== 'unlink' && (
                 <>
                   <Text>
-                    Reload after saving: {refreshAfterSave ? 'On' : 'Off'} for all selected
-                    projects. All tickets of this type become prompt sources. Existing links keep
-                    their sources. Tickets, descriptions, workflows and screens are not migrated.
+                    Reload after saving: {refreshAfterSave ? 'On' : 'Off'} for all selected spaces.
+                    All work items of this type become prompts. Prompts of a previous type stay
+                    selected where they are already used but cannot be added again. Existing work
+                    items, descriptions, workflows and screens are not changed.
                   </Text>
                   {plans
                     .filter((p) => p.value?.old && p.value.old !== p.value.type)
                     .map((p) => (
                       <Text key={p.id}>
-                        {label(p.id)}: visible old-type prompts
+                        {label(p.id)}: visible prompts of the previous type
                         {p.value!.promptIncomplete ? ' (incomplete)' : ''}:{' '}
-                        {p.value!.promptKeys.join(', ') || 'None returned'}. Tickets with links
-                        {p.value!.linksIncomplete ? ' (incomplete)' : ''}:{' '}
-                        {p.value!.linkedKeys.join(', ') || 'None returned'}. Hidden tickets are not
-                        counted.
+                        {p.value!.promptKeys.join(', ') || 'None returned'}. Work items using them
+                        {p.value!.usingIncomplete ? ' (incomplete)' : ''}:{' '}
+                        {p.value!.usingKeys.join(', ') || 'None returned'}. Hidden work items are
+                        not counted.
                       </Text>
                     ))}
                   <Text>
-                    Changes use your Jira administrator permissions and apply one project at a time.
+                    Changes use your Jira administrator permissions and apply one space at a time.
                     If interrupted, inspect saved progress before continuing.
                   </Text>
                 </>
@@ -439,12 +455,14 @@ export function ConfigurationDialog({
                         : 'Saved progress'}
                   </Heading>
                   <Text>
-                    {record.data.index} of {record.data.entries.length} projects{' '}
-                    {record.data.input.unlink ? 'unlinked' : 'configured'}.
+                    {record.data.input.unlink
+                      ? `Setup removed from ${record.data.index} of ${record.data.entries.length} spaces.`
+                      : `${record.data.index} of ${record.data.entries.length} spaces configured.`}
                   </Text>
-                  {record.data.type && (
+                  {record.data.input.name && record.data.type && (
                     <Text>
-                      Ticket type ID: {record.data.type}. Reuse this type for additional projects.
+                      Created work type: {record.data.input.name}. Use it when setting up more
+                      spaces.
                     </Text>
                   )}
                   <DynamicTable
@@ -452,7 +470,7 @@ export function ConfigurationDialog({
                     rowsPerPage={5}
                     head={{
                       cells: [
-                        { key: 'project', content: 'Project' },
+                        { key: 'project', content: 'Space' },
                         { key: 'status', content: 'Result' },
                       ],
                     }}
@@ -465,7 +483,7 @@ export function ConfigurationDialog({
                             <Text>
                               {e.status === 'done'
                                 ? record.data.input.unlink
-                                  ? 'Unlinked'
+                                  ? 'Setup removed'
                                   : 'Configured'
                                 : e.projectId === record.data.inspectProject ||
                                     (i === record.data.index &&
@@ -503,14 +521,14 @@ export function ConfigurationDialog({
               {active && foreignRun && (
                 <>
                   <Text>
-                    Only the administrator who reviewed this batch can continue its changes. If that
-                    administrator is unavailable, inspect the saved results and any affected project
-                    in Jira before releasing the abandoned batch. An uncertain or in-flight step
-                    requires a two-minute wait; releasing it cannot stop a delayed Jira request.
-                    Completed changes and project recovery records are kept.
+                    Only the administrator who reviewed this configuration can continue its changes.
+                    If that administrator is unavailable, inspect the saved results and any affected
+                    space in Jira before releasing the abandoned configuration. An uncertain or
+                    in-flight step requires a two-minute wait; releasing it cannot stop a delayed
+                    Jira request. Completed changes and space recovery records are kept.
                   </Text>
                   <Checkbox
-                    label="I confirmed this batch is abandoned and inspected its affected Jira changes."
+                    label="I confirmed this configuration is abandoned and inspected its affected Jira changes."
                     isChecked={abandonedAck}
                     isDisabled={busy}
                     onChange={(event) => setAbandonedAck(event.target.checked === true)}
@@ -522,7 +540,7 @@ export function ConfigurationDialog({
                         setAttempted(true);
                         setUncertain(true);
                         setRecord(
-                          await call<WizardRecord>('wizard-stop', {
+                          await call<BatchRecord>('configuration-stop', {
                             id: record.data.id,
                             revision: record.revision,
                             acknowledged: abandonedAck,
@@ -533,15 +551,15 @@ export function ConfigurationDialog({
                       })
                     }
                   >
-                    Release abandoned batch
+                    Release abandoned configuration
                   </Button>
                 </>
               )}
               {record && !foreignRun && ['running', 'attention'].includes(record.data.status) && (
                 <Text>
-                  Close this dialog and reload Project configuration to cancel your interrupted
-                  batch automatically. Completed changes are kept. Inspect the affected project
-                  using View details; a Jira request already in progress may still finish.
+                  Close this dialog and reload Space configuration to cancel your interrupted
+                  configuration automatically. Completed changes are kept. Inspect the affected
+                  space using View details; a Jira request already in progress may still finish.
                 </Text>
               )}
             </>
@@ -591,9 +609,9 @@ export function ConfigurationDialog({
                   setPlans([]);
                   setSharedAck(false);
                   setPlans(
-                    await readProjects(
+                    await readSpaces(
                       ids,
-                      (id) => call<Plan>('wizard-preview', { projectId: id, ...input }),
+                      (id) => call<Plan>('configuration-preview', { projectId: id, ...input }),
                       () => {},
                     ),
                   );

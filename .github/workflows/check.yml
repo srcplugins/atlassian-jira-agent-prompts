@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# An explicit bash adds pipefail: a failed command inside a pipe fails its step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     runs-on: ubuntu-24.04

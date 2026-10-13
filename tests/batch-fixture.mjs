@@ -1,7 +1,7 @@
 import './typescript-loader.mjs';
-const { createWizard } = await import('../src/wizard.ts');
+const { createConfigurationBatch } = await import('../src/configuration-batch.ts');
 const { UserError } = await import('../src/service.ts');
-export function wizardFixture() {
+export function batchFixture() {
   let run;
   const configs = new Map();
   const types = [{ id: '3', name: 'Task', subtask: false, hierarchyLevel: 0 }];
@@ -60,11 +60,11 @@ export function wizardFixture() {
     projects: async () => ({ projects: [...projects.values()], incomplete: false }),
     get: async () => structuredClone(run),
     cas: async (revision, data) => {
-      if ((run?.revision ?? 0) !== revision) throw new UserError('Wizard conflict');
+      if ((run?.revision ?? 0) !== revision) throw new UserError('Batch conflict');
       run = { revision: revision + 1, data: structuredClone(data) };
     },
   };
-  const api = createWizard(p, s, w);
+  const api = createConfigurationBatch(p, s, w);
   async function start(input = { name: 'Prompt' }, ids = ['1', '2']) {
     const entries = [];
     for (const projectId of ids)

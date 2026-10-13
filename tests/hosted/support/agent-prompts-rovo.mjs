@@ -4,13 +4,12 @@ const normalize = (value) => value.replace(/\s+/g, ' ').trim().toLowerCase();
 
 // The hosted script supplies real app/browser reads. Keep the fixture lifecycle
 // executable offline so a failed agent response cannot bypass guarded cleanup.
-export async function runNativeRovoJourney({
+export async function runRovoJourney({
   owned,
   setup,
   discover,
   search,
   read,
-  summarize,
   inventory,
   capture,
   verifyCleanup = async (baseline) =>
@@ -20,8 +19,8 @@ export async function runNativeRovoJourney({
   let passed = false;
   try {
     const configured = await setup();
-    assert.equal(configured.project.id, owned.project.id, 'Setup returned a different project');
-    assert.match(configured.type ?? '', /^[1-9]\d*$/, 'Configure the owned project before testing');
+    assert.equal(configured.project.id, owned.project.id, 'Setup returned a different space');
+    assert.match(configured.type ?? '', /^[1-9]\d*$/, 'Set up the owned space before testing');
     baseline = await inventory();
     const entry = await owned.propertyIssue(
       `Rovo ordinary prompt ${owned.run.state.runId.slice(0, 8)}`,
@@ -41,14 +40,14 @@ export async function runNativeRovoJourney({
     const found = await discover(source.key);
     assert.ok(
       found.prompts.some((prompt) => prompt.id === source.id && prompt.key === source.key),
-      'The new ordinary-description source must appear in the actual app catalog',
+      'The new ordinary-description source must be searchable in Jira',
     );
     const withFixture = await inventory();
     assert.equal(withFixture.filter((issue) => issue.id === source.id).length, 1);
     assert.deepEqual(
       withFixture.filter((issue) => issue.id !== source.id),
       baseline,
-      'Creating the fixture changed unrelated Jira issues',
+      'Creating the fixture changed unrelated Jira work items',
     );
     for (let index = 1; index <= 2; index++) {
       // Withhold the expected name/body from the user prompts. They must come
@@ -61,26 +60,9 @@ export async function runNativeRovoJourney({
       await capture(`read-${index}`, { key: source.key, expected: body, response });
       assert.ok(response.includes(source.key));
       assert.ok(normalize(response).includes(normalize(body)));
-      assert.deepEqual(await inventory(), withFixture, 'Read-only Rovo changed Jira issues');
+      assert.deepEqual(await inventory(), withFixture, 'Read-only Rovo changed Jira work items');
     }
     owned.run.check('Two fresh ordinary-source Rovo searches/reads and unchanged Jira');
-    if (summarize) {
-      // Ticket Description Summary: an ordinary ticket whose marker is only in its Description.
-      const ticket = await owned.issue(`Rovo description ${owned.run.state.runId.slice(0, 8)}`);
-      const target = await owned.api(`/issue/${ticket.id}?fields=summary,description`);
-      const marker = ticket.expected.marker;
-      assert.ok(JSON.stringify(target.fields.description).includes(marker));
-      assert.ok(!target.fields.summary.includes(marker));
-      const withTarget = await inventory();
-      for (let index = 1; index <= 2; index++) {
-        const response = await summarize({ key: target.key, index });
-        await capture(`summary-${index}`, { key: target.key, expected: marker, response });
-        assert.ok(response.includes(target.key));
-        assert.ok(response.includes(marker), 'The summary must report the Description marker');
-        assert.deepEqual(await inventory(), withTarget, 'Read-only Rovo changed Jira issues');
-      }
-      owned.run.check('Two fresh Ticket Description Summary reads and unchanged Jira');
-    }
     passed = true;
   } finally {
     owned.run.state.testStatus = 'failed';

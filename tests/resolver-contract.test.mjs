@@ -27,9 +27,9 @@ const revisioned = new Set([
   'save',
   'resolve-save',
   'accept-save',
-  'wizard-start',
-  'wizard-advance',
-  'wizard-stop',
+  'configuration-start',
+  'configuration-advance',
+  'configuration-stop',
   'settings-resolve',
   'settings-preferences',
 ]);
@@ -41,24 +41,24 @@ const context = {
 test('the resolver set is exactly the supported surface', () => {
   assert.deepEqual(resolvers.sort(), [
     'accept-save',
-    'library',
+    'configuration-advance',
+    'configuration-cancel-interrupted',
+    'configuration-catalog',
+    'configuration-preview',
+    'configuration-start',
+    'configuration-status',
+    'configuration-stop',
     'load',
     'resolve-save',
     'save',
     'save-status',
+    'search',
     'settings-health',
     'settings-preferences',
     'settings-projects',
     'settings-recover',
     'settings-resolve',
     'setup',
-    'wizard-advance',
-    'wizard-cancel-interrupted',
-    'wizard-catalog',
-    'wizard-preview',
-    'wizard-start',
-    'wizard-status',
-    'wizard-stop',
   ]);
 });
 
@@ -81,5 +81,65 @@ test('every resolver refuses unknown fields, forged identity and missing context
       assert.equal(s.calls.length, 0, `${name}: ${label} reached Jira`);
       assert.deepEqual(s.storage, [], `${name}: ${label} reached storage`);
     }
+  }
+});
+
+// A valid request for each resolver, so it gets past validation to its first Jira or storage
+// access.
+const valid = {
+  setup: {},
+  search: { query: '' },
+  load: {},
+  save: { ids: [], revision: 0, fingerprint: 'x' },
+  'save-status': {},
+  'resolve-save': { revision: 0, fingerprint: 'x', acknowledged: true },
+  'accept-save': { revision: 0, fingerprint: 'x', acknowledged: true },
+  'settings-projects': {},
+  'settings-health': { projectId: '1' },
+  'settings-recover': { projectId: '1' },
+  'settings-resolve': { projectId: '1', revision: 0 },
+  'settings-preferences': { projectId: '1', revision: 0, refreshAfterSave: true },
+  'configuration-catalog': {},
+  'configuration-status': {},
+  'configuration-cancel-interrupted': {},
+  'configuration-preview': { projectId: '1', type: '3' },
+  'configuration-start': {
+    type: '3',
+    entries: [{ projectId: '1', fingerprint: 'x' }],
+    revision: 0,
+  },
+  'configuration-advance': { id: 'x', revision: 0 },
+  'configuration-stop': { id: 'x', revision: 0 },
+};
+
+test('an unexpected error in any resolver returns the generic message and logs one fixed line', async (t) => {
+  assert.deepEqual(Object.keys(valid).sort(), [...resolvers].sort());
+  const logged = [];
+  t.mock.method(console, 'error', (line) => logged.push(line));
+  const fail = (where) => {
+    throw new TypeError(`private ${where} detail`);
+  };
+  for (const name of resolvers) {
+    logged.length = 0;
+    // A defect in app code, not an outage: building a request path throws, and a stored record
+    // throws as soon as the app reads it. (A failing storage call itself is an outage and is
+    // reported as such.)
+    const record = new Proxy(
+      {},
+      { get: (_, key) => (key === 'then' ? undefined : fail('record')) },
+    );
+    const s = {
+      ...sdk(),
+      route: () => fail('route'),
+      kvs: { entity: () => ({ get: async () => record }), transact: () => fail('storage') },
+      fieldType: () => fail('field'),
+    };
+    const result = await registerResolvers(s)[name]({ context, payload: valid[name] });
+    assert.deepEqual(
+      result,
+      { ok: false, error: 'Request could not be completed. Refresh and check your Jira access.' },
+      name,
+    );
+    assert.deepEqual(logged, ['{"event":"resolver_failed","category":"unexpected"}'], name);
   }
 });
