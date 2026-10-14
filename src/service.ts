@@ -30,6 +30,19 @@ export function numeric(value: unknown): string {
     throw new UserError('Invalid Jira identifier.');
   return value;
 }
+/** Runs `fn` over the items with at most four requests in flight, keeping the order. */
+export async function limited<T, R>(items: T[], fn: (item: T) => Promise<R>) {
+  const out: R[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, items.length) }, worker));
+  return out;
+}
 export interface Context {
   accountId: string;
   projectId: string;

@@ -1,4 +1,4 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const { registerResolvers } = await import('../src/integration.ts');
@@ -20,6 +20,16 @@ function jira() {
     issueTypes: [task],
   };
   const types = [task];
+  // One screen (50) serves every work type and operation; screen 51 serves Task's edit and view.
+  const screens = {
+    50: { name: 'Default screen', tabs: { 60: ['summary', 'description'] } },
+    51: { name: 'Task screen', tabs: { 61: ['summary'], 62: [] } },
+  };
+  const screenSchemes = {
+    40: { default: 50 },
+    41: { default: 50, edit: 51, view: 51 },
+  };
+  const mapping = [{ issueTypeId: 'default', screenSchemeId: '40' }];
   const writes = [];
   const reads = [];
   const answer = (method, path, body) => {
@@ -61,8 +71,6 @@ function jira() {
         };
       case 'GET /rest/api/3/field':
         return [{ id: FIELD, schema: { custom: 'exact-field' } }];
-      case 'POST /rest/api/3/search/jql':
-        return { issues: [], isLast: true };
       case 'GET /rest/api/3/issue/createmeta/1/issuetypes/20':
         return { total: 2, fields: [{ fieldId: 'summary' }, { fieldId: 'description' }] };
       case 'POST /rest/api/3/issuetype': {
@@ -70,6 +78,93 @@ function jira() {
         types.push(created);
         return created;
       }
+      case 'GET /rest/api/3/issuetypescreenscheme/project':
+        assert.equal(query.projectId, '1');
+        return {
+          isLast: true,
+          values: [{ issueTypeScreenScheme: { id: '30' }, projectIds: ['1'] }],
+        };
+      case 'GET /rest/api/3/issuetypescreenscheme/mapping':
+        assert.deepEqual(query, { issueTypeScreenSchemeId: '30', startAt: '0', maxResults: '100' });
+        return {
+          startAt: 0,
+          isLast: true,
+          values: mapping.map((row) => ({ ...row, issueTypeScreenSchemeId: '30' })),
+        };
+      case 'GET /rest/api/3/screenscheme': {
+        // Scheme 42 shares screen 51 with another space's work type screen scheme; scheme 43
+        // is unassigned, so Jira omits its expansion.
+        const all = { ...screenSchemes, 42: { default: 51 }, 43: { default: 52 } };
+        const users = { 40: ['30'], 41: ['30'], 42: ['31'] };
+        const item = (id, expand) => ({
+          id: Number(id),
+          screens: all[id],
+          ...(expand && users[id]
+            ? {
+                issueTypeScreenSchemes: { isLast: true, values: users[id].map((i) => ({ id: i })) },
+              }
+            : {}),
+        });
+        const ids = url.searchParams.getAll('id');
+        if (ids.length) return { isLast: true, values: ids.map((id) => item(id)) };
+        assert.deepEqual(query, {
+          startAt: '0',
+          maxResults: '100',
+          expand: 'issueTypeScreenSchemes',
+        });
+        return { startAt: 0, isLast: true, values: Object.keys(all).map((id) => item(id, true)) };
+      }
+      case 'GET /rest/api/3/issuetypescreenscheme/30/project':
+      case 'GET /rest/api/3/issuetypescreenscheme/31/project': {
+        const two = url.pathname.includes('/31/');
+        return {
+          startAt: 0,
+          isLast: true,
+          values: [
+            two ? { id: '2', key: 'TWO', name: 'Two' } : { id: '1', key: 'ONE', name: 'One' },
+          ],
+        };
+      }
+      case 'GET /rest/api/3/screens':
+        return {
+          isLast: true,
+          values: url.searchParams
+            .getAll('id')
+            .filter((id) => screens[id])
+            .map((id) => ({ id: Number(id), name: screens[id].name })),
+        };
+      case `GET /rest/api/3/field/${FIELD}/screens`:
+        assert.deepEqual(query, { startAt: '0', maxResults: '100', expand: 'tab' });
+        return {
+          startAt: 0,
+          isLast: true,
+          values: Object.entries(screens).flatMap(([id, screen]) =>
+            Object.entries(screen.tabs)
+              .filter(([, fields]) => fields.includes(FIELD))
+              .map(([tab]) => ({ id: Number(id), name: screen.name, tab: { id: Number(tab) } })),
+          ),
+        };
+      default:
+        break;
+    }
+    const tabRoute = url.pathname.match(
+      /^\/rest\/api\/3\/screens\/(\d+)\/tabs(?:\/(\d+)\/fields(?:\/([^/]+))?)?$/,
+    );
+    if (tabRoute) {
+      const [, screen, tab, field] = tabRoute;
+      const tabs = screens[screen].tabs;
+      if (method === 'GET' && !tab) return Object.keys(tabs).map((id) => ({ id: Number(id) }));
+      if (method === 'GET' && !field) return tabs[tab].map((id) => ({ id, name: id }));
+      if (method === 'POST' && !field) {
+        tabs[tab].push(body.fieldId);
+        return { id: body.fieldId, name: 'Agent Prompts' };
+      }
+      if (method === 'DELETE' && field) {
+        tabs[tab].splice(tabs[tab].indexOf(decodeURIComponent(field)), 1);
+        return null;
+      }
+    }
+    switch (route) {
       case 'PUT /rest/api/3/issuetypescheme/5/issuetype':
         for (const id of body.issueTypeIds)
           project.issueTypes.push(types.find((type) => type.id === id));
@@ -94,7 +189,7 @@ function jira() {
       throw Error('Unexpected asApp actor');
     },
   };
-  return { api, writes, reads, project, types };
+  return { api, writes, reads, project, types, screens, screenSchemes, mapping };
 }
 
 function store() {
@@ -116,20 +211,29 @@ function store() {
         assert.equal(name, 'native-prompt-state');
         return { get: async (key) => structuredClone(records.get(key)) };
       },
-      transact: () => ({
-        set: (key, value, options) => ({
+      transact: () => {
+        // All operations commit together, and only when every condition holds.
+        const operations = [];
+        const transaction = {
+          set: (key, value, options) => (operations.push([key, value, options]), transaction),
+          delete: (key, options) => (operations.push([key, undefined, options]), transaction),
           execute: async () => {
-            assert.equal(options.entityName, 'native-prompt-state');
-            const [attribute, condition] = options.conditions.condition;
-            assert.equal(attribute, 'revision');
-            conditions.push([key, condition]);
-            const current = records.get(key);
-            if (condition === 'missing' ? current : current?.revision !== condition[1])
-              throw Error('conditional write failed');
-            records.set(key, structuredClone(value));
+            for (const [key, , options] of operations) {
+              assert.equal(options.entityName, 'native-prompt-state');
+              const [attribute, condition] = options.conditions.condition;
+              assert.equal(attribute, 'revision');
+              conditions.push([key, condition]);
+              const current = records.get(key);
+              if (condition === 'missing' ? current : current?.revision !== condition[1])
+                throw Error('conditional write failed');
+            }
+            for (const [key, value] of operations)
+              if (value === undefined) records.delete(key);
+              else records.set(key, structuredClone(value));
           },
-        }),
-      }),
+        };
+        return transaction;
+      },
     },
   };
 }
@@ -140,7 +244,13 @@ function harness() {
   const route = (strings, ...values) =>
     strings.reduce(
       (out, part, i) =>
-        out + part + (i < values.length ? encodeURIComponent(String(values[i])) : ''),
+        out +
+        part +
+        (i >= values.length
+          ? ''
+          : values[i] instanceof URLSearchParams
+            ? values[i].toString()
+            : encodeURIComponent(String(values[i]))),
       '',
     );
   class Resolver {
@@ -169,16 +279,25 @@ function harness() {
 
 test('configure, review, apply and finish through the resolvers creates one type and attaches it once', async () => {
   const h = harness();
+  // Opening the dialog reads the work types only; the space inventory is the health view's.
   const catalog = await h.call('configuration-catalog', {});
-  assert.deepEqual(
-    catalog.projects.map((p) => p.key),
-    ['ONE'],
-  );
   assert.deepEqual(
     catalog.types.map((t) => t.name),
     ['Task'],
   );
-  const input = { name: 'Prompt', refreshAfterSave: true };
+  assert.equal('projects' in catalog, false);
+  assert.deepEqual(h.site.reads, ['GET /rest/api/3/mypermissions', 'GET /rest/api/3/issuetype']);
+  // The Work types step reads only the space itself: the site and space permission checks, then
+  // the space. No work type, scheme or screen reads.
+  const optionReads = h.site.reads.length;
+  const options = await h.call('configuration-options', { projectId: '1' });
+  assert.deepEqual(options, { availableTypes: [{ id: '10', name: 'Task' }], screenTypes: [] });
+  assert.deepEqual(h.site.reads.slice(optionReads), [
+    'GET /rest/api/3/mypermissions',
+    'GET /rest/api/3/mypermissions',
+    'GET /rest/api/3/project/1',
+  ]);
+  const input = { name: 'Prompt', reloadAfterSave: 'on' };
   const preview = await h.call('configuration-preview', { projectId: '1', ...input });
   assert.equal(typeof preview.fingerprint, 'string');
   assert.deepEqual(h.site.writes, [], 'review never writes');
@@ -191,15 +310,33 @@ test('configure, review, apply and finish through the resolvers creates one type
   });
   assert.equal(started.data.status, 'ready');
   assert.equal(started.data.actor, 'admin');
-  assert.deepEqual(started.data.input, { name: 'Prompt', refreshAfterSave: true });
+  assert.deepEqual(started.data.input, { name: 'Prompt', reloadAfterSave: 'on' });
   assert.deepEqual(h.site.writes, [], 'starting the batch never writes Jira');
 
+  const readsBefore = h.site.reads.length;
   const finished = await h.call('configuration-advance', {
     id: started.data.id,
     revision: started.revision,
   });
   assert.equal(finished.data.status, 'complete');
   assert.equal(finished.data.entries[0].status, 'done');
+
+  // The step reviews the space once and applies from that review. Derived by hand: the review
+  // reads the space, its types, its scheme, and the new type's create screen with its tabs and
+  // fields once (no other screen is selected, so the field's screen list is not read); the
+  // apply path re-reads only the scheme (before creation, before attachment and after it) and
+  // the space after attachment.
+  const stepReads = h.site.reads.slice(readsBefore);
+  const count = (route) => stepReads.filter((r) => r === route).length;
+  const matching = (route) => stepReads.filter((r) => route.test(r)).length;
+  assert.equal(count('GET /rest/api/3/issuetype'), 1);
+  assert.equal(count('GET /rest/api/3/issuetypescreenscheme/project'), 1);
+  assert.equal(count('GET /rest/api/3/screens'), 1);
+  assert.equal(matching(/^GET \/rest\/api\/3\/screens\/\d+\/tabs$/), 1);
+  assert.equal(matching(/^GET \/rest\/api\/3\/screens\/\d+\/tabs\/\d+\/fields$/), 1);
+  assert.equal(count(`GET /rest/api/3/field/${FIELD}/screens`), 0);
+  assert.equal(count('GET /rest/api/3/project/1'), 2);
+  assert.equal(count('GET /rest/api/3/issuetypescheme/project'), 4);
 
   // Exactly one created type and one scheme addition, with the bodies Jira documents.
   assert.deepEqual(h.site.writes, [
@@ -240,7 +377,7 @@ test('configure, review, apply and finish through the resolvers creates one type
 
 test('a reviewed configuration that is stopped before it advances writes nothing to Jira', async () => {
   const h = harness();
-  const input = { type: '10', refreshAfterSave: false };
+  const input = { type: '10', reloadAfterSave: 'off' };
   const preview = await h.call('configuration-preview', { projectId: '1', ...input });
   const started = await h.call('configuration-start', {
     ...input,
@@ -265,7 +402,7 @@ test('a reviewed configuration that is stopped before it advances writes nothing
 
 test('a review whose facts changed before apply is refused without a Jira write', async () => {
   const h = harness();
-  const input = { name: 'Prompt' };
+  const input = { name: 'Prompt', reloadAfterSave: 'keep' };
   const preview = await h.call('configuration-preview', { projectId: '1', ...input });
   // A well-formed fingerprint from a review of different facts.
   const stale = preview.fingerprint.replace(/^./, (c) => (c === '0' ? '1' : '0'));
@@ -282,4 +419,234 @@ test('a review whose facts changed before apply is refused without a Jira write'
   assert.match(advanced.data.message, /changed after review/);
   assert.deepEqual(h.site.writes, []);
   assert.equal(h.kv.records.has('config-1'), false);
+});
+
+test('a field used by more than a thousand screens blocks the space after ten pages, before any write', async () => {
+  const h = harness();
+  h.site.mapping.push({ issueTypeId: '10', screenSchemeId: '41' });
+  const route = `GET /rest/api/3/field/${FIELD}/screens`;
+  const asUser = h.site.api.asUser;
+  // The field's screen list never reports its last page.
+  h.site.api.asUser = () => {
+    const actor = asUser();
+    return {
+      requestJira: async (path, options) => {
+        if (!path.startsWith(`/rest/api/3/field/${FIELD}/screens`))
+          return actor.requestJira(path, options);
+        h.site.reads.push(route);
+        const start = Number(new URL(`https://jira.invalid${path}`).searchParams.get('startAt'));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            startAt: start,
+            isLast: false,
+            values: Array.from({ length: 100 }, (_, i) => ({
+              id: 1000 + start + i,
+              name: 'Screen',
+              tab: { id: 1 },
+            })),
+          }),
+        };
+      },
+    };
+  };
+  // Like any screen blocker, the cap blocks the space on the Review step rather than failing it.
+  const preview = await h.call('configuration-preview', {
+    projectId: '1',
+    name: 'Prompt',
+    reloadAfterSave: 'keep',
+    screenTypes: ['10'],
+  });
+  assert.equal(preview.blocked, 'Too many screens use the Agent Prompts field to review at once.');
+  assert.equal(h.site.reads.filter((r) => r === route).length, 10);
+  assert.deepEqual(h.site.writes, []);
+});
+
+test('selected work types get the field on a shared screen with approval, and lose it on deselection', async () => {
+  const h = harness();
+  h.site.mapping.push({ issueTypeId: '10', screenSchemeId: '41' });
+  const input = { name: 'Prompt', reloadAfterSave: 'keep', screenTypes: ['10'] };
+  const preview = await h.call('configuration-preview', { projectId: '1', ...input });
+  assert.deepEqual(preview.availableTypes, [{ id: '10', name: 'Task' }]);
+  assert.deepEqual(
+    preview.screens.changes.map((ch) => [ch.action, ch.screen, ch.tab, ch.impact.shared]),
+    [['add', { id: '51', name: 'Task screen' }, '61', true]],
+  );
+  assert.deepEqual(
+    preview.screenProjects['51'].map((p) => p.key),
+    ['ONE', 'TWO'],
+  );
+  assert.deepEqual(h.site.writes, [], 'review never writes');
+  const entries = [{ projectId: '1', fingerprint: preview.fingerprint, screenTypes: ['10'] }];
+  let run = await h.call('configuration-start', {
+    name: 'Prompt',
+    reloadAfterSave: 'keep',
+    entries,
+    revision: 0,
+  });
+  run = await h.call('configuration-advance', { id: run.data.id, revision: run.revision });
+  assert.equal(run.data.status, 'stopped');
+  assert.match(run.data.message, /Confirm the shared screens/);
+  assert.deepEqual(h.site.writes, []);
+
+  run = await h.call('configuration-start', {
+    name: 'Prompt',
+    reloadAfterSave: 'keep',
+    allowSharedScreens: true,
+    entries,
+    revision: run.revision,
+  });
+  run = await h.call('configuration-advance', { id: run.data.id, revision: run.revision });
+  assert.equal(run.data.status, 'complete', run.data.message);
+  assert.deepEqual(h.site.writes.slice(2), [
+    {
+      route: 'POST /rest/api/3/screens/51/tabs/61/fields',
+      query: {},
+      body: { fieldId: FIELD },
+    },
+  ]);
+  assert.deepEqual(h.kv.records.get('screen-51'), {
+    revision: 1,
+    data: { field: FIELD, projects: ['1'] },
+  });
+  assert.deepEqual(h.kv.records.get('config-1').data.screenTypes, ['10']);
+  assert.deepEqual(h.kv.records.get('config-1').data.screens, ['51']);
+  const recorded = h.kv.conditions.filter(([key]) => key === 'screen-51');
+  assert.deepEqual(recorded, [['screen-51', 'missing']]);
+
+  const removal = await h.call('configuration-preview', {
+    projectId: '1',
+    type: '20',
+    reloadAfterSave: 'keep',
+    screenTypes: [],
+  });
+  assert.deepEqual(
+    removal.screens.changes.map((ch) => [ch.action, ch.screen.id, ch.tab]),
+    [['remove', '51', '61']],
+  );
+  const before = h.kv.records.get('config-1').revision;
+  run = await h.call('configuration-start', {
+    type: '20',
+    reloadAfterSave: 'keep',
+    allowSharedScreens: true,
+    entries: [{ projectId: '1', fingerprint: removal.fingerprint, screenTypes: [] }],
+    revision: run.revision,
+  });
+  run = await h.call('configuration-advance', { id: run.data.id, revision: run.revision });
+  assert.equal(run.data.status, 'complete', run.data.message);
+  assert.deepEqual(h.site.writes.slice(3), [
+    {
+      route: `DELETE /rest/api/3/screens/51/tabs/61/fields/${FIELD}`,
+      query: {},
+      body: undefined,
+    },
+  ]);
+  assert.equal(h.kv.records.has('screen-51'), false);
+  // The removal is recorded with the space's setup in one transaction, then the setup is saved.
+  assert.deepEqual(h.kv.conditions.filter(([key]) => key !== 'configuration-batch').slice(-3), [
+    ['config-1', ['equal', before]],
+    ['screen-51', ['equal', 1]],
+    ['config-1', ['equal', before + 1]],
+  ]);
+  assert.equal(h.kv.records.get('config-1').data.screenTypes, undefined);
+});
+
+test('the reload choice keeps, sets or clears each space’s saved preference', async () => {
+  // Expected stored preference after configuring a space whose saved value is on, off or unset.
+  const cases = [
+    ['keep', true, true],
+    ['keep', false, false],
+    ['keep', undefined, undefined],
+    ['on', false, true],
+    ['on', undefined, true],
+    ['off', true, false],
+    ['off', undefined, false],
+  ];
+  for (const [reloadAfterSave, saved, expected] of cases) {
+    const h = harness();
+    h.kv.records.set('config-1', {
+      revision: 1,
+      data: { type: '10', ...(saved === undefined ? {} : { refreshAfterSave: saved }) },
+    });
+    const input = { type: '10', reloadAfterSave };
+    const preview = await h.call('configuration-preview', { projectId: '1', ...input });
+    let run = await h.call('configuration-start', {
+      ...input,
+      entries: [{ projectId: '1', fingerprint: preview.fingerprint }],
+      revision: 0,
+    });
+    run = await h.call('configuration-advance', { id: run.data.id, revision: run.revision });
+    assert.equal(run.data.status, 'complete', run.data.message);
+    const data = h.kv.records.get('config-1').data;
+    assert.equal(data.type, '10');
+    assert.equal(data.refreshAfterSave, expected, `${reloadAfterSave} from ${saved}`);
+    assert.equal('refreshAfterSave' in data, expected !== undefined);
+    assert.deepEqual(h.site.writes, []);
+  }
+});
+
+test('a missing or unknown reload choice is refused before any Jira request', async () => {
+  for (const reloadAfterSave of [undefined, true, false, 'yes', 'Keep', null]) {
+    const h = harness();
+    const input = {
+      type: '10',
+      ...(reloadAfterSave === undefined ? {} : { reloadAfterSave }),
+    };
+    for (const [name, payload] of [
+      ['configuration-preview', { projectId: '1', ...input }],
+      [
+        'configuration-start',
+        { ...input, entries: [{ projectId: '1', fingerprint: 'a'.repeat(64) }], revision: 0 },
+      ],
+    ]) {
+      const result = await h.resolvers[name]({ context, payload });
+      assert.deepEqual(result, { ok: false, error: 'Invalid display preference.' }, name);
+    }
+    assert.deepEqual(h.site.reads, []);
+    assert.deepEqual(h.site.writes, []);
+    assert.deepEqual(h.kv.conditions, []);
+  }
+  // The retired boolean field is not accepted under either name.
+  const h = harness();
+  const result = await h.resolvers['configuration-preview']({
+    context,
+    payload: { projectId: '1', type: '10', refreshAfterSave: true },
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(h.site.reads, []);
+});
+
+test('a configuration run saved with the retired reload option stops without a change', async () => {
+  const h = harness();
+  h.kv.records.set('config-1', { revision: 1, data: { type: '10', refreshAfterSave: true } });
+  const preview = await h.call('configuration-preview', {
+    projectId: '1',
+    type: '10',
+    reloadAfterSave: 'off',
+  });
+  // A run saved by an earlier version, which stored the reload option as a boolean.
+  h.kv.records.set('configuration-batch', {
+    revision: 1,
+    data: {
+      id: 'earlier',
+      actor: 'admin',
+      input: { type: '10', refreshAfterSave: false },
+      entries: [{ projectId: '1', fingerprint: preview.fingerprint, status: 'waiting' }],
+      index: 0,
+      status: 'ready',
+      started: Date.now(),
+    },
+  });
+  const run = await h.call('configuration-advance', { id: 'earlier', revision: 1 });
+  assert.equal(run.data.status, 'stopped');
+  assert.match(
+    run.data.message,
+    /^Nothing was changed for this space: Invalid display preference\./,
+  );
+  assert.deepEqual(h.site.writes, []);
+  assert.deepEqual(h.kv.records.get('config-1'), {
+    revision: 1,
+    data: { type: '10', refreshAfterSave: true },
+  });
 });

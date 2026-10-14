@@ -15,6 +15,7 @@ import {
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
 import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
+import { reviewConfiguration } from './support/configuration-dialog.mjs';
 test.use({ fixtureApp: agentPromptsFixture });
 test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
   test.skip(
@@ -66,12 +67,10 @@ for (const blank of [false, true]) {
   });
 }
 
+/** Opens the space or global page, checks the owned space and returns its health. */
 async function configuration(page, owned, global = false) {
   const t = installation('agent-prompts');
-  if (global)
-    await page.goto(
-      `${activeTarget().site}/jira/settings/apps/configure/${t.appId}/${t.environmentId}`,
-    );
+  if (global) await globalConfiguration(page, t);
   else await spaceSettings(page, owned.project.key);
   await expect(page.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled({
     timeout: 60000,
@@ -86,6 +85,18 @@ async function configuration(page, owned, global = false) {
     owned.project.id,
   );
   return health;
+}
+/** Opens the global configuration page and returns the space inventory it loads. */
+function globalConfiguration(page, t) {
+  return observeAction(
+    page,
+    'settings-projects',
+    () =>
+      page.goto(
+        `${activeTarget().site}/jira/settings/apps/configure/${t.appId}/${t.environmentId}`,
+      ),
+    t,
+  );
 }
 async function details(page, key) {
   await page
@@ -107,12 +118,7 @@ test('NPL-02 selected space health and cancelled modal preserve Jira', async ({ 
     page.getByRole('heading', { name: 'Jira configuration', exact: true }),
   ).toBeVisible();
   await page.getByRole('button', { name: 'Reconfigure space', exact: true }).click();
-  const plan = await observeAction(
-    page,
-    'configuration-preview',
-    () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
-    t,
-  );
+  const plan = await reviewConfiguration(page, t);
   expect(plan.type).toBe(health.state.data.type);
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
@@ -157,8 +163,14 @@ test('NPL-11 details modal keeps focus, contrast and layout in dark theme and na
     await page.setViewportSize({ width: 1440, height: 1100 });
     await theme(name);
     await page.setViewportSize(viewport);
-    await configuration(page, owned);
-    await expect(page.locator('html')).toHaveAttribute('data-color-mode', name.toLowerCase());
+    // Jira applies a new theme at once but saves it a moment later; a page loaded before the
+    // save still renders the old theme, so load the space settings again until it applies.
+    await expect(async () => {
+      await configuration(page, owned);
+      await expect(page.locator('html')).toHaveAttribute('data-color-mode', name.toLowerCase(), {
+        timeout: 5000,
+      });
+    }).toPass({ timeout: 90000 });
     await viewDetails.click();
     await expect(
       dialog.getByRole('heading', { name: 'Jira configuration', exact: true }),
@@ -223,18 +235,31 @@ test('NPL-05 unified global configuration checks selected spaces and selects acr
       /* non app traffic */
     }
   });
-  await configuration(page, owned, true);
+  const inventory = await globalConfiguration(page, t);
+  expect(inventory.incomplete).toBe(false);
   const search = page.getByRole('textbox', { name: 'Find a space', exact: true });
+  await expect(search).toBeEnabled({ timeout: 60000 });
+  await search.fill(owned.project.key);
+  await page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }).click();
+  await observeAction(
+    page,
+    'settings-health',
+    () => page.getByRole('button', { name: 'Check selected', exact: true }).click(),
+    t,
+    owned.project.id,
+  );
   await search.fill('');
   const all = page.getByRole('checkbox', { name: 'Select all matching spaces', exact: true });
   await all.click();
   await expect(all).toBeChecked();
-  const inventory = await observeAction(
+  const catalog = await observeAction(
     page,
     'configuration-catalog',
     () => page.getByRole('button', { name: 'Configure selected', exact: true }).click(),
     t,
   );
+  expect(catalog.typesAvailable).toBe(true);
+  expect('projects' in catalog).toBe(false);
   await expect(
     page.getByRole('heading', {
       name: `Configure ${inventory.projects.length} spaces`,
@@ -409,20 +434,30 @@ test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-on
     .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
     .locator('..')
     .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  let loaded;
   const open = async () => {
     await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
-    await observeAction(page, 'load', () => readView.click({ position: { x: 2, y: 2 } }), t);
+    loaded = await observeAction(
+      page,
+      'load',
+      () => readView.click({ position: { x: 2, y: 2 } }),
+      t,
+    );
     await expect(
       editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
     ).toBeEnabled();
   };
-  const save = () =>
-    observeAction(
-      page,
-      'save',
-      () => editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
-      t,
-    );
+  const save = async () => {
+    const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
+    // With the space's reload preference on, navigation can discard the resolver body; the Jira
+    // assertions after each save are the oracle.
+    if (loaded.refreshAfterSave)
+      await Promise.all([
+        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+        click(),
+      ]);
+    else await observeAction(page, 'save', click, t);
+  };
   await open();
   const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
   await observeAction(page, 'search', () => combo.fill(sourceIssue.key), t);

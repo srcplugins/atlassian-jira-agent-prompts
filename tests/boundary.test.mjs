@@ -1,4 +1,4 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const { createPorts, registerResolvers } = await import('../src/integration.ts');
@@ -910,4 +910,366 @@ test('one request reads a space settings record once, and a storage failure is a
       assert.equal(error.message, 'App storage is unavailable. Try again shortly.');
       return true;
     });
+});
+test('create fields are read past 200 a page and reported incomplete past 1,000', async () => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  const page = (start, total, ids) => ({
+    expect: {
+      method: 'GET',
+      path: `/rest/api/3/issue/createmeta/1/issuetypes/20?startAt=${start}&maxResults=200`,
+    },
+    body: { startAt: start, maxResults: 200, total, fields: ids.map((fieldId) => ({ fieldId })) },
+  });
+  const custom = (from, n) => Array.from({ length: n }, (_, i) => `customfield_${from + i}`);
+  let s = sdk(
+    page(0, 202, ['summary', ...custom(0, 199)]),
+    page(200, 202, ['description', 'customfield_999']),
+  );
+  const fields = await createSettingsPorts(s).createFields('1', '20');
+  assert.equal(fields.length, 202);
+  assert.ok(fields.includes('summary') && fields.includes('description'));
+  s.assertDrained();
+
+  s = sdk(...Array.from({ length: 5 }, (_, n) => page(n * 200, 1001, custom(n * 200, 200))));
+  await assert.rejects(
+    createSettingsPorts(s).createFields('1', '20'),
+    /Create fields are incomplete/,
+  );
+  s.assertDrained();
+
+  // A page shorter than Jira promised is not a complete list.
+  s = sdk(page(0, 300, ['summary']), page(1, 300, []));
+  await assert.rejects(
+    createSettingsPorts(s).createFields('1', '20'),
+    /Create fields are incomplete/,
+  );
+  s.assertDrained();
+});
+test('screen field writes classify documented rejections and keep other failures uncertain', async () => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  for (const [operation, status, rejected] of [
+    ['add', 400, true],
+    ['add', 404, true],
+    ['add', 429, true],
+    ['add', 500, false],
+    ['remove', 403, true],
+    ['remove', 409, false],
+    ['remove', 503, false],
+  ]) {
+    const s = sdk({ status, body: { errorMessages: ['PRIVATE'] } });
+    const ports = createSettingsPorts(s);
+    await assert.rejects(
+      operation === 'add'
+        ? ports.addScreenField('51', '61', 'customfield_1')
+        : ports.removeScreenField('51', '61', 'customfield_1'),
+      (error) => {
+        assert.equal(error instanceof JiraRejected, rejected, `${operation} ${status}`);
+        assert.doesNotMatch(error.message, /PRIVATE/);
+        return true;
+      },
+    );
+    assert.deepEqual(
+      s.calls.map((c) => [c.actor, c.method, c.path]),
+      [
+        operation === 'add'
+          ? ['asUser', 'POST', '/rest/api/3/screens/51/tabs/61/fields']
+          : ['asUser', 'DELETE', '/rest/api/3/screens/51/tabs/61/fields/customfield_1'],
+      ],
+    );
+    if (operation === 'add')
+      assert.deepEqual(JSON.parse(s.calls[0].body), { fieldId: 'customfield_1' });
+  }
+});
+test('screen adapter resolves a work type’s screens through the space’s complete screen scheme', async () => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  const assigned = {
+    isLast: true,
+    values: [{ issueTypeScreenScheme: { id: '30' }, projectIds: ['1'] }],
+  };
+  const row = (issueTypeId, screenSchemeId) => ({
+    issueTypeId,
+    screenSchemeId,
+    issueTypeScreenSchemeId: '30',
+  });
+  const mapping = {
+    body: { startAt: 0, isLast: true, values: [row('default', '40'), row('10', '41')] },
+  };
+  // Every chosen screen scheme is read in one request.
+  const s = sdk({ body: assigned }, mapping, {
+    body: {
+      isLast: true,
+      values: [
+        { id: 41, screens: { default: 50, edit: 51 } },
+        { id: 40, screens: { default: 52 } },
+      ],
+    },
+  });
+  assert.deepEqual(
+    await createSettingsPorts(s).screenUses('1', [
+      { type: '10', op: 'edit' },
+      { type: '10', op: 'view' },
+      { type: '11', op: 'create' },
+    ]),
+    ['51', '50', '52'],
+  );
+  assert.deepEqual(
+    s.calls.map((c) => c.path),
+    [
+      '/rest/api/3/issuetypescreenscheme/project?projectId=1',
+      '/rest/api/3/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=30&startAt=0&maxResults=100',
+      '/rest/api/3/screenscheme?id=41&id=40&maxResults=100',
+    ],
+  );
+  // A screen scheme missing from the answer, or one not asked for, is refused.
+  for (const values of [
+    [{ id: 41, screens: { default: 50 } }],
+    [
+      { id: 41, screens: { default: 50 } },
+      { id: 42, screens: { default: 52 } },
+    ],
+  ]) {
+    const partial = sdk({ body: assigned }, mapping, { body: { isLast: true, values } });
+    await assert.rejects(
+      createSettingsPorts(partial).screenUses('1', [
+        { type: '10', op: 'edit' },
+        { type: '11', op: 'edit' },
+      ]),
+      /screen scheme could not be read/,
+    );
+  }
+  // A duplicated row or another scheme's row is inconsistent, never guessed.
+  const duplicate = sdk(
+    { body: assigned },
+    { body: { startAt: 0, isLast: true, values: [row('10', '41'), row('10', '42')] } },
+  );
+  await assert.rejects(
+    createSettingsPorts(duplicate).screenUses('1', [{ type: '10', op: 'edit' }]),
+    /inconsistent/,
+  );
+  const unassigned = sdk({
+    body: { isLast: true, values: [{ issueTypeScreenScheme: { id: '30' }, projectIds: ['2'] }] },
+  });
+  await assert.rejects(
+    createSettingsPorts(unassigned).screenUses('1', [{ op: 'edit' }]),
+    /screen scheme/,
+  );
+});
+test('screen reads name screens in bulk, place the field from one read and read tabs only when needed', async () => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  const get = (path, body) => ({ expect: { method: 'GET', path: `/rest/api/3/${path}` }, body });
+  const placed = (start, isLast, values) =>
+    get(`field/customfield_1/screens?startAt=${start}&maxResults=100&expand=tab`, {
+      startAt: start,
+      isLast,
+      values,
+    });
+  // 50 was deleted in Jira; 51 has the field; 52 is read in full; 53 lacks the field.
+  const s = sdk(
+    get('screens?id=50&id=51&id=52&id=53&maxResults=100', {
+      isLast: true,
+      values: [
+        { id: 51, name: 'Task screen' },
+        { id: 52, name: 'Create screen' },
+        { id: 53, name: 'Bug screen' },
+      ],
+    }),
+    placed(0, false, [{ id: 51, name: 'Task screen', tab: { id: 62, name: 'Field Tab' } }]),
+    placed(1, true, [{ id: 52, name: 'Create screen', tab: { id: 63 } }]),
+    get('screens/52/tabs', [{ id: 63 }, { id: 64 }]),
+    get('screens/53/tabs', [{ id: 65 }]),
+    get('screens/52/tabs/63/fields', [{ id: 'summary' }, { id: 'customfield_1' }]),
+    get('screens/52/tabs/64/fields', [{ id: 'description' }]),
+  );
+  assert.deepEqual(
+    await createSettingsPorts(s).screens(['50', '51', '52', '53'], 'customfield_1', ['52']),
+    [
+      undefined,
+      { id: '51', name: 'Task screen', tabs: [{ id: '62', fields: ['customfield_1'] }] },
+      {
+        id: '52',
+        name: 'Create screen',
+        tabs: [
+          { id: '63', fields: ['summary', 'customfield_1'] },
+          { id: '64', fields: ['description'] },
+        ],
+      },
+      { id: '53', name: 'Bug screen', tabs: [{ id: '65', fields: [] }] },
+    ],
+  );
+  s.assertDrained();
+
+  // More than 100 screens are named 100 at a time; when every screen is read in full, where the
+  // field sits is not read.
+  const ids = Array.from({ length: 101 }, (_, i) => String(i + 1));
+  const named = (chunk) =>
+    get(`screens?${chunk.map((id) => `id=${id}`).join('&')}&maxResults=100`, {
+      isLast: true,
+      values: chunk.map((id) => ({ id: Number(id), name: `Screen ${id}` })),
+    });
+  const bulk = sdk(
+    named(ids.slice(0, 100)),
+    named(ids.slice(100)),
+    ...ids.map((id) => get(`screens/${id}/tabs`, [])),
+  );
+  const all = await createSettingsPorts(bulk).screens(ids, '', ids);
+  assert.deepEqual(all.at(-1), { id: '101', name: 'Screen 101', tabs: [] });
+  bulk.assertDrained();
+
+  // A placement without its tab, or a malformed field ID, is refused.
+  await assert.rejects(
+    createSettingsPorts(
+      sdk(
+        get('screens?id=51&maxResults=100', { isLast: true, values: [{ id: 51, name: 'A' }] }),
+        placed(0, true, [{ id: 51 }]),
+      ),
+    ).screens(['51'], 'customfield_1'),
+    /Agent Prompts field could not be read/,
+  );
+  await assert.rejects(
+    createSettingsPorts(
+      sdk(get('screens?id=51&maxResults=100', { isLast: true, values: [{ id: 51, name: 'A' }] })),
+    ).screens(['51'], 'summary'),
+    /Invalid prompt field/,
+  );
+});
+test('screen impact lists every screen scheme with its users, then reads the spaces of matching ones', async () => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  const get = (path, body) => ({ expect: { method: 'GET', path: `/rest/api/3/${path}` }, body });
+  const listPage = (start, isLast, values, total) =>
+    get(`screenscheme?startAt=${start}&maxResults=100&expand=issueTypeScreenSchemes`, {
+      startAt: start,
+      isLast,
+      values,
+      ...(total === undefined ? {} : { total }),
+    });
+  const users = (...ids) => ({ isLast: true, values: ids.map((id) => ({ id })) });
+  const spaces = (itss, ...values) =>
+    get(`issuetypescreenscheme/${itss}/project?startAt=0&maxResults=100`, {
+      startAt: 0,
+      isLast: true,
+      values,
+    });
+  // Jira omits the expansion for a screen scheme no work type screen scheme uses (43).
+  const list = listPage(0, true, [
+    { id: 40, screens: { default: 51 }, issueTypeScreenSchemes: users('30') },
+    { id: 43, screens: { edit: 51, default: 52 } },
+    { id: 44, screens: { default: 99 }, issueTypeScreenSchemes: users('31') },
+  ]);
+  let s = sdk(list, spaces(30, { id: '2', key: 'TWO' }, { id: '1', key: 'ONE' }));
+  const ports = createSettingsPorts(s);
+  const expected = {
+    projects: [
+      { id: '1', key: 'ONE' },
+      { id: '2', key: 'TWO' },
+    ],
+    complete: true,
+  };
+  assert.deepEqual(await ports.screenImpact('51'), expected);
+  // The list and each work type screen scheme's spaces are read once per request.
+  assert.deepEqual(await ports.screenImpact('51'), expected);
+  s.assertDrained();
+
+  // A partial expansion falls back to the full mapping, read once.
+  s = sdk(
+    listPage(0, true, [
+      {
+        id: 40,
+        screens: { default: 51 },
+        issueTypeScreenSchemes: { isLast: false, values: [{ id: '30' }] },
+      },
+      { id: 43, screens: { edit: 51 } },
+    ]),
+    get('issuetypescreenscheme/mapping?startAt=0&maxResults=100', {
+      startAt: 0,
+      isLast: true,
+      values: [
+        { issueTypeId: 'default', issueTypeScreenSchemeId: '30', screenSchemeId: '40' },
+        { issueTypeId: '10', issueTypeScreenSchemeId: '31', screenSchemeId: '40' },
+        { issueTypeId: 'default', issueTypeScreenSchemeId: '32', screenSchemeId: '44' },
+      ],
+    }),
+    spaces(30, { id: '1', key: 'ONE' }),
+    spaces(31, { id: '3', key: 'THREE' }),
+  );
+  assert.deepEqual(
+    (await createSettingsPorts(s).screenImpact('51')).projects.map((p) => p.key),
+    ['ONE', 'THREE'],
+  );
+  s.assertDrained();
+
+  // With a total, the remaining pages are read together; a scheme added meanwhile is read after.
+  const schemes = (from, count, used = {}) =>
+    Array.from({ length: count }, (_, i) => ({
+      id: from + i,
+      screens: { default: 1000 + from + i },
+      issueTypeScreenSchemes: users(...(used[from + i] ?? [])),
+    }));
+  s = sdk(
+    listPage(0, false, schemes(1, 100), 250),
+    listPage(100, false, schemes(101, 100)),
+    listPage(200, false, schemes(201, 50, { 240: ['30'] })),
+    listPage(250, true, [
+      { id: 251, screens: { default: 1240 }, issueTypeScreenSchemes: users('31') },
+    ]),
+    spaces(30, { id: '1', key: 'ONE' }),
+    spaces(31, { id: '3', key: 'THREE' }),
+  );
+  assert.deepEqual(await createSettingsPorts(s).screenImpact('1240'), {
+    projects: [
+      { id: '1', key: 'ONE' },
+      { id: '3', key: 'THREE' },
+    ],
+    complete: true,
+  });
+  s.assertDrained();
+  // Without a total, pages are read one after another.
+  s = sdk(
+    listPage(0, false, schemes(1, 100)),
+    listPage(100, true, schemes(101, 1, { 101: ['30'] })),
+    spaces(30, { id: '1', key: 'ONE' }),
+  );
+  assert.equal((await createSettingsPorts(s).screenImpact('1101')).complete, true);
+  s.assertDrained();
+
+  // More than one page of spaces per work type screen scheme is read; past ten it is incomplete.
+  const page = (start, isLast) =>
+    get(`issuetypescreenscheme/30/project?startAt=${start}&maxResults=100`, {
+      startAt: start,
+      isLast,
+      values: Array.from({ length: 100 }, (_, i) => ({ id: String(start + i + 1) })),
+    });
+  s = sdk(list, ...Array.from({ length: 10 }, (_, i) => page(i * 100, false)));
+  const many = await createSettingsPorts(s).screenImpact('51');
+  assert.deepEqual([many.projects.length, many.complete, many.timedOut], [1000, false, undefined]);
+
+  s = sdk(list, { body: { startAt: 0, isLast: false, values: [] } });
+  await assert.rejects(createSettingsPorts(s).screenImpact('51'), /could not be read completely/);
+});
+test('screen impact reads stop after twelve seconds of the request and report the timeout', async (t) => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  let now = 1_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const s = sdk({
+    expect: {
+      method: 'GET',
+      path: '/rest/api/3/screenscheme?startAt=0&maxResults=100&expand=issueTypeScreenSchemes',
+    },
+    body: { startAt: 0, isLast: false, total: 300, values: [{ id: 40, screens: { default: 51 } }] },
+  });
+  const asUser = s.api.asUser;
+  s.api.asUser = () => {
+    const user = asUser();
+    return {
+      requestJira: (...args) => {
+        now += 12_001;
+        return user.requestJira(...args);
+      },
+    };
+  };
+  const ports = createSettingsPorts(s);
+  assert.equal(ports.timeLeft(), 22_000);
+  const result = await ports.screenImpact('51');
+  assert.deepEqual(result, { projects: [], complete: false, timedOut: true });
+  assert.equal(ports.timeLeft(), 9_999);
+  s.assertDrained();
 });

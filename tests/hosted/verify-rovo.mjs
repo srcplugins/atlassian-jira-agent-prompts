@@ -7,12 +7,12 @@ import {
   allIssues,
   openRun,
   installation,
-  expect,
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { openRovoChat, askRovo } from '@srcplugins/atlassian-forge-test-framework/browser';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { runRovoJourney } from './support/agent-prompts-rovo.mjs';
+import { expect } from './support/expect.mjs';
 import { agentPromptsFixture } from './support/fixture.mjs';
 import { spaceSettings } from './support/space-settings.mjs';
 assert.equal(process.env.NATIVE_ROVO_TESTS, '1', 'Explicit supervised Rovo mode required');

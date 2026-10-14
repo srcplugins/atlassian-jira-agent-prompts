@@ -1,9 +1,10 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { createService, JiraRejected, UserError } = await import('../src/service.ts');
+const { createService, JiraRejected, UserError, limited } = await import('../src/service.ts');
 const { sourceContent } = await import('../src/prompt-text.ts');
 const { createSettings } = await import('../src/settings.ts');
+const { screenFixture } = await import('./screen-fixture.mjs');
 const doc = (text) => ({
   type: 'doc',
   version: 1,
@@ -262,9 +263,9 @@ test('changing setup to a type whose prompts are selected permits only cleanup w
     },
     types: async () => types,
     scheme: async () => ({ id: '9', name: 'Dedicated', isDefault: false, projectIds: ['1'] }),
-    impact: async () => ({ keys: ['TEST-10'], incomplete: false }),
     create: async () => assert.fail('existing type must not be created'),
     attach: async () => assert.fail('associated type must not be attached again'),
+    ...screenFixture(() => ['1']).ports,
   });
   await settings.apply(c, { ...(await settings.preview(c, { type: '2' })), type: '2' });
   assert.equal(config.data.type, '2');
@@ -471,4 +472,17 @@ test('initial suggestions use one ten-summary search without fetching source bod
   await f.service.search(c, { query: '' });
   assert.deepEqual(searches[1].query, { query: '', limit: 10 });
   assert.equal(f.calls(), 0);
+});
+test('limited runs at most four reads at once and keeps their order', async () => {
+  let running = 0;
+  let most = 0;
+  const out = await limited([5, 1, 4, 2, 3, 0, 6], async (ms) => {
+    most = Math.max(most, ++running);
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    running--;
+    return ms * 10;
+  });
+  assert.deepEqual(out, [50, 10, 40, 20, 30, 0, 60]);
+  assert.equal(most, 4);
+  assert.deepEqual(await limited([], async () => 1), []);
 });

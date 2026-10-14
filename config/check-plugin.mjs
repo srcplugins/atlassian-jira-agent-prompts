@@ -8,7 +8,8 @@ import { parseDocument } from 'yaml';
 // Self-contained so standalone plugin repositories can run it in their own CI (synchronized
 // to config/check-plugin.mjs).
 
-export const requiredSections = ['Usage', 'Permissions', 'Data', 'Rovo control'];
+// Usage and Rovo control may live on the plugin's website page instead (Forge README rules).
+export const requiredSections = ['Permissions', 'Data'];
 
 /**
  * Manifest defaults every Forge app must keep unless an explicit review says otherwise.
@@ -108,10 +109,102 @@ export function readmeFindings(appDir) {
       errors.push('README.md: scope table must match manifest scopes exactly');
     for (const row of documented)
       if (row[2].trim().length < 20) errors.push(`README.md: explain why ${row[1]} is required`);
+    // A plugin that can write must say what it changes in the host, not only which scopes it holds.
+    const changes = /^## Changes to [A-Z]\w*\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(text);
+    if (
+      expected.some((scope) => /^(?:write|manage|delete):/.test(scope)) &&
+      !(changes?.[1].trim().length >= 20)
+    )
+      errors.push(
+        'README.md: missing or empty "## Changes to <host>": a plugin with write or manage scopes lists what it changes, when and what removal undoes',
+      );
   } catch (error) {
     errors.push(`manifest.yml: ${error.message}`);
   }
   return errors;
+}
+
+// Public prose uses Jira Cloud's current terms: work item, work type and space. Code spans name
+// identifiers, link targets are URLs, and bold or double-quoted text quotes a host label exactly
+// (even one that still uses an old word), so none of those count.
+const oldHostTerm = /\b(issues?|projects?|tickets?)\b/i;
+const visibleWords = (text) =>
+  text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/`[^`\n]*`/g, '')
+    .replace(/\]\([^)]*\)/g, ']')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\*\*[^*\n]*\*\*|"[^"\n]*"|“[^”\n]*”/g, '');
+const visibleKeys = new Set([
+  'title',
+  'name',
+  'description',
+  'prompt',
+  'label',
+  'conversationStarters',
+]);
+/** User-visible manifest strings as [path, text] pairs. */
+const manifestText = (node, path = 'modules', visible = false) =>
+  typeof node === 'string'
+    ? visible
+      ? [[path, node]]
+      : []
+    : Array.isArray(node)
+      ? node.flatMap((item, i) => manifestText(item, `${path}.${item?.key ?? i}`, visible))
+      : node && typeof node === 'object'
+        ? Object.entries(node).flatMap(([key, value]) =>
+            manifestText(value, `${path}.${key}`, visibleKeys.has(key)),
+          )
+        : [];
+export function hostTermFindings(appDir) {
+  const findings = [];
+  const readme = join(appDir, 'README.md');
+  if (existsSync(readme))
+    prose(readFileSync(readme, 'utf8'))
+      .split('\n')
+      .forEach((line, i) => {
+        const term = oldHostTerm.exec(visibleWords(line))?.[1];
+        if (term) findings.push(`README.md:${i + 1}: "${term}" is an old Jira term`);
+      });
+  const modules = parseDocument(readFileSync(join(appDir, 'manifest.yml'), 'utf8')).toJS()?.modules;
+  for (const [path, text] of manifestText(modules ?? {})) {
+    const term = oldHostTerm.exec(visibleWords(text))?.[1];
+    if (term) findings.push(`manifest.yml ${path}: "${term}" is an old Jira term`);
+  }
+  return findings.map(
+    (finding) =>
+      `${finding}; use work item, work type or space (quote a host label in bold or double quotes)`,
+  );
+}
+
+// Before 1.0.0 the only installs are on owned sites, so compatibility code protects nobody:
+// rename and remove outright, and reinstall owned sites (scope-and-hygiene.md). Shared files serve
+// released plugins too and are checked in dev-platform.
+const compatWording =
+  /\b(legacy|backwards?|compat(?:ible|ibility)?|migrat\w*|(?:older|installed|previous) (?:versions?|builds?|installs?)|predates|permanent (?:key|id))\b/i;
+export function compatFindings(appDir) {
+  const version = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')).version ?? '0';
+  if (Number(version.split('.')[0]) >= 1 || !existsSync(join(appDir, 'src'))) return [];
+  const findings = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(join(appDir, directory), { withFileTypes: true })) {
+      const file = `${directory}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (file !== 'src/shared') visit(file);
+      } else if (/\.[cm]?[jt]sx?$/.test(entry.name))
+        readFileSync(join(appDir, file), 'utf8')
+          .split('\n')
+          .forEach((line, i) => {
+            const word = compatWording.exec(line)?.[1];
+            if (word)
+              findings.push(
+                `${file}:${i + 1}: "${word}" suggests compatibility code, which a plugin before 1.0.0 doesn't need; remove it or reword the comment`,
+              );
+          });
+    }
+  };
+  visit('src');
+  return findings;
 }
 
 // Custom UI must follow the host theme: colours come from ADS tokens (raw values only as token
@@ -295,6 +388,8 @@ export function pluginFindings(appDir) {
     ),
     ...dependencyPinFindings(JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8'))),
     ...readmeFindings(appDir),
+    ...hostTermFindings(appDir),
+    ...compatFindings(appDir),
     ...themeFindings(appDir),
     ...handlerFindings(appDir),
     ...bundleHostFindings(appDir),
@@ -308,6 +403,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (findings.length) process.exitCode = 1;
   else
     console.log(
-      'Manifest defaults and handlers, exact pins, README structure, theme rules, bundle hosts and public-repository rules passed.',
+      'Manifest defaults and handlers, exact pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts and public-repository rules passed.',
     );
 }

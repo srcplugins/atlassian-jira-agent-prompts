@@ -1,4 +1,4 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { forgeContract } from './support/forge-contract.mjs';
@@ -44,6 +44,7 @@ test('the resolver set is exactly the supported surface', () => {
     'configuration-advance',
     'configuration-cancel-interrupted',
     'configuration-catalog',
+    'configuration-options',
     'configuration-preview',
     'configuration-start',
     'configuration-status',
@@ -102,10 +103,18 @@ const valid = {
   'configuration-catalog': {},
   'configuration-status': {},
   'configuration-cancel-interrupted': {},
-  'configuration-preview': { projectId: '1', type: '3' },
+  'configuration-options': { projectId: '1' },
+  'configuration-preview': {
+    projectId: '1',
+    type: '3',
+    reloadAfterSave: 'keep',
+    screenTypes: ['4'],
+  },
   'configuration-start': {
     type: '3',
-    entries: [{ projectId: '1', fingerprint: 'x' }],
+    reloadAfterSave: 'keep',
+    allowSharedScreens: true,
+    entries: [{ projectId: '1', fingerprint: 'x', screenTypes: ['4'] }],
     revision: 0,
   },
   'configuration-advance': { id: 'x', revision: 0 },

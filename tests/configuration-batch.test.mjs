@@ -1,9 +1,10 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { batchFixture as fixture } from './batch-fixture.mjs';
 const { UserError, JiraRejected, JiraUnavailable, StorageUnavailable } =
   await import('../src/service.ts');
+const { createSettings } = await import('../src/settings.ts');
 test('configuration creates one global type for the exact reviewed spaces and can later reuse it', async () => {
   const f = fixture();
   let r = await f.start();
@@ -291,7 +292,10 @@ test('expired running and uncertain attempts cancel without clearing space safet
     assert.equal(stopped.data.inspectProject, '1');
     assert.deepEqual(f.configs.get('1'), pending);
     assert.deepEqual(f.writes, ['create']);
-    await assert.rejects(f.api.preview('admin', '1', { type: '3' }), /earlier configuration/);
+    await assert.rejects(
+      f.api.preview('admin', '1', { type: '3', reloadAfterSave: 'keep' }),
+      /earlier configuration/,
+    );
     assert.equal((await f.start({ type: '3' }, ['2'])).data.status, 'ready');
   }
 });
@@ -379,16 +383,23 @@ test('interrupted bulk setup removal retains completed removals and leaves remai
 
 test('bulk options reject invalid combinations and changed preferences invalidate review', async () => {
   const f = fixture();
-  for (const input of [
-    { unlink: true, type: '3' },
-    { unlink: true, refreshAfterSave: true },
-    { type: '3', refreshAfterSave: 'yes' },
+  for (const [input, error] of [
+    [{ unlink: true, type: '3' }, /Removing setup/],
+    [{ unlink: true, reloadAfterSave: 'keep' }, /Removing setup/],
+    [{ type: '3', reloadAfterSave: 'yes' }, /Invalid display preference/],
+    [{ type: '3', reloadAfterSave: true }, /Invalid display preference/],
+    [{ type: '3', reloadAfterSave: undefined }, /Invalid display preference/],
   ])
-    await assert.rejects(f.start(input));
-  const plan = await f.api.preview('admin', '1', { type: '3', refreshAfterSave: true });
+    for (const attempt of [
+      () => f.api.preview('admin', '1', input),
+      () => f.api.start('admin', input, [{ projectId: '1', fingerprint: 'a'.repeat(64) }], 0),
+    ])
+      await assert.rejects(attempt(), error);
+  assert.equal(f.state(), undefined);
+  const plan = await f.api.preview('admin', '1', { type: '3', reloadAfterSave: 'on' });
   const r = await f.api.start(
     'admin',
-    { type: '3', refreshAfterSave: false },
+    { type: '3', reloadAfterSave: 'keep' },
     [{ projectId: '1', fingerprint: plan.fingerprint }],
     0,
   );
@@ -405,28 +416,20 @@ test('cancellation notice describes this visit rather than replaying historical 
   assert.equal((await f.api.cancelInterrupted('admin')).cancelledNow, false);
 });
 
-test('catalog reports independent discovery failures without hiding saved state or blocking setup removal', async () => {
-  for (const failure of ['types', 'inventory', 'both']) {
-    const f = fixture();
-    const r = await f.start({ type: '3' }, ['1']);
-    if (failure !== 'inventory')
-      f.s.types = async () => {
-        throw Error('Types failed');
-      };
-    if (failure !== 'types')
-      f.w.projects = async () => {
-        throw Error('Inventory failed');
-      };
-    const catalog = await f.api.catalog();
-    assert.equal(catalog.typesAvailable, failure === 'inventory');
-    assert.equal(catalog.inventoryAvailable, failure === 'types');
-    assert.equal((await f.api.status()).data.id, r.data.id);
-    await f.api.stop('admin', r.data.id, r.revision, true);
-    const unlink = await f.start({ unlink: true }, ['1']);
-    const result = await f.api.advance('admin', unlink.data.id, unlink.revision);
-    assert.equal(result.data.status, 'complete');
-    assert.deepEqual(f.writes, []);
-  }
+test('catalog reports a work type discovery failure without hiding saved state or blocking setup removal', async () => {
+  const f = fixture();
+  const r = await f.start({ type: '3' }, ['1']);
+  assert.deepEqual(await f.api.catalog(), { typesAvailable: true, types: f.types });
+  f.s.types = async () => {
+    throw Error('Types failed');
+  };
+  assert.deepEqual(await f.api.catalog(), { typesAvailable: false, types: [] });
+  assert.equal((await f.api.status()).data.id, r.data.id);
+  await f.api.stop('admin', r.data.id, r.revision, true);
+  const unlink = await f.start({ unlink: true }, ['1']);
+  const result = await f.api.advance('admin', unlink.data.id, unlink.revision);
+  assert.equal(result.data.status, 'complete');
+  assert.deepEqual(f.writes, []);
 });
 
 test('stale abandoned-run release cannot overwrite a competing continuation', async () => {
@@ -444,14 +447,15 @@ test('stale abandoned-run release cannot overwrite a competing continuation', as
 });
 
 test('a brief outage before any write returns the run to ready at the same space', async () => {
-  const f = fixture();
-  let r = await f.start();
-  const types = f.s.types;
+  const f = twoScreenFixture();
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ['3'] });
+  const field = f.p.field;
   let reads = 0;
-  f.s.types = async () => {
-    // The first read is advance's fresh review; the second is apply's own review.
+  f.p.field = async () => {
+    // The step reviews the space once (the first read); apply reads the field again before its
+    // claim, and nothing else from Jira until then.
     if (++reads === 2) throw new JiraUnavailable('Jira connection failed. No write was retried.');
-    return types();
+    return field();
   };
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'ready');
@@ -459,10 +463,15 @@ test('a brief outage before any write returns the run to ready at the same space
   assert.equal(r.data.inspectProject, undefined);
   assert.match(r.data.entries[0].message, /Nothing was changed/);
   assert.deepEqual(f.writes, []);
-  f.s.types = types;
+  f.p.field = field;
   r = await f.api.advance('admin', r.data.id, r.revision);
-  assert.equal(r.data.index, 1);
-  assert.deepEqual(f.writes, ['create', 'attach 91']);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(f.writes, [
+    'create',
+    'attach 91',
+    'add 300 customfield_1',
+    'add 301 customfield_1',
+  ]);
 });
 
 test('a rejected creation stops the run without an outcome check and never creates again', async () => {
@@ -528,16 +537,16 @@ test('releasing another administrator’s ready run needs acknowledgement; the o
 });
 
 test('a storage outage before any write keeps the run ready; a defect stops it honestly', async () => {
-  // Storage briefly unavailable during apply's own review: an outage, so the step can be
-  // continued later.
+  // Storage briefly unavailable when apply reads the space's record (the step's review read it
+  // first): an outage, so the step can be continued later.
   let f = fixture();
   let r = await f.start();
-  const types = f.s.types;
+  let get = f.s.get;
   let reads = 0;
-  f.s.types = async () => {
+  f.s.get = async (id) => {
     if (++reads === 2)
       throw new StorageUnavailable('App storage is unavailable. Try again shortly.');
-    return types();
+    return get(id);
   };
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'ready');
@@ -552,10 +561,11 @@ test('a storage outage before any write keeps the run ready; a defect stops it h
   // batch stops with a message that says so, and still writes nothing.
   f = fixture();
   r = await f.start();
+  get = f.s.get;
   reads = 0;
-  f.s.types = async () => {
+  f.s.get = async (id) => {
     if (++reads === 2) throw new TypeError('private defect detail');
-    return f.types;
+    return get(id);
   };
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'stopped');
@@ -578,4 +588,286 @@ test('a polling view that names an older run never cancels a newer one', async (
   assert.equal(polled.data.status, 'ready');
   assert.equal(polled.cancelledNow, false);
   assert.equal(f.state().revision, next.revision);
+});
+// Screens: each reviewed space carries its own work type selection.
+function sharedScreenFixture() {
+  const f = fixture();
+  f.screens.use('1', '3', '*', '200');
+  f.screens.use('2', '3', '*', '200');
+  return f;
+}
+const taskScreens = { 1: ['3'], 2: ['3'] };
+test('a screen shared by two reviewed spaces gets the field once and records both spaces', async () => {
+  const f = sharedScreenFixture();
+  let r = await f.start({ name: 'Prompt', allowSharedScreens: true }, ['1', '2'], taskScreens);
+  assert.deepEqual(
+    r.data.entries.map((e) => e.screenTypes),
+    [['3'], ['3']],
+  );
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready');
+  // The second space's review still shows the reviewed add, now made by this run.
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(f.writes, ['create', 'attach 91', 'add 200 customfield_1', 'attach 92']);
+  assert.deepEqual(f.screens.records.get('200').data.projects, ['1', '2']);
+  assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+  assert.deepEqual(f.configs.get('2').data.screens, ['200']);
+});
+test('shared screen changes need their own approval before any write', async () => {
+  const f = sharedScreenFixture();
+  const r = await f.start({ name: 'Prompt', allowShared: true }, ['1', '2'], taskScreens);
+  await refused(f, r, /Confirm the shared screens/);
+  assert.equal(f.configs.size, 0);
+});
+test('a screen changed in Jira after review stops the space before any write', async () => {
+  const f = sharedScreenFixture();
+  const r = await f.start({ name: 'Prompt', allowSharedScreens: true }, ['1', '2'], taskScreens);
+  f.screens.screens.get('200').tabs[0].fields.push('customfield_1');
+  await refused(f, r, /changed after review/);
+});
+test('one space leaving a shared screen does not stop another space joining it in the same run', async () => {
+  const f = fixture();
+  for (const s of ['1', '2', '7']) f.screens.use(s, '3', '*', '200');
+  let r = await f.start(
+    { name: 'Prompt', allowShared: true, allowSharedScreens: true },
+    ['1', '7'],
+    {
+      1: ['3'],
+      7: ['3'],
+    },
+  );
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  f.writes.length = 0;
+  // Space 1 deselects Task (leave: space 7 still relies on the field); space 2 selects it (join).
+  r = await f.start({ type: '5', allowSharedScreens: true }, ['1', '2'], { 1: [], 2: ['3'] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(f.screens.records.get('200').data.projects, ['2', '7']);
+  assert.ok(!f.writes.some((w) => w.startsWith('add') || w.startsWith('remove')), f.writes.join());
+});
+test('screen selections are per space: validated at start and absent for setup removal', async () => {
+  const f = fixture();
+  await assert.rejects(
+    f.api.preview('admin', '1', { name: 'Prompt', reloadAfterSave: 'keep', screenTypes: ['x'] }),
+    /Invalid Jira identifier/,
+  );
+  await assert.rejects(
+    f.api.start(
+      'admin',
+      { name: 'Prompt', screenTypes: ['3'] },
+      [{ projectId: '1', fingerprint: 'a'.repeat(64) }],
+      0,
+    ),
+    /per space/,
+  );
+  await assert.rejects(
+    f.api.start(
+      'admin',
+      { unlink: true },
+      [{ projectId: '1', fingerprint: 'a'.repeat(64), screenTypes: ['3'] }],
+      0,
+    ),
+    /Removing setup/,
+  );
+  // A space reviewed without a selection keeps its saved one.
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ['3'] });
+  await f.api.advance('admin', r.data.id, r.revision);
+  assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+  r = await f.start({ type: '5' }, ['1']);
+  assert.equal(r.data.entries[0].screenTypes, undefined);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+});
+function twoScreenFixture() {
+  const f = fixture();
+  f.screens.use('1', '3', 'edit', '300');
+  f.screens.use('1', '3', 'view', '301');
+  return f;
+}
+/** The nth screen write fails before reaching Jira, after the earlier ones succeeded. */
+function failScreenWrite(f, method, nth) {
+  const write = f.s[method];
+  let n = 0;
+  f.s[method] = async (...a) => {
+    if (++n === nth) throw new JiraUnavailable('Jira connection failed. No write was retried.');
+    return write(...a);
+  };
+}
+async function screenCheck(f) {
+  const health = await createSettings(f.p, f.s).health({ accountId: 'admin', projectId: '1' });
+  return health.checks.find((c) => c.label === 'Agent Prompts on screens');
+}
+test('a partial screen change keeps its reason, saves the selection and shows in health', async () => {
+  const f = twoScreenFixture();
+  let r = await f.start({ name: 'Prompt' }, ['1']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  failScreenWrite(f, 'addScreenField', 2);
+  r = await f.start({ type: '5' }, ['1'], { 1: ['3'] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'attention');
+  assert.match(r.data.message, /partially configured\. Screen changes stopped/);
+  assert.match(r.data.entries[0].message, /^Screen changes stopped/);
+  assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+  assert.deepEqual(f.configs.get('1').data.screens, ['300']);
+  const check = await screenCheck(f);
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /missing from \S+ 301\./);
+});
+test('an interrupted screen removal shows the screen the app still records in health', async () => {
+  const f = twoScreenFixture();
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ['3'] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.equal((await screenCheck(f)).ok, true);
+  failScreenWrite(f, 'removeScreenField', 2);
+  r = await f.start({ type: '5' }, ['1'], { 1: [] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'attention');
+  assert.equal(f.configs.get('1').data.screenTypes, undefined);
+  assert.deepEqual(f.configs.get('1').data.screens, ['301']);
+  const check = await screenCheck(f);
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /still records adding the field to \S+ 301,/);
+});
+test('a screen failure after the type was attached says so and keeps the outcome check', async () => {
+  const f = twoScreenFixture();
+  failScreenWrite(f, 'addScreenField', 2);
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ['3'] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'attention');
+  assert.match(r.data.message, /work type was added to the space, but screen changes stopped/);
+  assert.ok(f.configs.get('1').data.pending);
+  assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+});
+/** Space 1 selects seven more work types, each with its own edit and view screen: 14 changes. */
+function manyScreensFixture() {
+  const f = fixture();
+  const ids = Array.from({ length: 7 }, (_, i) => String(10 + i));
+  for (const [i, id] of ids.entries()) {
+    const type = { id, name: `Type ${id}`, subtask: false, hierarchyLevel: 0 };
+    f.types.push(type);
+    f.projects.get('1').issueTypes.push(type);
+    f.screens.use('1', id, 'edit', String(300 + 2 * i));
+    f.screens.use('1', id, 'view', String(301 + 2 * i));
+  }
+  // Nine seconds leave room for four screen changes after the type writes.
+  f.screens.clock.left = 9_000;
+  return { f, ids };
+}
+const added = (f) => f.writes.filter((w) => w.startsWith('add')).length;
+test('a large selection is applied over several steps of the same run', async () => {
+  const { f, ids } = manyScreensFixture();
+  let r = await f.start({ name: 'Prompt' }, ['1', '2'], { 1: ids, 2: [] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  assert.equal(r.data.index, 0);
+  assert.equal(r.data.type, '5');
+  assert.equal(r.data.entries[0].applied, 4);
+  assert.equal(r.data.entries[0].remaining.length, 10);
+  assert.match(r.data.entries[0].message, /^4 of 14 screen changes made\./);
+  assert.deepEqual(f.writes.slice(0, 2), ['create', 'attach 91']);
+  // Later steps reuse the created type and never repeat a write.
+  for (const applied of [8, 12, undefined]) {
+    r = await f.api.advance('admin', r.data.id, r.revision);
+    assert.equal(r.data.entries[0].applied, applied, r.data.message);
+  }
+  assert.equal(r.data.index, 1);
+  assert.equal(r.data.entries[0].status, 'done');
+  assert.equal(added(f), 14);
+  assert.equal(new Set(f.writes).size, f.writes.length);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(
+    f.writes.filter((w) => !w.startsWith('add')),
+    ['create', 'attach 91', 'attach 92'],
+  );
+  assert.equal(f.configs.get('1').data.screens.length, 14);
+});
+test('a screen changed in Jira between steps stops the run without further writes', async () => {
+  const { f, ids } = manyScreensFixture();
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ids });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.entries[0].applied, 4);
+  f.screens.screens.get('310').tabs[0].fields.push('customfield_1');
+  const writes = [...f.writes];
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'stopped');
+  assert.match(
+    r.data.message,
+    /^No further change was made for this space: .*changed after review/,
+  );
+  assert.match(r.data.message, /earlier changes and completed spaces remain configured/);
+  assert.deepEqual(f.writes, writes);
+});
+test('an outage between steps keeps the run ready at the same progress', async () => {
+  const { f, ids } = manyScreensFixture();
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ids });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  const field = f.p.field;
+  let reads = 0;
+  f.p.field = async () => {
+    // The first read is the step's review; the second is apply's, before its claim.
+    if (++reads === 2) throw new JiraUnavailable('Jira connection failed. No write was retried.');
+    return field();
+  };
+  const writes = [...f.writes];
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  assert.equal(r.data.entries[0].applied, 4);
+  assert.match(r.data.entries[0].message, /Nothing was changed/);
+  assert.deepEqual(f.writes, writes);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.entries[0].applied, 8, r.data.message);
+});
+test('a large setup removal keeps the space set up until its last screen change', async () => {
+  const { f, ids } = manyScreensFixture();
+  f.screens.clock.left = 22_000;
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ids });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  f.screens.clock.left = 9_000;
+  r = await f.start({ unlink: true }, ['1']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  assert.equal(f.configs.get('1').data.type, '5');
+  assert.equal(f.configs.get('1').data.screens.length, 10);
+  for (let i = 0; i < 3 && r.data.status === 'ready'; i++)
+    r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.equal(f.writes.filter((w) => w.startsWith('remove')).length, 14);
+  assert.equal(f.configs.get('1').data.type, undefined);
+  assert.deepEqual(f.configs.get('1').data.previousTypes, ['5']);
+});
+
+test('the reload choice keeps each space’s preference or sets it for every selected space', async () => {
+  // Space 1 reloads, space 2 does not, and space 7 has never chosen.
+  const seed = (f) => {
+    f.configs.set('1', { revision: 1, data: { type: '3', refreshAfterSave: true } });
+    f.configs.set('2', { revision: 1, data: { type: '3', refreshAfterSave: false } });
+    f.configs.set('7', { revision: 1, data: { type: '3' } });
+  };
+  for (const [choice, expected] of [
+    ['keep', { 1: true, 2: false, 7: undefined }],
+    ['on', { 1: true, 2: true, 7: true }],
+    ['off', { 1: false, 2: false, 7: false }],
+  ]) {
+    const f = fixture();
+    seed(f);
+    let r = await f.start({ type: '3', reloadAfterSave: choice }, ['1', '2', '7']);
+    assert.equal(r.data.input.reloadAfterSave, choice);
+    while (r.data.status === 'ready') r = await f.api.advance('admin', r.data.id, r.revision);
+    assert.equal(r.data.status, 'complete', r.data.message);
+    for (const [id, value] of Object.entries(expected)) {
+      assert.equal(f.configs.get(id).data.refreshAfterSave, value, `${choice}: space ${id}`);
+      assert.equal(f.configs.get(id).data.type, '3');
+    }
+    assert.deepEqual(f.writes, []);
+  }
 });

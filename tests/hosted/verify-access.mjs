@@ -12,7 +12,8 @@ import {
   renameSync,
   unlinkSync,
 } from 'node:fs';
-import { chromium, expect } from '@playwright/test';
+import { chromium } from '@playwright/test';
+import { expect } from './support/expect.mjs';
 import {
   activeTarget,
   fixtureProject,
@@ -29,6 +30,7 @@ import {
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { spaceSettings } from './support/space-settings.mjs';
+import { chooseScreenTypes, nextStep, reviewStep } from './support/configuration-dialog.mjs';
 
 const [mode, recoveryId] = process.argv.slice(2);
 assert.ok(mode === 'run' || (mode === 'cleanup' && /^[0-9a-f-]{36}$/.test(recoveryId)));
@@ -387,47 +389,41 @@ try {
       )
       .toBe(j.securityScheme.id);
 
-    stage('field-on-screens');
-    // The template gives the space its own screens; add the app field only to those.
-    const itss = (await pages(`/issuetypescreenscheme/project?projectId=${j.project.id}`))[0]
-      .issueTypeScreenScheme;
-    assert.ok(itss.name.startsWith(`${j.key}:`));
-    const users = await pages(`/issuetypescreenscheme/${itss.id}/project`);
-    assert.deepEqual(
-      users.map((p) => String(p.id)),
-      [j.project.id],
-    );
-    const screenSchemes = new Set(
-      (await pages(`/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=${itss.id}`)).map(
-        (m) => m.screenSchemeId,
-      ),
-    );
-    j.screens = [];
-    for (const ss of screenSchemes) {
-      const screenScheme = (await pages(`/screenscheme?id=${ss}`))[0];
-      assert.ok(screenScheme.name.startsWith(`${j.key}:`));
-      for (const screen of new Set(Object.values(screenScheme.screens))) {
-        const tabs = await api(`/screens/${screen}/tabs`);
-        let present = false;
-        for (const tab of tabs)
-          if (
-            (await api(`/screens/${screen}/tabs/${tab.id}/fields`)).some((f) => f.id === field.id)
-          )
-            present = true;
-        if (!present) {
-          j.screens.push({ screen: String(screen), tab: String(tabs[0].id) });
-          persist();
-          await api(`/screens/${screen}/tabs/${tabs[0].id}/fields`, 'POST', { fieldId: field.id });
-        }
-      }
-    }
-
     stage('configure');
     const task = project.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
     const targetType = project.issueTypes.find(
       (x) => !x.subtask && x.id !== task?.id && x.hierarchyLevel === 0,
     );
     assert.ok(task && targetType);
+    // The template gives the space its own screens, so the app's change reaches no other space.
+    const itss = (await pages(`/issuetypescreenscheme/project?projectId=${j.project.id}`))[0]
+      .issueTypeScreenScheme;
+    assert.ok(itss.name.startsWith(`${j.key}:`));
+    assert.deepEqual(
+      (await pages(`/issuetypescreenscheme/${itss.id}/project`)).map((p) => String(p.id)),
+      [j.project.id],
+    );
+    const rows = await pages(`/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=${itss.id}`);
+    const row =
+      rows.find((m) => m.issueTypeId === targetType.id) ??
+      rows.find((m) => m.issueTypeId === 'default');
+    const screenScheme = (await pages(`/screenscheme?id=${row.screenSchemeId}`))[0];
+    assert.ok(screenScheme.name.startsWith(`${j.key}:`));
+    j.screens = [
+      ...new Set(
+        ['edit', 'view'].map((op) =>
+          String(screenScheme.screens[op] ?? screenScheme.screens.default),
+        ),
+      ),
+    ];
+    persist();
+    const onScreen = async (screen) => {
+      for (const tab of await api(`/screens/${screen}/tabs`))
+        if ((await api(`/screens/${screen}/tabs/${tab.id}/fields`)).some((f) => f.id === field.id))
+          return true;
+      return false;
+    };
+    for (const screen of j.screens) assert.equal(await onScreen(screen), false);
     await spaceSettings(page, j.key);
     const find = page.getByRole('textbox', { name: 'Find a space', exact: true });
     await expect(find).toBeEnabled({ timeout: 60000 });
@@ -437,18 +433,23 @@ try {
     await page.getByRole('combobox', { name: 'Existing type', exact: true }).click();
     await page.getByRole('option', { name: task.name, exact: true }).click();
     // Without the reload preference, save responses are observed in place.
-    const reload = page.getByRole('checkbox', {
-      name: 'Reload work item after saving prompts',
-      exact: true,
-    });
-    if (await reload.isChecked()) await reload.click();
-    await expect(reload).not.toBeChecked();
-    await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+    await page
+      .getByRole('combobox', { name: 'Reload work item after saving prompts', exact: true })
+      .click();
+    await page.getByRole('option', { name: 'Off for all selected spaces', exact: true }).click();
+    await nextStep(page);
+    // The app places the field on the target type's screens; the review then lists that change.
+    await chooseScreenTypes(page, j.key, targetType.name);
+    await reviewStep(page);
+    await expect(page.getByRole('dialog').getByText(/^Agent Prompts to /)).toHaveCount(
+      j.screens.length,
+    );
     await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
     await expect(
       page.getByRole('heading', { name: 'Configuration complete', exact: true }),
     ).toBeVisible({ timeout: 60000 });
     await page.getByRole('button', { name: 'Done', exact: true }).click();
+    for (const screen of j.screens) assert.equal(await onScreen(screen), true);
 
     stage('create-work-items');
     const visible = await createIssue('visible', {

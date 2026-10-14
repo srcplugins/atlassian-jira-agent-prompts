@@ -1,7 +1,8 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const { createSettings, NotApplied } = await import('../src/settings.ts');
+const { screenFixture } = await import('./screen-fixture.mjs');
 const { UserError, JiraRejected, JiraUnavailable, StorageUnavailable } =
   await import('../src/service.ts');
 const c = { accountId: 'admin', projectId: '1' };
@@ -20,21 +21,21 @@ function fixture() {
   };
   const scheme = { id: '9', name: 'TEST scheme', projectIds: ['1'], isDefault: false };
   const writes = [];
+  const screens = screenFixture(() => ['1', '2'], writes);
   const p = {
     allowed: async (_project, permission) => assert.equal(permission, 'ADMINISTER'),
     project: async () => structuredClone(project),
     field: async () => 'customfield_1',
-    search: async () => ({
-      prompts: [{ id: '20', key: 'TEST-20', name: 'Visible prompt' }],
-      incomplete: false,
-    }),
+    search: async () => assert.fail('settings never read prompts'),
     issue: async () => ({ id: '10', fields: { project: { id: '1' } } }),
   };
   const s = {
     get: async () => structuredClone(stored),
-    cas: async (_project, revision, data) => {
+    cas: async (_project, revision, data, screen) => {
       if ((stored?.revision ?? 0) !== revision) throw new UserError('Setup changed');
+      screens.check(screen);
       stored = { revision: revision + 1, data: structuredClone(data) };
+      screens.commit(screen);
       writes.push('config');
     },
     types: async () => structuredClone(types),
@@ -48,8 +49,8 @@ function fixture() {
       writes.push('attach');
       project.issueTypes.push(types.find((t) => t.id === type));
     },
-    impact: async () => ({ keys: ['TEST-10'], incomplete: true }),
     createFields: async () => ['summary', 'description'],
+    ...screens.ports,
   };
   return {
     p,
@@ -58,6 +59,7 @@ function fixture() {
     project,
     scheme,
     writes,
+    screens,
     settings: createSettings(p, s),
     state: () => structuredClone(stored),
     set: (value) => {
@@ -73,15 +75,42 @@ test('health observes renames by stable ID and makes no writes', async () => {
   assert.ok(health.checks.every((check) => check.ok));
   assert.deepEqual(f.writes, []);
 });
-test('type replacement previews bounded visible impact and retains old IDs without Jira writes', async () => {
+test('type replacement retains old IDs without reading prompts or work items and without Jira writes', async () => {
   const f = fixture();
   const plan = await f.settings.preview(c, { type: '4' });
-  assert.deepEqual(plan.promptKeys, ['TEST-20']);
-  assert.deepEqual(plan.usingKeys, ['TEST-10']);
-  assert.equal(plan.usingIncomplete, true);
+  assert.equal('promptKeys' in plan, false);
+  assert.equal('usingKeys' in plan, false);
   await f.settings.apply(c, { type: '4', fingerprint: plan.fingerprint });
   assert.deepEqual(f.state().data, { type: '4', previousTypes: ['3'] });
   assert.deepEqual(f.writes, ['config']);
+});
+test('apply works from the review it is given instead of reading the space again', async () => {
+  const f = fixture();
+  const reads = { types: 0, project: 0, screenUses: 0 };
+  const counted =
+    (name, port) =>
+    async (...args) => {
+      reads[name]++;
+      return port(...args);
+    };
+  f.s.types = counted('types', f.s.types);
+  f.p.project = counted('project', f.p.project);
+  f.s.screenUses = counted('screenUses', f.s.screenUses);
+  const settings = createSettings(f.p, f.s);
+  const plan = await settings.preview(c, { type: '4' });
+  const reviewed = { ...reads };
+  await settings.apply(c, { type: '4', fingerprint: plan.fingerprint }, plan);
+  assert.deepEqual(reads, reviewed, 'the given review is used as is');
+  assert.deepEqual(f.state().data, { type: '4', previousTypes: ['3'] });
+  assert.deepEqual(f.writes, ['config']);
+  // Without a review of its own, apply reviews the space before writing.
+  const again = fixture();
+  again.s.types = counted('types', again.s.types);
+  const alone = createSettings(again.p, again.s);
+  const fresh = await alone.preview(c, { type: '4' });
+  const before = reads.types;
+  await alone.apply(c, { type: '4', fingerprint: fresh.fingerprint });
+  assert.equal(reads.types, before + 1);
 });
 test('concurrent setup applies admit one claimant and stale preview is rejected', async () => {
   const f = fixture();
@@ -148,11 +177,10 @@ test('uncertain create remains locked; outcome check is read-only and does not r
   assert.equal(f.state().data.type, '3');
   assert.equal(f.state().data.pending, undefined);
 });
-test('deleted type can be replaced without claiming old work items absent', async () => {
+test('a deleted type can be replaced and is still retained as a previous type', async () => {
   const f = fixture();
   f.types.shift();
   const plan = await f.settings.preview(c, { type: '4' });
-  assert.equal(plan.promptIncomplete, true);
   await f.settings.apply(c, { type: '4', fingerprint: plan.fingerprint });
   assert.deepEqual(f.state().data.previousTypes, ['3']);
 });
@@ -733,4 +761,260 @@ test('a setup removal check that fails before its write is not applied: an outag
     );
     assert.deepEqual(f.writes, []);
   }
+});
+// Screens: the Agent Prompts field on the edit and view screens of selected work types.
+const FIELD = 'customfield_1';
+test('selected work types get the field on their own edit and view screens, once and recorded', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', 'edit', '200');
+  f.screens.use('1', '4', 'view', '201', ['summary', FIELD]);
+  const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  assert.deepEqual(plan.availableTypes, [{ id: '4', name: 'Playbook' }]);
+  assert.deepEqual(
+    plan.screens.changes.map((ch) => [ch.action, ch.screen.id, ch.tab, ch.impact]),
+    [
+      [
+        'add',
+        '200',
+        '2001',
+        { spaces: 1, shared: false, digest: plan.screens.changes[0].impact.digest },
+      ],
+    ],
+  );
+  // A field already on a screen without the app's record was added outside the app.
+  assert.deepEqual(plan.screens.present, [{ id: '201', name: 'Screen 201' }]);
+  await f.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint });
+  assert.deepEqual(f.writes, ['add 200 customfield_1', 'config', 'config']);
+  assert.deepEqual(f.state().data, {
+    type: '3',
+    previousTypes: [],
+    screenTypes: ['4'],
+    screens: ['200'],
+  });
+  assert.deepEqual(f.screens.records.get('200'), {
+    revision: 1,
+    data: { field: FIELD, projects: ['1'] },
+  });
+  const health = await f.settings.health(c);
+  assert.ok(health.checks.find((ch) => ch.label === 'Agent Prompts on screens').ok);
+  // The saved selection is reviewed again without changes.
+  assert.deepEqual((await f.settings.preview(c, { type: '3' })).screens.changes, []);
+});
+test('a screen shared with another space needs approval; incomplete impact blocks the space', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', '*', '200');
+  f.screens.use('2', '7', 'edit', '200');
+  const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  assert.equal(plan.screens.changes[0].impact.shared, true);
+  assert.deepEqual(
+    plan.screenProjects['200'].map((p) => p.id),
+    ['1', '2'],
+  );
+  const input = { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint };
+  await assert.rejects(f.settings.apply(c, input), (error) => error instanceof NotApplied);
+  assert.deepEqual(f.writes, []);
+  await f.settings.apply(c, { ...input, allowSharedScreens: true });
+  assert.deepEqual(f.writes.slice(0, 1), ['add 200 customfield_1']);
+  const g = fixture();
+  g.screens.use('1', '4', '*', '200');
+  g.screens.incomplete.add('200');
+  const blocked = await g.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  assert.match(blocked.blocked, /Screen 200 is used by more spaces than can be reviewed/);
+  assert.deepEqual(blocked.screens.changes, []);
+  await assert.rejects(
+    g.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: blocked.fingerprint }),
+    (error) => error instanceof NotApplied && !error.retryable,
+  );
+  // Reads that ran out of time are an outage to retry, not a block.
+  g.screens.incomplete.clear();
+  g.screens.late.add('200');
+  await assert.rejects(
+    g.settings.preview(c, { type: '3', screenTypes: ['4'] }),
+    /spaces using the screen Screen 200 could not all be read in time/,
+  );
+  await assert.rejects(
+    g.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: blocked.fingerprint }),
+    (error) => error instanceof NotApplied && error.retryable,
+  );
+  assert.deepEqual(g.writes, []);
+});
+test('a step stops before its first write when the request has too little time left', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', '*', '200');
+  const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  const input = { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint };
+  // One screen change and up to two type writes need 3 + 3 seconds.
+  f.screens.clock.left = 5_999;
+  await assert.rejects(
+    f.settings.apply(c, input),
+    (error) =>
+      error instanceof NotApplied &&
+      error.retryable &&
+      /Too little time was left in this request to apply the changes\. Nothing was changed\./.test(
+        error.message,
+      ),
+  );
+  assert.deepEqual(f.writes, []);
+  assert.equal((await f.settings.health(c)).state.data.pending, undefined);
+  f.screens.clock.left = 6_000;
+  await f.settings.apply(c, input);
+  assert.deepEqual(f.writes[0], 'add 200 customfield_1');
+});
+test('a step makes the screen changes that fit its time and reports the rest', async () => {
+  const f = fixture();
+  const types = Array.from({ length: 7 }, (_, i) => String(10 + i));
+  for (const [i, type] of types.entries()) {
+    f.screens.use('1', type, 'edit', String(300 + 2 * i));
+    f.screens.use('1', type, 'view', String(301 + 2 * i));
+  }
+  for (const id of types) {
+    f.types.push({ id, name: `Type ${id}`, subtask: false, hierarchyLevel: 0 });
+    f.project.issueTypes.push(f.types.at(-1));
+  }
+  const input = { type: '3', screenTypes: types };
+  let plan = await f.settings.preview(c, input);
+  assert.equal(plan.blocked, undefined);
+  assert.equal(plan.screens.changes.length, 14);
+  // Eight seconds leave room for three changes after the type writes and a three-second margin.
+  f.screens.clock.left = 8_000;
+  const first = await f.settings.apply(c, { ...input, fingerprint: plan.fingerprint });
+  assert.deepEqual(
+    f.writes.filter((w) => w.startsWith('add')),
+    ['add 300 customfield_1', 'add 301 customfield_1', 'add 302 customfield_1'],
+  );
+  assert.deepEqual(
+    first.remaining.map((r) => r.screen),
+    ['303', '304', '305', '306', '307', '308', '309', '310', '311', '312', '313'],
+  );
+  assert.deepEqual((await f.settings.health(c)).state.data.screens, ['300', '301', '302']);
+  assert.deepEqual((await f.settings.health(c)).state.data.screenTypes, types);
+  // The next step reviews again and finds only the changes still to make.
+  plan = await f.settings.preview(c, input);
+  assert.equal(plan.screens.changes.length, 11);
+  f.screens.clock.left = 22_000;
+  const second = await f.settings.apply(c, { ...input, fingerprint: plan.fingerprint });
+  assert.deepEqual(second.remaining, []);
+  assert.equal(f.writes.filter((w) => w.startsWith('add')).length, 14);
+  assert.equal((await f.settings.preview(c, input)).screens.changes.length, 0);
+});
+test('deselecting removes only recorded fields, and keeps a field another space still records', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', '*', '200');
+  f.screens.use('1', '3', 'edit', '201', ['summary', FIELD]);
+  let plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  await f.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint });
+  f.writes.length = 0;
+  plan = await f.settings.preview(c, { type: '3', screenTypes: [] });
+  assert.deepEqual(
+    plan.screens.changes.map((ch) => [ch.action, ch.screen.id]),
+    [['remove', '200']],
+  );
+  // Another space recorded the same field meanwhile: the review is stale.
+  f.screens.records.set('200', { revision: 2, data: { field: FIELD, projects: ['1', '2'] } });
+  await assert.rejects(
+    f.settings.apply(c, { type: '3', screenTypes: [], fingerprint: plan.fingerprint }),
+    (error) => error instanceof NotApplied,
+  );
+  plan = await f.settings.preview(c, { type: '3', screenTypes: [] });
+  assert.deepEqual(
+    plan.screens.changes.map((ch) => [ch.action, ch.screen.id, ch.impact]),
+    [['leave', '200', undefined]],
+  );
+  await f.settings.apply(c, { type: '3', screenTypes: [], fingerprint: plan.fingerprint });
+  assert.deepEqual(f.writes, ['config', 'config']);
+  assert.deepEqual(f.screens.records.get('200').data.projects, ['2']);
+  assert.ok(f.screens.screens.get('200').tabs[0].fields.includes(FIELD));
+  assert.deepEqual(f.state().data, { type: '3', previousTypes: [] });
+});
+test('removing setup removes the fields only this space recorded and never manual ones', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', '*', '200');
+  f.screens.use('1', '4', 'view', '201', ['summary', FIELD]);
+  let plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  await f.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint });
+  f.writes.length = 0;
+  plan = await f.settings.preview(c, { unlink: true });
+  await f.settings.apply(c, { unlink: true, fingerprint: plan.fingerprint });
+  assert.deepEqual(f.writes, ['remove 200 customfield_1', 'config', 'config']);
+  assert.equal(f.screens.records.has('200'), false);
+  assert.ok(f.screens.screens.get('201').tabs[0].fields.includes(FIELD));
+  assert.deepEqual(f.state().data, { previousTypes: ['3'] });
+});
+test('the prompt type create screen gets missing Summary and Description in the same step', async () => {
+  const f = fixture();
+  f.screens.use('1', '3', 'create', '300', ['summary']);
+  const plan = await f.settings.preview(c, { type: '3' });
+  assert.deepEqual(
+    plan.screens.changes.map((ch) => [ch.action, ch.screen.id, ch.field]),
+    [['require', '300', 'description']],
+  );
+  await f.settings.apply(c, { type: '3', fingerprint: plan.fingerprint });
+  assert.deepEqual(f.writes, ['add 300 description', 'config']);
+  assert.equal(f.screens.records.has('300'), false);
+});
+test('screen faults: a rejected first write changes nothing; later or lost writes are uncertain', async () => {
+  const setup = () => {
+    const f = fixture();
+    f.screens.use('1', '4', 'edit', '200');
+    f.screens.use('1', '4', 'view', '201');
+    return f;
+  };
+  const run = async (f) => {
+    const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+    return f.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint });
+  };
+  let f = setup();
+  f.s.addScreenField = async () => {
+    f.writes.push('add');
+    throw new JiraRejected(403, 'Jira rejected adding a field to a screen (HTTP 403).');
+  };
+  await assert.rejects(run(f), (error) => error instanceof NotApplied && !error.retryable);
+  assert.deepEqual(f.writes, ['add']);
+  assert.deepEqual(f.state().data, { type: '3' });
+  f = setup();
+  f.s.addScreenField = async () => {
+    f.writes.push('add');
+    throw new JiraUnavailable('Jira connection failed.');
+  };
+  await assert.rejects(
+    run(f),
+    (error) => !(error instanceof NotApplied) && /uncertain/.test(error.message),
+  );
+  f = setup();
+  const add = f.s.addScreenField;
+  let calls = 0;
+  f.s.addScreenField = async (...args) => {
+    if (++calls === 2) throw new JiraRejected(400, 'Jira rejected adding a field to a screen.');
+    return add(...args);
+  };
+  await assert.rejects(
+    run(f),
+    (error) => !(error instanceof NotApplied) && /uncertain/.test(error.message),
+  );
+  // The first screen's change is recorded, so a new review offers only what remains.
+  assert.deepEqual(f.state().data.screens, ['200']);
+  const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  assert.deepEqual(
+    plan.screens.changes.map((ch) => [ch.action, ch.screen.id]),
+    [['add', '201']],
+  );
+  f = setup();
+  const cas = f.s.cas;
+  f.s.cas = async (...args) => {
+    if (args[3]) throw new StorageUnavailable('Storage is unavailable.');
+    return cas(...args);
+  };
+  await assert.rejects(
+    run(f),
+    (error) => !(error instanceof NotApplied) && /uncertain/.test(error.message),
+  );
+});
+test('screen selection is validated against the space’s work types before any Jira read', async () => {
+  const f = fixture();
+  await assert.rejects(
+    f.settings.preview(c, { type: '3', screenTypes: ['3'] }),
+    /Choose work types/,
+  );
+  await assert.rejects(f.settings.preview(c, { type: '3', screenTypes: ['4', '4'] }), /distinct/);
+  await assert.rejects(f.settings.preview(c, { unlink: true, screenTypes: [] }), /Removing setup/);
 });

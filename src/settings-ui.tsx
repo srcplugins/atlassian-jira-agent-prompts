@@ -131,6 +131,20 @@ export function Settings({
                   </Text>
                   <Text>Agent Prompts</Text>
                 </Stack>
+                <Stack space="space.050">
+                  <Text size="small" color="color.text.subtle">
+                    Screens
+                  </Text>
+                  <Text>
+                    {(health.state.data.screenTypes ?? [])
+                      .map(
+                        (id) =>
+                          health.project.issueTypes.find((type) => type.id === id)?.name ??
+                          `Work type ID ${id}`,
+                      )
+                      .join(', ') || 'Not set'}
+                  </Text>
+                </Stack>
               </Inline>
               <Inline space="space.200" alignBlock="center" shouldWrap>
                 {configurationAction}
@@ -151,8 +165,8 @@ export function Settings({
                   <Stack space="space.150">
                     <Text>
                       An earlier change did not finish cleanly. Requested type:{' '}
-                      {health.state.data.pending.name ?? health.state.data.pending.type}. Inspect
-                      the result before making another change.
+                      {health.state.data.pending.name ?? health.state.data.pending.type}. It may
+                      also have changed screens. Inspect the result before making another change.
                     </Text>
                     <Inline space="space.100" shouldWrap>
                       <Button
@@ -172,7 +186,7 @@ export function Settings({
                     </Inline>
                     <Checkbox
                       isDisabled={busy}
-                      label="I inspected Jira’s type list and resolved the earlier operation; do not repeat its writes."
+                      label="I inspected Jira’s type list and the reviewed screens and resolved the earlier operation; do not repeat its writes."
                       isChecked={ack}
                       onChange={(e) => setAck(e.target.checked === true)}
                     />
@@ -186,7 +200,7 @@ export function Settings({
                               revision: health.state.revision,
                             });
                             await refresh(
-                              'Resolution acknowledged. Select the existing type and review the change.',
+                              'Resolution acknowledged. Select the existing type and work types for screens, then review the change.',
                             );
                           })
                         }

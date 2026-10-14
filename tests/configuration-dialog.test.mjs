@@ -1,16 +1,23 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import { readSpaces } from '../src/space-reads.ts';
 import { finished } from '../src/batch-status.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { batchFixture } from './batch-fixture.mjs';
 import { bridgeClient, hookHost, load, standIns, view } from './support/ui-harness.mjs';
-function ui(f, selected = [...f.projects.values()]) {
+/** `inventory` is what the health view passes: every space it loaded, by default all of them. */
+function ui(
+  f,
+  selected = [...f.projects.values()],
+  inventory = { projects: [...f.projects.values()], incomplete: false },
+) {
   const calls = [];
   const closed = [];
+  const payloads = [];
   const invoke = async (name, payload) => {
     calls.push(name);
     const p = JSON.parse(JSON.stringify(payload));
+    payloads.push({ name, payload: p });
     let value;
     try {
       if (name === 'settings-health') {
@@ -25,6 +32,8 @@ function ui(f, selected = [...f.projects.values()]) {
         if (f.statusFailure) throw Error('Progress unavailable');
         value = await f.api.status();
       }
+      if (name === 'configuration-options')
+        value = await f.api.options(f.actor ?? 'admin', p.projectId);
       if (name === 'configuration-preview')
         value = await f.api.preview(f.actor ?? 'admin', p.projectId, p);
       if (name === 'configuration-start')
@@ -49,7 +58,7 @@ function ui(f, selected = [...f.projects.values()]) {
     './batch-status': { finished },
     './client': bridgeClient(invoke),
     '@forge/react': {
-      useProductContext: () => ({ accountId: f.actor ?? 'admin' }),
+      useProductContext: () => f.context ?? { accountId: f.actor ?? 'admin' },
       ...standIns(
         'Modal',
         'ModalBody',
@@ -61,6 +70,7 @@ function ui(f, selected = [...f.projects.values()]) {
         'Button',
         'Checkbox',
         'Heading',
+        'HelperMessage',
         'Label',
         'Link',
         'Select',
@@ -69,6 +79,9 @@ function ui(f, selected = [...f.projects.values()]) {
         'Text',
         'Textfield',
         'ProgressBar',
+        'ProgressTracker',
+        'Lozenge',
+        'SectionMessage',
         'List',
         'ListItem',
       ),
@@ -77,6 +90,7 @@ function ui(f, selected = [...f.projects.values()]) {
   const v = view(hooks, () =>
     ConfigurationDialog({
       projects: selected,
+      inventory,
       onClose: (changed) => closed.push(changed),
       onBusy: () => {},
     }),
@@ -84,6 +98,7 @@ function ui(f, selected = [...f.projects.values()]) {
   return {
     ...v,
     calls,
+    payloads,
     closed,
     hasButton: (label) => v.button(label) !== undefined,
     disabled: (label) => v.button(label)?.props.isDisabled,
@@ -97,7 +112,8 @@ test('configuration dialog checks all existing spaces, creates nothing until con
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
-  v.change('Checkbox', 'Reload work item after saving prompts', { target: { checked: true } });
+  v.change('Select', 'configuration-reload', { value: 'on', label: 'On for all selected spaces' });
+  await v.click('Next');
   await v.click('Review changes');
   assert.deepEqual(f.writes, []);
   assert.equal(v.disabled('Apply changes'), false);
@@ -120,21 +136,22 @@ test('configuration dialog checks all existing spaces, creates nothing until con
   assert.equal(f.writes.filter((x) => x === 'create').length, 1);
 });
 test('a step that applied nothing stops the automatic advance and offers Continue reviewed changes', async () => {
-  const { JiraUnavailable } = await import('../src/service.ts');
+  const { StorageUnavailable } = await import('../src/service.ts');
   const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
   await v.click('Review changes');
-  // Every second type read fails: advance's fresh review passes, apply's own review does not,
-  // so the server returns the batch ready at the same project with nothing applied.
-  const types = f.s.types;
+  // The step's review reads the space's record once; apply's own read of it, before the claim,
+  // fails, so the server returns the batch ready at the same space with nothing applied.
+  const get = f.s.get;
   let reads = 0;
-  f.s.types = async () => {
-    if (++reads % 2 === 0)
-      throw new JiraUnavailable('Jira connection failed. No write was retried.');
-    return types();
+  f.s.get = async (id) => {
+    if (++reads === 2)
+      throw new StorageUnavailable('App storage is unavailable. Try again shortly.');
+    return get(id);
   };
   await v.click('Apply changes');
   assert.equal(v.calls.filter((name) => name === 'configuration-advance').length, 1);
@@ -151,6 +168,7 @@ test('configuration dialog exposes per-space blockers and disables confirmation 
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
   await v.click('Review changes');
   assert.equal(v.hasButton('Apply changes'), false);
   assert.match(v.text(), /Blocked:.*default/);
@@ -176,6 +194,7 @@ test('confirmation response loss exposes read-only recovery without a duplicate 
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
   await v.click('Review changes');
   await v.click('Apply changes');
   assert.equal(v.hasButton('Check saved progress'), true);
@@ -193,6 +212,7 @@ test('a completed prior run does not prevent opening a fresh review', async () =
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-type', { value: '5' });
+  await v.click('Next');
   await v.click('Review changes');
   assert.equal(v.hasButton('Apply changes'), true);
   assert.equal(v.hasButton('Done'), false);
@@ -206,6 +226,7 @@ test('shared review lists unselected affected spaces and requires acknowledgment
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
   await v.click('Review changes');
   assert.equal(v.disabled('Apply changes'), true);
   assert.match(v.text(), /3 spaces.*2 selected.*1 additional/);
@@ -221,12 +242,13 @@ test('shared review lists unselected affected spaces and requires acknowledgment
   assert.equal(f.configs.has('7'), false);
 });
 
-test('bulk setup saves the selected reload preference for every reviewed space', async () => {
+test('bulk setup with reload on saves it for every reviewed space', async () => {
   const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-type', { value: '3' });
-  v.change('Checkbox', 'Reload work item after saving prompts', { target: { checked: true } });
+  v.change('Select', 'configuration-reload', { value: 'on', label: 'On for all selected spaces' });
+  await v.click('Next');
   await v.click('Review changes');
   await v.click('Apply changes');
   for (const id of ['1', '2', '7']) assert.equal(f.configs.get(id).data.refreshAfterSave, true);
@@ -272,6 +294,101 @@ test('the spinner remains visible during review and apply, then clears', async (
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  for (const [method, button, before] of [
+    ['preview', 'Next'],
+    ['start', 'Apply changes', 'Review changes'],
+  ]) {
+    if (before) await v.click(before);
+    const original = f.api[method];
+    let release;
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    f.api[method] = async (...args) => {
+      await pending;
+      return original(...args);
+    };
+    const action = v.click(button);
+    v.render();
+    assert.equal(v.nodes('Spinner').length, 1);
+    assert.match(v.text(), / 0 of 3 spaces$/m);
+    assert.equal(v.nodes('ProgressBar')[0]?.props.value, 0);
+    // Only applying warns against reloading, which cancels the remaining spaces.
+    assert.equal(/Keep this page open/.test(v.text()), method === 'start');
+    assert.ok(!v.hasButton(button) || v.disabled(button));
+    release();
+    await action;
+    assert.equal(v.nodes('Spinner').length, 0);
+    assert.equal(v.nodes('ProgressBar').length, 0);
+    f.api[method] = original;
+  }
+  assert.equal(f.state().data.status, 'complete');
+});
+
+test('clicking outside the dialog or pressing Escape keeps it open; the footer button closes it', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  const height = v.nodes('Modal')[0].props.height;
+  assert.ok(height > 0);
+  await v.click('Next');
+  // Every step has the same height, so the footer buttons don't move.
+  assert.equal(v.nodes('Modal')[0].props.height, height);
+  v.nodes('Modal')[0].props.onClose();
+  v.render();
+  assert.deepEqual(v.closed, []);
+  assert.equal(v.hasButton('Review changes'), true);
+  await v.click('Cancel');
+  assert.deepEqual(v.closed, [false]);
+});
+
+test('review and work type pages step through the chosen spaces', async () => {
+  const f = batchFixture(['1', '2', '3', '4', '5', '6', '7']);
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  await v.click('Review changes');
+  const spaces = () => v.text().match(/^PR\d — Project \d$/gm);
+  assert.deepEqual(spaces(), [
+    'PR1 — Project 1',
+    'PR2 — Project 2',
+    'PR3 — Project 3',
+    'PR4 — Project 4',
+    'PR5 — Project 5',
+  ]);
+  assert.match(v.text(), /Spaces 1–5 of 7/);
+  assert.equal(v.disabled('Previous spaces'), true);
+  await v.click('Next spaces');
+  assert.deepEqual(spaces(), ['PR6 — Project 6', 'PR7 — Project 7']);
+  assert.match(v.text(), /Spaces 6–7 of 7/);
+  assert.equal(v.disabled('Next spaces'), true);
+  await v.click('Back');
+  assert.equal(v.nodes('Label').length, 6);
+  await v.click('Next spaces');
+  assert.deepEqual(
+    v.nodes('Label').map((n) => String(n.props.children)),
+    [
+      'Set all selected spaces to',
+      'Work types for PR6 — Project 6',
+      'Work types for PR7 — Project 7',
+    ],
+  );
+  await v.click('Previous spaces');
+  assert.match(String(v.nodes('Label')[1].props.children), /PR1/);
+});
+
+test('the space pager is disabled while a review or an apply is in flight', async () => {
+  const f = batchFixture(['1', '2', '3', '4', '5', '6', '7']);
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  await v.click('Next spaces');
   for (const [method, button] of [
     ['preview', 'Review changes'],
     ['start', 'Apply changes'],
@@ -287,14 +404,38 @@ test('the spinner remains visible during review and apply, then clears', async (
     };
     const action = v.click(button);
     v.render();
-    assert.equal(v.nodes('Spinner').length, 1);
-    assert.ok(!v.hasButton(button) || v.disabled(button));
+    if (method === 'preview') {
+      // The review keeps the Work types step on screen with its pager locked.
+      assert.equal(v.disabled('Previous spaces'), true);
+      assert.equal(v.disabled('Next spaces'), true);
+    } else {
+      // Applying replaces the steps with the progress view, so there is no pager to click.
+      assert.equal(v.hasButton('Previous spaces'), false);
+      assert.equal(v.hasButton('Next spaces'), false);
+    }
     release();
     await action;
-    assert.equal(v.nodes('Spinner').length, 0);
     f.api[method] = original;
+    // The review lands on the first page of the Review step, where the pager works again.
+    if (method === 'preview') assert.equal(v.disabled('Next spaces'), false);
   }
   assert.equal(f.state().data.status, 'complete');
+});
+
+test('Continue reviewed changes waits for the product context to name the viewer', async () => {
+  const f = batchFixture();
+  await f.start();
+  // Before the context resolves, the saved run cannot be known to be the viewer's own.
+  f.context = {};
+  const unknown = ui(f);
+  await unknown.mount();
+  assert.equal(unknown.hasButton('Continue reviewed changes'), false);
+  assert.equal(unknown.hasButton('Check saved progress'), true);
+  f.context = undefined;
+  const known = ui(f);
+  await known.mount();
+  assert.equal(known.hasButton('Continue reviewed changes'), true);
+  assert.deepEqual(f.writes, []);
 });
 
 test('another administrator can release an abandoned configuration without continuing its writes', async () => {
@@ -321,6 +462,7 @@ test('another administrator can release an abandoned configuration without conti
   const next = ui(f, [f.projects.get('2')]);
   await next.mount();
   next.change('Select', 'configuration-type', { value: '5' });
+  await next.click('Next');
   await next.click('Review changes');
   await next.click('Apply changes');
   assert.equal(f.state().data.status, 'complete');
@@ -375,19 +517,21 @@ test('setup removal remains reviewable when type discovery, inventory or the cat
       f.s.types = async () => {
         throw Error('Types unavailable');
       };
-    if (failure === 'inventory')
-      f.w.projects = async () => {
-        throw Error('Inventory unavailable');
-      };
     if (failure === 'catalog') f.catalogFailure = true;
-    const v = ui(f, [f.projects.get('1')]);
+    // A failed or truncated inventory arrives from the health view as incomplete.
+    const v =
+      failure === 'inventory'
+        ? ui(f, [f.projects.get('1')], { projects: [f.projects.get('1')], incomplete: true })
+        : ui(f, [f.projects.get('1')]);
     await v.mount();
+    if (failure === 'inventory') assert.match(v.text(), /The space inventory is incomplete/);
+    else assert.doesNotMatch(v.text(), /inventory is incomplete/);
     if (failure !== 'inventory') {
       assert.match(v.text(), /Work types could not be loaded/);
-      assert.equal(v.disabled('Review changes'), true);
+      assert.equal(v.disabled('Next'), true);
       v.change('Select', 'configuration-mode', { value: 'create' });
       v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
-      assert.equal(v.disabled('Review changes'), true);
+      assert.equal(v.disabled('Next'), true);
     }
     v.change('Select', 'configuration-mode', { value: 'unlink' });
     await v.click('Review changes');
@@ -418,8 +562,8 @@ test('saved progress names a space outside the loaded inventory by its ID, never
   const f = batchFixture();
   const started = await f.start();
   f.catalogFailure = true;
-  // No selected spaces and no catalog: the saved batch's spaces are known only by ID.
-  const v = ui(f, []);
+  // No selected spaces and an empty inventory: the saved batch's spaces are known only by ID.
+  const v = ui(f, [], { projects: [], incomplete: true });
   await v.mount();
   for (const { projectId } of started.data.entries)
     assert.match(v.text(), new RegExp(`Space ID ${projectId}\\b`));
@@ -432,7 +576,7 @@ test('failed initial progress read blocks new mutations until an explicit succes
   f.statusFailure = true;
   const v = ui(f);
   await v.mount();
-  assert.equal(v.hasButton('Review changes'), false);
+  assert.equal(v.hasButton('Next'), false);
   assert.equal(v.hasButton('Apply changes'), false);
   assert.equal(v.hasButton('Check saved progress'), true);
   f.statusFailure = false;
@@ -448,16 +592,19 @@ test('failed initial progress read blocks new mutations until an explicit succes
   assert.deepEqual(f.writes, []);
 });
 
-test('a second Apply or Review click delivered before the host re-renders is ignored', async () => {
+test('a second Apply or Next click delivered before the host re-renders is ignored', async () => {
   const f = batchFixture();
   const v = ui(f);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
-  const review = v.button('Review changes');
-  review.props.onClick();
-  review.props.onClick();
+  const next = v.button('Next');
+  next.props.onClick();
+  next.props.onClick();
   await v.settle();
+  assert.equal(v.calls.filter((c) => c === 'configuration-options').length, f.projects.size);
+  assert.equal(v.calls.filter((c) => c === 'configuration-preview').length, 0);
+  await v.click('Review changes');
   assert.equal(v.calls.filter((c) => c === 'configuration-preview').length, f.projects.size);
   const apply = v.button('Apply changes');
   apply.props.onClick();
@@ -466,4 +613,437 @@ test('a second Apply or Review click delivered before the host re-renders is ign
   assert.equal(v.calls.filter((c) => c === 'configuration-start').length, 1);
   assert.equal(f.state().data.status, 'complete');
   assert.doesNotMatch(v.text(), /progress changed|Reopen the configuration dialog/);
+});
+test('work types chosen per space put Agent Prompts on their screens, and shared screens need their own approval', async () => {
+  const f = batchFixture();
+  // Spaces 1 and 2 share one Task screen; space 7 keeps its own.
+  f.screens.use('1', '3', '*', '200');
+  f.screens.use('2', '3', '*', '200');
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  assert.match(v.text(), /Choose the work types that show the Agent Prompts field in each space/);
+  // Choosing types clears the review, and the next review sends the choice.
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-2', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-7', [{ value: '3', label: 'Task' }]);
+  await v.click('Review changes');
+  assert.match(v.text(), /^Agent Prompts to Screen 200$/m);
+  assert.match(v.text(), /^Agent Prompts to Screen 1007$/m);
+  assert.ok(v.nodes('Lozenge').some((n) => n.props.appearance === 'success'));
+  assert.match(v.text(), /PR1 — Project 1\nAgent Prompts added/);
+  assert.match(v.text(), /PR2 — Project 2\nAgent Prompts added/);
+  assert.equal(v.disabled('Apply changes'), true);
+  v.change('Checkbox', 'I approve the shared screen changes for all listed affected spaces.', {
+    target: { checked: true },
+  });
+  assert.deepEqual(f.writes, []);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete');
+  assert.deepEqual(
+    f.writes.filter((w) => w.startsWith('add')),
+    ['add 200 customfield_1', 'add 1007 customfield_1'],
+  );
+  assert.deepEqual(f.screens.records.get('200').data.projects, ['1', '2']);
+  for (const id of ['1', '2', '7']) assert.deepEqual(f.configs.get(id).data.screenTypes, ['3']);
+});
+test('removing setup reviews the screens the app added the field to and hides the work type picker', async () => {
+  const f = batchFixture();
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  await v.click('Review changes');
+  await v.click('Apply changes');
+  assert.ok(f.writes.includes('add 1001 customfield_1'));
+  const after = ui(f, [f.projects.get('1')]);
+  await after.mount();
+  after.change('Select', 'configuration-mode', { value: 'unlink' });
+  assert.equal(
+    after.nodes('Select').some((n) => n.props.inputId === 'screen-types-1'),
+    false,
+  );
+  await after.click('Review changes');
+  assert.match(after.text(), /^Agent Prompts from Screen 1001$/m);
+  await after.click('Apply changes');
+  assert.ok(f.writes.includes('remove 1001 customfield_1'));
+  assert.equal(f.screens.records.has('1001'), false);
+});
+async function configureWithTask(f) {
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  await v.click('Review changes');
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete');
+}
+const picker = (v, id) => v.nodes('Select').find((n) => n.props.inputId === `screen-types-${id}`);
+test('a space blocked by a screen still offers its work types, so another selection can unblock it', async () => {
+  const f = batchFixture();
+  await configureWithTask(f);
+  // Task's edit screen in space 1 is moved in Jira to a screen whose impact can't be reviewed.
+  f.screens.use('1', '3', 'edit', '300');
+  f.screens.incomplete.add('300');
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-type', { value: '5' });
+  await v.click('Next');
+  assert.deepEqual(
+    picker(v, '1').props.value.map((o) => o.value),
+    ['3'],
+  );
+  await v.click('Review changes');
+  assert.match(v.text(), /Blocked: The screen Screen 300 is used by more spaces/);
+  assert.equal(v.hasButton('Apply changes'), false);
+  await v.click('Back');
+  v.change('Select', 'screen-types-1', []);
+  await v.click('Review changes');
+  assert.doesNotMatch(v.text(), /Blocked/);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete', f.state().data.message);
+  assert.equal(f.configs.get('1').data.screenTypes, undefined);
+});
+test('a review that returns after the selection changed is dropped', async () => {
+  const f = batchFixture();
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  // A changed choice clears the review made for this step, so Review changes reviews again.
+  v.change('Select', 'screen-types-1', []);
+  const select = picker(v, '1');
+  // The picker change arrives before the disabled tree reaches the host.
+  v.button('Review changes').props.onClick();
+  select.props.onChange([{ value: '3', label: 'Task' }]);
+  await v.settle();
+  assert.deepEqual(
+    picker(v, '1').props.value.map((o) => o.value),
+    ['3'],
+  );
+  assert.equal(v.hasButton('Apply changes'), false);
+  assert.match(v.text(), /selection changed during the review/);
+  await v.click('Review changes');
+  await v.click('Apply changes');
+  assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+});
+test('changing one space’s work types reviews only that space again', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  const previews = () => v.payloads.filter((c) => c.name === 'configuration-preview');
+  await v.click('Next');
+  await v.click('Review changes');
+  assert.equal(previews().length, 3);
+  assert.equal(v.hasButton('Apply changes'), true);
+  await v.click('Back');
+  v.change('Select', 'screen-types-2', [{ value: '3', label: 'Task' }]);
+  await v.click('Review changes');
+  assert.equal(previews().length, 4);
+  assert.deepEqual(previews()[3].payload.projectId, '2');
+  assert.deepEqual(previews()[3].payload.screenTypes, ['3']);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete', f.state().data.message);
+  assert.deepEqual(f.configs.get('2').data.screenTypes, ['3']);
+  assert.equal(f.configs.get('1').data.screenTypes, undefined);
+});
+test('Apply to all reviews again only the spaces whose choice changed', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  const previews = () => v.payloads.filter((c) => c.name === 'configuration-preview');
+  await v.click('Next');
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  await v.click('Review changes');
+  assert.equal(previews().length, 3);
+  await v.click('Back');
+  // Space 1 already has Task, so only spaces 2 and 7 change.
+  v.change('Select', 'bulk-types', [{ value: '3', label: 'Task' }]);
+  await v.click('Apply to all');
+  await v.click('Review changes');
+  assert.equal(previews().length, 5);
+  assert.deepEqual(
+    previews()
+      .slice(3)
+      .map((c) => c.payload.projectId)
+      .sort(),
+    ['2', '7'],
+  );
+  assert.equal(v.hasButton('Apply changes'), true);
+  // Applying the same choice again changes nothing, so the review stands.
+  await v.click('Back');
+  await v.click('Apply to all');
+  await v.click('Review changes');
+  assert.equal(previews().length, 5);
+  assert.equal(v.hasButton('Apply changes'), true);
+});
+test('each space’s work type picker is named for its purpose and space', async () => {
+  const f = batchFixture();
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  const label = v.nodes('Label').find((n) => n.props.labelFor === 'screen-types-1');
+  assert.match(String(label.props.children), /^Work types for PR1 — Project 1$/);
+});
+/** Space 1 offers seven more work types with their own screens (14 changes); each step has
+ * time for four. Returns the picker options. */
+function manyTypes(f) {
+  const options = [];
+  for (let i = 0; i < 7; i++) {
+    const type = { id: String(10 + i), name: `Type ${10 + i}`, subtask: false, hierarchyLevel: 0 };
+    f.types.push(type);
+    f.projects.get('1').issueTypes.push(type);
+    f.screens.use('1', type.id, 'edit', String(300 + 2 * i));
+    f.screens.use('1', type.id, 'view', String(301 + 2 * i));
+    options.push({ value: type.id, label: type.name });
+  }
+  f.screens.clock.left = 9_000;
+  return options;
+}
+async function applyMany(f) {
+  const options = manyTypes(f);
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  v.change('Select', 'screen-types-1', options);
+  await v.click('Review changes');
+  return v;
+}
+test('a space with more screen changes than one step makes keeps advancing until it is done', async () => {
+  const f = batchFixture();
+  const v = await applyMany(f);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete', f.state().data.message);
+  assert.equal(v.calls.filter((name) => name === 'configuration-advance').length, 4);
+  assert.equal(f.writes.filter((w) => w.startsWith('add')).length, 14);
+  assert.match(v.text(), /1 of 1 spaces configured/);
+});
+test('a run stopped between steps shows the screen changes already made', async () => {
+  const f = batchFixture();
+  const v = await applyMany(f);
+  // Someone adds the field to a later screen in Jira during the first step.
+  const add = f.s.addScreenField;
+  f.s.addScreenField = async (...a) => {
+    await add(...a);
+    if (a[0] === '303') f.screens.screens.get('310').tabs[0].fields.push('customfield_1');
+  };
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'stopped');
+  assert.equal(v.calls.filter((name) => name === 'configuration-advance').length, 2);
+  assert.match(v.text(), /4 of 14 screen changes made/);
+  assert.match(v.text(), /No further change was made for this space/);
+});
+
+const reloadPicker = (v) =>
+  v.nodes('Select').find((n) => n.props.inputId === 'configuration-reload');
+test('the reload choice offers keep, on and off, starts on keep and keeps each space’s setting', async () => {
+  const f = batchFixture();
+  f.configs.set('1', { revision: 1, data: { type: '3', refreshAfterSave: true } });
+  f.configs.set('2', { revision: 1, data: { type: '3', refreshAfterSave: false } });
+  const v = ui(f);
+  await v.mount();
+  assert.match(v.text('Label'), /^Reload work item after saving prompts$/m);
+  assert.match(v.text('HelperMessage'), /Reloading can discard other unsaved edits/);
+  assert.deepEqual(
+    // Spread into this realm: the component runs in its own.
+    [...reloadPicker(v).props.options].map((o) => [o.value, o.label]),
+    [
+      ['keep', 'Keep each space’s setting'],
+      ['on', 'On for all selected spaces'],
+      ['off', 'Off for all selected spaces'],
+    ],
+  );
+  assert.equal(reloadPicker(v).props.value.label, 'Keep each space’s setting');
+  v.change('Select', 'configuration-type', { value: '3' });
+  await v.click('Next');
+  await v.click('Review changes');
+  assert.match(v.text(), /^Reload after saving\nKeep each space’s setting$/m);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete', f.state().data.message);
+  assert.equal(f.configs.get('1').data.refreshAfterSave, true);
+  assert.equal(f.configs.get('2').data.refreshAfterSave, false);
+  assert.equal(f.configs.get('7').data.refreshAfterSave, undefined);
+});
+test('one selected space words the keep choice for that space; on and off are reviewed', async () => {
+  for (const [choice, review, expected] of [
+    ['keep', 'Keep this space’s setting', true],
+    ['on', 'On', true],
+    ['off', 'Off', false],
+  ]) {
+    const f = batchFixture();
+    f.configs.set('1', { revision: 1, data: { type: '3', refreshAfterSave: true } });
+    const v = ui(f, [f.projects.get('1')]);
+    await v.mount();
+    assert.equal(reloadPicker(v).props.options[0].label, 'Keep this space’s setting');
+    v.change('Select', 'configuration-type', { value: '3' });
+    const option = reloadPicker(v).props.options.find((o) => o.value === choice);
+    v.change('Select', 'configuration-reload', option);
+    assert.equal(reloadPicker(v).props.value.value, choice);
+    await v.click('Next');
+    await v.click('Review changes');
+    assert.ok(v.text().includes(`Reload after saving\n${review}\n`), v.text());
+    await v.click('Apply changes');
+    assert.equal(f.configs.get('1').data.refreshAfterSave, expected, choice);
+  }
+});
+test('removing setup offers no reload choice', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'unlink' });
+  assert.equal(reloadPicker(v), undefined);
+  assert.equal(v.nodes('HelperMessage').length, 0);
+});
+test('Apply to all gives each space the chosen types it has, and the review groups changes by space', async () => {
+  const f = batchFixture();
+  const bug = { id: '4', name: 'Bug', subtask: false, hierarchyLevel: 0 };
+  f.types.push(bug);
+  for (const id of ['1', '2']) f.projects.get(id).issueTypes.push(bug);
+  f.configs.set('1', { revision: 1, data: { type: '3', screenTypes: ['4'] } });
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  assert.deepEqual(
+    [...picker(v, '1').props.value].map((o) => o.value),
+    ['4'],
+  );
+  assert.doesNotMatch(v.text(), /Was:/);
+  const bulk = v.nodes('Select').find((n) => n.props.inputId === 'bulk-types');
+  assert.deepEqual(
+    [...bulk.props.options].map((o) => o.label),
+    ['Task', 'Bug'],
+  );
+  v.change('Select', 'bulk-types', [
+    { value: '3', label: 'Task' },
+    { value: '4', label: 'Bug' },
+  ]);
+  await v.click('Apply to all');
+  assert.deepEqual(
+    [...picker(v, '1').props.value].map((o) => o.value),
+    ['3', '4'],
+  );
+  assert.deepEqual(
+    [...picker(v, '7').props.value].map((o) => o.value),
+    ['3'],
+  );
+  assert.match(v.text(), /^Was: Bug$/m);
+  assert.match(v.text(), /^Was: none · Bug isn’t in this space$/m);
+  await v.click('Review changes');
+  assert.match(
+    v.text(),
+    /^PR1 — Project 1\nPrompt type: Task → Prompt\nPrompt work type to Scheme 1/m,
+  );
+  assert.deepEqual(
+    v
+      .nodes('Lozenge')
+      .slice(0, 2)
+      .map((n) => [n.props.appearance, n.props.children.join('')]),
+    [
+      ['moved', 'Change'],
+      ['success', 'Add'],
+    ],
+  );
+  assert.match(v.text(), /Prompts of the old type stay where they’re already selected/);
+  assert.match(v.text(), /Nothing else changes: work items, descriptions and workflows/);
+  await v.click('Back');
+  assert.deepEqual(
+    [...picker(v, '7').props.value].map((o) => o.value),
+    ['3'],
+  );
+  await v.click('Back');
+  assert.equal(v.hasButton('Next'), true);
+  assert.deepEqual(f.writes, []);
+});
+
+test('Next reads each space’s work types once; Review reviews the spaces', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  const count = (name) => v.calls.filter((c) => c === name).length;
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 3);
+  assert.equal(count('configuration-preview'), 0);
+  v.change('Select', 'bulk-types', [{ value: '3', label: 'Task' }]);
+  await v.click('Apply to all');
+  await v.click('Back');
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 3);
+  assert.equal(count('configuration-preview'), 0);
+  assert.deepEqual(
+    [...picker(v, '1').props.value].map((o) => o.value),
+    ['3'],
+  );
+  await v.click('Review changes');
+  assert.equal(count('configuration-preview'), 3);
+  // The work types offered do not depend on the prompt type: another one leaves the prompt type
+  // out of the pickers without reading the spaces again, and only Review reviews them.
+  await v.click('Back');
+  await v.click('Back');
+  v.change('Select', 'configuration-mode', { value: 'existing' });
+  v.change('Select', 'configuration-type', { value: '3' });
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 3);
+  assert.equal(count('configuration-preview'), 3);
+  assert.ok(![...picker(v, '1').props.options].some((o) => o.value === '3'));
+  await v.click('Review changes');
+  assert.equal(count('configuration-preview'), 6);
+});
+test('editing the new type’s name does not read the spaces again', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Promt' } });
+  const count = (name) => v.calls.filter((c) => c === name).length;
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 3);
+  await v.click('Back');
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 3);
+  assert.equal(count('configuration-preview'), 0);
+  await v.click('Review changes');
+  assert.equal(count('configuration-preview'), 3);
+  assert.match(v.text(), /Prompt/);
+});
+test('a space whose work types could not be read keeps the dialog on the first step; Next reads only that space', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  const count = (name) => v.calls.filter((c) => c === name).length;
+  const project = f.p.project;
+  f.p.project = async (id) => {
+    if (id === '2') throw Error('Space unavailable');
+    return project(id);
+  };
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 3);
+  assert.equal(v.hasButton('Review changes'), false);
+  assert.match(v.text(), /Work types could not be read for PR2 — Project 2: Space unavailable/);
+  f.p.project = project;
+  await v.click('Next');
+  assert.equal(count('configuration-options'), 4);
+  assert.equal(v.hasButton('Review changes'), true);
+  assert.deepEqual(f.writes, []);
 });

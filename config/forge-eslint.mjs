@@ -3,7 +3,7 @@ import tseslint from 'typescript-eslint';
 import hooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 import a11y from 'eslint-plugin-jsx-a11y-x';
-import forgeLocal from './eslint-local-rules.mjs';
+import forgeLocal, { testOnlyMessage } from './eslint-local-rules.mjs';
 
 const a11yRecommended = a11y.configs.recommended;
 
@@ -68,12 +68,19 @@ const deployedSecurity = {
           ],
           message: 'No code execution or subprocesses in deployed apps.',
         },
+        { regex: '^\\.\\.?/tests(/|$)|/tests/', message: testOnlyMessage },
       ],
       paths: [{ name: '@forge/api', importNames: ['asApp'], message: asAppMessage }],
     },
   ],
-  'no-restricted-properties': ['error', { property: 'asApp', message: asAppMessage }],
+  'no-restricted-properties': [
+    'error',
+    { property: 'asApp', message: asAppMessage },
+    { object: 'process', property: 'env', message: testOnlyMessage },
+  ],
   'forge-local/strict-permission-check': 'error',
+  'forge-local/host-terms': 'error',
+  'forge-local/test-harness-names': 'error',
   'no-restricted-syntax': [
     'error',
     { selector: 'ImportExpression', message: 'Use static reviewed imports in deployed apps.' },

@@ -2,7 +2,8 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { chromium, expect } from '@playwright/test';
+import { chromium } from '@playwright/test';
+import { expect } from './support/expect.mjs';
 import {
   openRun,
   tokenRequest,

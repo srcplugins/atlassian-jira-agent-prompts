@@ -1,4 +1,4 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import { readSpaces } from '../src/space-reads.ts';
 import { finished } from '../src/batch-status.ts';
 import test from 'node:test';
@@ -185,6 +185,9 @@ test('closing configuration invalidates health without triggering any new checks
   assert.equal(f.nodes('Modal').length, 0);
   assert.equal(f.nodes('ConfigurationDialog').length, 1);
   assert.equal(f.nodes('ConfigurationDialog')[0].props.projects[0].id, '10');
+  // The dialog names spaces from the inventory this view loaded; it does not read it again.
+  assert.equal(f.nodes('ConfigurationDialog')[0].props.inventory.projects.length, 100);
+  assert.equal(f.nodes('ConfigurationDialog')[0].props.inventory.incomplete, false);
   await f.nodes('ConfigurationDialog')[0].props.onClose(true);
   await f.settle();
   assert.equal(f.nodes('ConfigurationDialog').length, 0);

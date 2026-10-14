@@ -39,7 +39,13 @@ export function forgeContract(...responses) {
   const route = (strings, ...values) =>
     strings.reduce(
       (out, part, i) =>
-        out + part + (i < values.length ? encodeURIComponent(String(values[i])) : ''),
+        out +
+        part +
+        (i < values.length
+          ? values[i] instanceof URLSearchParams
+            ? values[i].toString() // as Forge does for query parameters
+            : encodeURIComponent(String(values[i]))
+          : ''),
       '',
     );
   class Resolver {

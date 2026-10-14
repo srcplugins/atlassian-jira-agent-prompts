@@ -24,9 +24,25 @@ const notAppText = new Map([
   ['/^0\\/5 selected/', 'computed selection count'],
   ["'Owner only'", 'issue security level the access runner creates in Jira'],
   ["'Configure 2 spaces'", 'computed button label'],
+  ['/^Agent Prompts to /', 'review change line; the field name is computed'],
+  ['/^Description to /', 'review change line; the field name is computed'],
+  ['/^Summary to /', 'review change line; the field name is computed'],
+  ['/^Agent Prompts from /', 'review change line; the screen name is a template literal'],
+  [
+    '/^Agent Prompts on .+ \\(added outside the app\\)$/',
+    'review change line; the screen name is a template literal',
+  ],
+  [
+    '/^Agent Prompts on .+ \\(another configured space uses it\\)$/',
+    'review change line; the screen name is a template literal',
+  ],
+  ["'Agent Prompts added'", 'shared screen effect; the field name is computed'],
+  ['/^Blocked: /', 'review result; the reason is a template literal'],
+  ['/^\\d+ of 20 screen changes made$/', 'computed step progress'],
+  ["'Field Tab'", 'screen tab the setup runner creates in Jira'],
 ]);
 const locator =
-  /(?:getByText|getByLabel|getByPlaceholder|toContainText|toHaveText|hasText:|name:)\s*\(?\s*('(?:[^'\\]|\\.)*'|\/(?:[^/\\\n]|\\.)+\/[a-z]*)/g;
+  /(?:getByText|\bline|getByLabel|getByPlaceholder|toContainText|toHaveText|hasText:|name:)\s*\(?\s*('(?:[^'\\]|\\.)*'|\/(?:[^/\\\n]|\\.)+\/[a-z]*)/g;
 
 test('hosted text locators match text the app renders', () => {
   const found = files('tests/hosted')
@@ -51,4 +67,18 @@ test('hosted text locators match text the app renders', () => {
       found.some((entry) => entry.literal === literal),
       `Unused exception ${literal}`,
     );
+});
+
+// Outside the Playwright test runner `expect` waits only 5 s, and hosted Jira often takes longer, so
+// runners and support modules assert through the shared 30 s `expect`.
+test('hosted runners assert with the shared expect timeout', () => {
+  const direct = files('tests/hosted')
+    .filter((path) => path.endsWith('.mjs') && !path.endsWith('.spec.mjs'))
+    .filter((path) => path !== join('tests', 'hosted', 'support', 'expect.mjs'))
+    .filter((path) =>
+      /import\s*\{[^}]*\bexpect\b[^}]*\}\s*from\s*'(?:@playwright\/test|@srcplugins\/atlassian-forge-test-framework\/\w+)'/.test(
+        readFileSync(path, 'utf8'),
+      ),
+    );
+  assert.deepEqual(direct, [], 'Import expect from tests/hosted/support/expect.mjs');
 });

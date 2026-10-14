@@ -61,6 +61,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     [busy, setBusy] = useState(true),
     [error, setError] = useState(''),
     [incomplete, setIncomplete] = useState(false),
+    [inventoryFailed, setInventoryFailed] = useState(false),
     [detail, setDetail] = useState<string>(),
     [configure, setConfigure] = useState<string[]>(),
     [progress, setProgress] = useState<BatchRecord | null>(null),
@@ -93,9 +94,11 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           : inventory.projects,
       );
       setIncomplete(inventory.incomplete);
+      setInventoryFailed(false);
     } catch (e) {
       if (mounted.current) {
         setError(e instanceof Error ? e.message : 'Spaces could not be loaded.');
+        setInventoryFailed(true);
         // Inventory failure must not remove the current space's explicit recovery path.
         if (projectId) setProjects([{ id: projectId, key: projectId, name: 'Current space' }]);
       }
@@ -621,6 +624,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       {configure && (
         <ConfigurationDialog
           projects={projects.filter((p) => configure.includes(p.id))}
+          inventory={{ projects, incomplete: incomplete || inventoryFailed }}
           {...(configure.length === 1 &&
           results.find((r) => r.id === configure[0])?.value?.state.data.type
             ? { initialType: results.find((r) => r.id === configure[0])!.value!.state.data.type! }

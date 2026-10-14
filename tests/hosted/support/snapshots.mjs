@@ -1,12 +1,12 @@
 import { gunzipSync } from 'node:zlib';
 import {
-  expect,
   installation,
   observeAction,
   dismissOnboarding,
   adf,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { activeTarget, markers } from '@srcplugins/atlassian-forge-test-framework/core';
+import { expect } from './expect.mjs';
 import { spaceSettings } from './space-settings.mjs';
 export function editor(page) {
   const t = installation('agent-prompts');

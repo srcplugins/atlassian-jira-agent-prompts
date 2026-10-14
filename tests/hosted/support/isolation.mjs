@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { expect } from '@playwright/test';
+import { expect } from './expect.mjs';
 import {
   siteFor,
   activeTarget,

@@ -1,12 +1,13 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 const { createConfigurationBatch } = await import('../src/configuration-batch.ts');
 const { UserError } = await import('../src/service.ts');
-export function batchFixture() {
+const { screenFixture } = await import('./screen-fixture.mjs');
+export function batchFixture(ids = ['1', '2', '7']) {
   let run;
   const configs = new Map();
   const types = [{ id: '3', name: 'Task', subtask: false, hierarchyLevel: 0 }];
   const projects = new Map(
-    ['1', '2', '7'].map((id) => [
+    ids.map((id) => [
       id,
       {
         id,
@@ -25,6 +26,7 @@ export function batchFixture() {
     ]),
   );
   const writes = [];
+  const screens = screenFixture(() => [...projects.keys()], writes);
   const p = {
     allowed: async () => {},
     project: async (id) => structuredClone(projects.get(id)),
@@ -33,9 +35,11 @@ export function batchFixture() {
   };
   const s = {
     get: async (id) => structuredClone(configs.get(id)),
-    cas: async (id, revision, data) => {
+    cas: async (id, revision, data, screen) => {
       if ((configs.get(id)?.revision ?? 0) !== revision) throw new UserError('Conflict');
+      screens.check(screen);
       configs.set(id, { revision: revision + 1, data: structuredClone(data) });
+      screens.commit(screen);
     },
     types: async () => structuredClone(types),
     scheme: async (id) => structuredClone(schemes.get(id)),
@@ -53,11 +57,10 @@ export function batchFixture() {
         projects.get(id).issueTypes.push(types.find((t) => t.id === type));
       }
     },
-    impact: async () => ({ keys: [], incomplete: false }),
+    ...screens.ports,
   };
   const w = {
     admin: async () => {},
-    projects: async () => ({ projects: [...projects.values()], incomplete: false }),
     get: async () => structuredClone(run),
     cas: async (revision, data) => {
       if ((run?.revision ?? 0) !== revision) throw new UserError('Batch conflict');
@@ -65,14 +68,38 @@ export function batchFixture() {
     },
   };
   const api = createConfigurationBatch(p, s, w);
-  async function start(input = { name: 'Prompt' }, ids = ['1', '2']) {
+  /** `screenTypes` maps a space to the work types reviewed for its screens. Like Configure, a
+   * configuration names a reload choice; keep unless the test chooses one. */
+  async function start(options = { name: 'Prompt' }, ids = ['1', '2'], screenTypes = {}) {
+    const input = options.unlink ? options : { reloadAfterSave: 'keep', ...options };
     const entries = [];
-    for (const projectId of ids)
+    for (const projectId of ids) {
+      const types = screenTypes[projectId];
       entries.push({
         projectId,
-        fingerprint: (await api.preview('admin', projectId, input)).fingerprint,
+        fingerprint: (
+          await api.preview('admin', projectId, {
+            ...input,
+            ...(types ? { screenTypes: types } : {}),
+          })
+        ).fingerprint,
+        ...(types ? { screenTypes: types } : {}),
       });
+    }
     return api.start('admin', input, entries, run?.revision ?? 0);
   }
-  return { api, p, s, w, writes, configs, types, projects, schemes, start, state: () => run };
+  return {
+    api,
+    p,
+    s,
+    w,
+    writes,
+    configs,
+    types,
+    projects,
+    schemes,
+    screens,
+    start,
+    state: () => run,
+  };
 }

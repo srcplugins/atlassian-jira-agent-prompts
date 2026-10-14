@@ -1,4 +1,4 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const { snapshotContent, synchronizeDescription } = await import('../src/description.ts');

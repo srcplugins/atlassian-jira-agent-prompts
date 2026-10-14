@@ -62,13 +62,6 @@ modules:
         function: resolver
       title: Configure Agent Prompts for Jira
       useAsConfig: true
-    - key: get-started
-      resource: admin
-      render: native
-      resolver:
-        function: resolver
-      title: Configure Agent Prompts for Jira
-      useAsGetStarted: true
   jira:projectSettingsPage:
     - key: space-settings
       resource: project-settings
@@ -97,6 +90,7 @@ permissions:
     - write:jira-work
     - storage:app
     - manage:jira-configuration
+    - manage:jira-project
 app:
   id: ari:cloud:ecosystem::app/bcb6f961-1ff3-4d02-af4f-9c8c19ce2ebc
   runtime:

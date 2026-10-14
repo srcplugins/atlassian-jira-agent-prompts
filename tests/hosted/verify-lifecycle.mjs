@@ -3,7 +3,8 @@
 import assert from 'node:assert/strict';
 import { runIsolationProbe } from './support/isolation.mjs';
 import { readFileSync } from 'node:fs';
-import { chromium, expect } from '@playwright/test';
+import { chromium } from '@playwright/test';
+import { expect } from './support/expect.mjs';
 import {
   siteFor,
   activeTarget,
@@ -25,6 +26,7 @@ import {
 import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
 import { snapshotJourney, editor, resumeSavedJourney } from './support/snapshots.mjs';
 import { agentPromptsFixture } from './support/fixture.mjs';
+import { reviewConfiguration } from './support/configuration-dialog.mjs';
 
 const options = lifecycleOptions(
   process.argv.slice(2),
@@ -137,15 +139,11 @@ try {
       await admin.getByRole('combobox', { name: 'Existing type', exact: true }).click();
       await admin.getByRole('option', { name: type.name, exact: true }).click();
       await admin
-        .getByRole('checkbox', { name: 'Reload work item after saving prompts', exact: true })
-        .uncheck();
+        .getByRole('combobox', { name: 'Reload work item after saving prompts', exact: true })
+        .click();
+      await admin.getByRole('option', { name: 'Off for all selected spaces', exact: true }).click();
     }
-    const plan = await observeAction(
-      admin,
-      'configuration-preview',
-      () => admin.getByRole('button', { name: 'Review changes', exact: true }).click(),
-      target,
-    );
+    const plan = await reviewConfiguration(admin, target, unlink);
     assert.equal(plan.project.id, project.id);
     if (!unlink) verifyConfigurationPlan(plan, project.id, type.id);
     else assert.equal(plan.unlink, true);

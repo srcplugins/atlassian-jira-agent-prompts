@@ -1,4 +1,12 @@
-import { createSettings, type SettingsPorts, type SettingsRecord } from './settings';
+import {
+  createSettings,
+  reloadInput,
+  screenTypesInput,
+  type ScreenInfo,
+  type ScreenRecord,
+  type SettingsPorts,
+  type SettingsRecord,
+} from './settings';
 import {
   createConfigurationBatch,
   type BatchPorts,
@@ -20,6 +28,7 @@ import {
   JiraRejected,
   JiraUnavailable,
   StorageUnavailable,
+  limited,
   numeric,
   UserError,
   type Context,
@@ -68,6 +77,16 @@ function exactKey(value: unknown, message: string) {
   const key = typeof value === 'string' ? value.trim().toUpperCase() : '';
   if (!/^[A-Z][A-Z0-9_]{1,30}-[1-9][0-9]{0,19}$/.test(key)) throw new UserError(message);
   return key;
+}
+/** IDs in groups of 100, the most Jira returns a page. */
+function pages(ids: string[]) {
+  return Array.from({ length: Math.ceil(ids.length / 100) }, (_, i) =>
+    ids.slice(i * 100, i * 100 + 100),
+  );
+}
+/** A query naming each ID (`id=1&id=2`), one page of up to 100. */
+function byIds(ids: string[]) {
+  return new URLSearchParams([...ids.map((id) => ['id', id]), ['maxResults', '100']]);
 }
 /** The trusted space (and, on a work item, its ID) from a field or search resolver context. */
 function context(raw: unknown): Context {
@@ -154,7 +173,9 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
         if (!Array.isArray(fields)) throw new UserError('Incomplete Jira field data.');
         const matches = fields.filter((f) => f.schema?.custom === fieldType());
         if (matches.length !== 1 || !/^customfield_[1-9]\d*$/.test(matches[0].id))
-          throw new UserError('Add the Agent Prompts field to this work item’s screen.');
+          throw new UserError(
+            'The Agent Prompts field could not be identified in Jira. Check that the app is installed and its field is not in the trash.',
+          );
         return matches[0].id;
       })();
       return fieldPromise;
@@ -325,24 +346,48 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
 export function createSettingsPorts(sdk: Sdk): SettingsPorts {
   const { route, kvs, Filter, FilterConditions } = sdk;
   const request = requester(sdk);
+  // One resolver invocation may run for 25 seconds. Reads that find who uses a screen stop after
+  // 12, so a blocked review comes back instead of a timeout; writes need the rest (`timeLeft`).
+  const started = Date.now();
+  const late = () => Date.now() > started + 12_000;
+  // Who uses a screen: Jira has no direct lookup, so every screen scheme is listed once per
+  // request with the work type screen schemes using it, then those schemes' spaces.
+  type Read<T> = Promise<T & { complete: boolean; late?: boolean }>;
+  let screenSchemeList:
+    Read<{ schemes: { id: string; screens: string[]; itss?: string[] }[] }> | undefined;
+  let mappingScan: Read<{ users: Map<string, string[]> }> | undefined;
+  const itssProjects: Record<
+    string,
+    Read<{ projects: { id: string; key?: string; name?: string }[] }>
+  > = {};
   return {
     get: (project) => readState<SettingsRecord>(kvs, `config-${project}`),
-    cas: async (project, revision, data) => {
+    cas: async (project, revision, data, screen) => {
+      const condition = (revision: number) => ({
+        entityName: 'native-prompt-state',
+        conditions: new Filter<SettingsRecord>().and(
+          'revision',
+          revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
+        ),
+      });
       try {
-        await kvs
+        // A space's setup and the screen ownership record it changes commit together.
+        let transaction = kvs
           .transact()
           .set(
             `config-${project}`,
             { revision: revision + 1, data: JSON.parse(JSON.stringify(data)) },
-            {
-              entityName: 'native-prompt-state',
-              conditions: new Filter<SettingsRecord>().and(
-                'revision',
-                revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
-              ),
-            },
-          )
-          .execute();
+            condition(revision),
+          );
+        if (screen)
+          transaction = screen.data
+            ? transaction.set(
+                `screen-${screen.id}`,
+                { revision: screen.revision + 1, data: JSON.parse(JSON.stringify(screen.data)) },
+                condition(screen.revision),
+              )
+            : transaction.delete(`screen-${screen.id}`, condition(screen.revision));
+        await transaction.execute();
       } catch {
         throw new UserError(
           'Configuration changed or storage is unavailable. Check the space again.',
@@ -462,34 +507,345 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
         );
       }
     },
-    impact: async (project, _type, field) => {
-      if (!/^customfield_[1-9]\d*$/.test(field)) throw new UserError('Invalid prompt field.');
-      const value = await request(route`/rest/api/3/search/jql`, 'POST', {
-        jql: `project = ${numeric(project)} AND cf[${field.slice(12)}] IS NOT EMPTY ORDER BY key ASC`,
-        fields: ['summary'],
-        maxResults: 100,
-      });
-      if (
-        !Array.isArray(value?.issues) ||
-        typeof value.isLast !== 'boolean' ||
-        value.issues.some((i: { key?: unknown }) => typeof i.key !== 'string')
-      )
-        throw new UserError('Jira returned incomplete data about work items using these prompts.');
-      return { keys: value.issues.map((i: { key: string }) => i.key), incomplete: !value.isLast };
-    },
+    // Jira returns at most 200 create fields a page; past 1,000 the list is reported incomplete.
     createFields: async (project, type) => {
-      const value = await request(
-        route`/rest/api/3/issue/createmeta/${project}/issuetypes/${type}?maxResults=200`,
-      );
-      if (!Array.isArray(value?.fields) || value.total > value.fields.length)
-        throw new UserError('Create fields are incomplete.');
-      return value.fields.map((f: { fieldId: string }) => f.fieldId);
+      const fields: string[] = [];
+      for (let start = 0; start < 1000;) {
+        const value = await request(
+          route`/rest/api/3/issue/createmeta/${project}/issuetypes/${type}?startAt=${start}&maxResults=200`,
+        );
+        if (!Array.isArray(value?.fields)) throw new UserError('Create fields are incomplete.');
+        fields.push(...value.fields.map((f: { fieldId: string }) => f.fieldId));
+        if (
+          typeof value.total === 'number' ? fields.length >= value.total : value.fields.length < 200
+        )
+          return fields;
+        if (!value.fields.length) throw new UserError('Create fields are incomplete.');
+        start += value.fields.length;
+      }
+      throw new UserError('Create fields are incomplete.');
     },
+    screenUses: async (project, uses) => {
+      const assigned = await request(
+        route`/rest/api/3/issuetypescreenscheme/project?projectId=${project}`,
+      );
+      if (
+        assigned?.isLast !== true ||
+        !Array.isArray(assigned.values) ||
+        assigned.values.length !== 1 ||
+        !assigned.values[0]?.projectIds?.includes?.(project)
+      )
+        throw new UserError('Could not identify the space’s screen scheme.');
+      const scheme = numeric(assigned.values[0].issueTypeScreenScheme?.id);
+      const rows = new Map<string, string>();
+      for (let start = 0, page = 0; ; page++) {
+        const value =
+          page < 10
+            ? await request(
+                route`/rest/api/3/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=${scheme}&startAt=${start}&maxResults=100`,
+              )
+            : undefined;
+        if (
+          !Array.isArray(value?.values) ||
+          value.startAt !== start ||
+          typeof value.isLast !== 'boolean' ||
+          (!value.isLast && !value.values.length)
+        )
+          throw new UserError('The space’s screen scheme could not be read completely.');
+        for (const row of value.values) {
+          const type = row?.issueTypeId === 'default' ? 'default' : numeric(row?.issueTypeId);
+          if (numeric(row.issueTypeScreenSchemeId) !== scheme || rows.has(type))
+            throw new UserError('The space’s screen scheme is inconsistent.');
+          rows.set(type, numeric(row.screenSchemeId));
+        }
+        if (value.isLast) break;
+        start += value.values.length;
+      }
+      const screenSchemes = new Map<string, Record<string, string>>();
+      const chosen = uses.map((u) => {
+        const row = (u.type && rows.get(u.type)) || rows.get('default');
+        if (!row) throw new UserError('The space’s screen scheme has no default screens.');
+        return row;
+      });
+      for (const ids of pages([...new Set(chosen)])) {
+        const value = await request(route`/rest/api/3/screenscheme?${byIds(ids)}`);
+        if (
+          value?.isLast !== true ||
+          !Array.isArray(value.values) ||
+          value.values.length !== ids.length
+        )
+          throw new UserError('A screen scheme could not be read.');
+        for (const item of value.values) {
+          const id = String(item?.id);
+          if (!ids.includes(id) || !record(item.screens))
+            throw new UserError('A screen scheme could not be read.');
+          screenSchemes.set(
+            id,
+            Object.fromEntries(
+              ['default', 'create', 'edit', 'view']
+                .filter((op) => item.screens[op] !== undefined)
+                .map((op) => [op, numeric(String(item.screens[op]))]),
+            ),
+          );
+        }
+      }
+      return uses.map((u, i) => {
+        const screens = screenSchemes.get(chosen[i]!)!;
+        const screen = screens[u.op] ?? screens.default;
+        if (!screen) throw new UserError('A screen scheme has no default screen.');
+        return screen;
+      });
+    },
+    // Names come from one bulk read and where the field sits from one field read, so only a
+    // screen without the field (for its first tab) or one in `full` reads its tabs.
+    screens: async (ids, field, full = []) => {
+      const names = new Map<string, string>();
+      for (const chunk of pages(ids)) {
+        const value = await request(route`/rest/api/3/screens?${byIds(chunk)}`);
+        if (value?.isLast !== true || !Array.isArray(value.values))
+          throw new UserError('A screen could not be read.');
+        for (const item of value.values) {
+          if (!chunk.includes(String(item?.id)) || typeof item.name !== 'string')
+            throw new UserError('A screen could not be read.');
+          names.set(String(item.id), item.name);
+        }
+      }
+      // A screen deleted in Jira is reported as missing, so its stale ownership can be dropped.
+      const present = ids.filter((id) => names.has(id));
+      const placed = present.some((id) => !full.includes(id))
+        ? await fieldTabs(field)
+        : new Map<string, string>();
+      return limited(ids, async (id): Promise<ScreenInfo | undefined> => {
+        const name = names.get(id);
+        if (name === undefined) return undefined;
+        const tab = placed.get(id);
+        if (tab && !full.includes(id)) return { id, name, tabs: [{ id: tab, fields: [field] }] };
+        const tabs = await request(route`/rest/api/3/screens/${id}/tabs`);
+        if (!Array.isArray(tabs) || tabs.length > 50)
+          throw new UserError('A screen’s tabs could not be read.');
+        const read = [];
+        for (const t of tabs) {
+          const tabId = numeric(String(t?.id));
+          if (!full.includes(id)) {
+            read.push({ id: tabId, fields: [] });
+            continue;
+          }
+          const fields = await request(route`/rest/api/3/screens/${id}/tabs/${tabId}/fields`);
+          if (!Array.isArray(fields) || fields.some((f) => typeof f?.id !== 'string'))
+            throw new UserError('A screen’s fields could not be read.');
+          read.push({ id: tabId, fields: fields.map((f: { id: string }) => f.id) });
+        }
+        return { id, name, tabs: read };
+      });
+    },
+    screenImpact: async (screen) => {
+      screenSchemeList ??= listScreenSchemes();
+      const list = await screenSchemeList;
+      const matching = list.schemes.filter((s) => s.screens.includes(screen));
+      let complete = list.complete;
+      let timedOut = !!list.late;
+      const itss = new Set(matching.flatMap((s) => s.itss ?? []));
+      // The expansion is one page; the full mapping lists the rest.
+      if (matching.some((s) => !s.itss)) {
+        mappingScan ??= scanMappings();
+        const mapping = await mappingScan;
+        complete &&= mapping.complete;
+        timedOut ||= !!mapping.late;
+        for (const s of matching)
+          if (!s.itss) for (const id of mapping.users.get(s.id) ?? []) itss.add(id);
+      }
+      const projects = new Map<string, { id: string; key?: string; name?: string }>();
+      const read = await limited([...itss], (id) => (itssProjects[id] ??= projectsOf(id)));
+      for (const value of read) {
+        complete &&= value.complete;
+        timedOut ||= !!value.late;
+        for (const p of value.projects) projects.set(p.id, p);
+      }
+      if (projects.size > 1000) complete = false;
+      return {
+        projects: [...projects.values()].sort((a, b) => a.id.localeCompare(b.id)),
+        complete,
+        ...(!complete && timedOut ? { timedOut } : {}),
+      };
+    },
+    addScreenField: async (screen, tab, field) => {
+      try {
+        await request(route`/rest/api/3/screens/${screen}/tabs/${tab}/fields`, 'POST', {
+          fieldId: field,
+        });
+      } catch (e) {
+        classifyWrite(
+          e,
+          'screen-field-add',
+          (status) =>
+            `Jira rejected adding a field to a screen (HTTP ${status}). Nothing was changed.`,
+        );
+      }
+    },
+    removeScreenField: async (screen, tab, field) => {
+      try {
+        await request(route`/rest/api/3/screens/${screen}/tabs/${tab}/fields/${field}`, 'DELETE');
+      } catch (e) {
+        classifyWrite(
+          e,
+          'screen-field-remove',
+          (status) =>
+            `Jira rejected removing a field from a screen (HTTP ${status}). Nothing was changed.`,
+        );
+      }
+    },
+    screenRecord: (screen) => readState<ScreenRecord>(kvs, `screen-${screen}`),
+    timeLeft: () => started + 22_000 - Date.now(),
   };
+  /** Where `field` sits: screen ID to tab ID, across every screen that has it. */
+  async function fieldTabs(field: string) {
+    if (!/^customfield_[1-9]\d*$/.test(field)) throw new UserError('Invalid prompt field.');
+    const tabs = new Map<string, string>();
+    // Ten pages, like the screen scheme mapping: a thousand screens is past any review budget.
+    for (let start = 0, page = 0; ; page++) {
+      if (page >= 10)
+        throw new UserError('Too many screens use the Agent Prompts field to review at once.');
+      const value = await request(
+        route`/rest/api/3/field/${field}/screens?startAt=${start}&maxResults=100&expand=tab`,
+      );
+      if (
+        !Array.isArray(value?.values) ||
+        value.startAt !== start ||
+        typeof value.isLast !== 'boolean' ||
+        (!value.isLast && !value.values.length)
+      )
+        throw new UserError('The screens using the Agent Prompts field could not be read.');
+      for (const item of value.values) {
+        if (item?.tab?.id === undefined)
+          throw new UserError('The screens using the Agent Prompts field could not be read.');
+        tabs.set(numeric(String(item.id)), numeric(String(item.tab.id)));
+      }
+      if (value.isLast) return tabs;
+      start += value.values.length;
+    }
+  }
+  /** Every screen scheme with its screens and, when Jira listed them all, the work type screen
+   * schemes using it (none when the expansion is omitted). The first page gives the total, so the
+   * rest are read four at a time. */
+  async function listScreenSchemes() {
+    const schemes = new Map<string, { id: string; screens: string[]; itss?: string[] }>();
+    const page = async (start: number) => {
+      if (late()) return undefined;
+      const value = await request(
+        route`/rest/api/3/screenscheme?startAt=${start}&maxResults=100&expand=issueTypeScreenSchemes`,
+      );
+      if (
+        !Array.isArray(value?.values) ||
+        value.startAt !== start ||
+        typeof value.isLast !== 'boolean' ||
+        (!value.isLast && !value.values.length)
+      )
+        throw new UserError('Screen schemes could not be read completely.');
+      for (const item of value.values) {
+        const nested = item?.issueTypeScreenSchemes;
+        if (
+          !record(item?.screens) ||
+          (nested !== undefined &&
+            (!Array.isArray(nested?.values) || typeof nested.isLast !== 'boolean'))
+        )
+          throw new UserError('A screen scheme could not be read.');
+        const id = numeric(String(item.id));
+        schemes.set(id, {
+          id,
+          screens: Object.values(item.screens).map((s) => numeric(String(s))),
+          ...(nested === undefined
+            ? { itss: [] }
+            : nested.isLast
+              ? { itss: nested.values.map((i: { id?: unknown }) => numeric(String(i?.id))) }
+              : {}),
+        });
+      }
+      return {
+        isLast: value.isLast as boolean,
+        next: start + value.values.length,
+        total: value.total as unknown,
+      };
+    };
+    const done = (complete: boolean) => ({
+      schemes: [...schemes.values()],
+      complete,
+      ...(complete ? {} : { late: true }),
+    });
+    let read = await page(0);
+    if (!read) return done(false);
+    if (!read.isLast && typeof read.total === 'number' && read.total > read.next) {
+      const starts = [];
+      for (let start = read.next; start < read.total; start += read.next) starts.push(start);
+      const rest = await limited(starts, page);
+      if (rest.some((r) => !r)) return done(false);
+      read = rest.at(-1)!;
+    }
+    // Without a total, or when schemes were added meanwhile, the rest is read page by page.
+    while (!read.isLast) {
+      read = await page(read.next);
+      if (!read) return done(false);
+    }
+    return done(true);
+  }
+  /** Every work type screen scheme row, grouped by screen scheme. */
+  async function scanMappings(): Read<{ users: Map<string, string[]> }> {
+    const users = new Map<string, string[]>();
+    for (let start = 0; ;) {
+      if (late()) return { users, complete: false, late: true };
+      const value = await request(
+        route`/rest/api/3/issuetypescreenscheme/mapping?startAt=${start}&maxResults=100`,
+      );
+      if (
+        !Array.isArray(value?.values) ||
+        value.startAt !== start ||
+        typeof value.isLast !== 'boolean' ||
+        (!value.isLast && !value.values.length)
+      )
+        throw new UserError('Screen schemes could not be read completely.');
+      for (const row of value.values) {
+        const scheme = numeric(String(row?.screenSchemeId));
+        const itss = numeric(String(row?.issueTypeScreenSchemeId));
+        const known = users.get(scheme) ?? [];
+        if (!known.includes(itss)) users.set(scheme, [...known, itss]);
+      }
+      if (value.isLast) return { users, complete: true };
+      start += value.values.length;
+    }
+  }
+  async function projectsOf(
+    itss: string,
+  ): Read<{ projects: { id: string; key?: string; name?: string }[] }> {
+    const projects = [];
+    for (let start = 0, page = 0; page < 10; page++) {
+      if (late()) return { projects, complete: false, late: true };
+      const value = await request(
+        route`/rest/api/3/issuetypescreenscheme/${itss}/project?startAt=${start}&maxResults=100`,
+      );
+      if (
+        !Array.isArray(value?.values) ||
+        value.startAt !== start ||
+        typeof value.isLast !== 'boolean' ||
+        (!value.isLast && !value.values.length)
+      )
+        throw new UserError('The spaces using a screen could not be read completely.');
+      for (const p of value.values)
+        projects.push({
+          id: numeric(String(p?.id)),
+          ...(typeof p.key === 'string' ? { key: p.key } : {}),
+          ...(typeof p.name === 'string' ? { name: p.name } : {}),
+        });
+      if (value.isLast) return { projects, complete: true };
+      start += value.values.length;
+    }
+    return { projects, complete: false };
+  }
 }
 // Storage key of the unfinished multi-space configuration. Renaming it would orphan a saved run.
 const batchStorageKey = 'configuration-batch';
-export function createBatchPorts(sdk: Sdk): BatchPorts {
+/** The batch ports plus the space inventory, which only the health view reads. */
+export function createBatchPorts(
+  sdk: Sdk,
+): BatchPorts & { projects(): Promise<{ projects: InventoryProject[]; incomplete: boolean }> } {
   const request = requester(sdk);
   const { route, kvs, Filter, FilterConditions } = sdk;
   return {
@@ -598,6 +954,7 @@ export function registerResolvers(sdk: Sdk) {
     'catalog',
     'status',
     'cancel-interrupted',
+    'options',
     'preview',
     'start',
     'advance',
@@ -616,25 +973,28 @@ export function registerResolvers(sdk: Sdk) {
             throw new UserError('Open Configure Agent Prompts for Jira in Jira settings.');
           const payload = request.payload ?? {};
           const fields =
-            action === 'preview'
-              ? ['projectId', 'name', 'type', 'unlink', 'refreshAfterSave']
-              : action === 'start'
-                ? [
-                    'name',
-                    'type',
-                    'entries',
-                    'revision',
-                    'allowShared',
-                    'unlink',
-                    'refreshAfterSave',
-                  ]
-                : action === 'advance'
-                  ? ['id', 'revision']
-                  : action === 'stop'
-                    ? ['id', 'revision', 'acknowledged']
-                    : action === 'cancel-interrupted'
-                      ? ['id']
-                      : [];
+            action === 'options'
+              ? ['projectId']
+              : action === 'preview'
+                ? ['projectId', 'name', 'type', 'unlink', 'reloadAfterSave', 'screenTypes']
+                : action === 'start'
+                  ? [
+                      'name',
+                      'type',
+                      'entries',
+                      'revision',
+                      'allowShared',
+                      'allowSharedScreens',
+                      'unlink',
+                      'reloadAfterSave',
+                    ]
+                  : action === 'advance'
+                    ? ['id', 'revision']
+                    : action === 'stop'
+                      ? ['id', 'revision', 'acknowledged']
+                      : action === 'cancel-interrupted'
+                        ? ['id']
+                        : [];
           if (!record(payload) || Object.keys(payload).some((key) => !fields.includes(key)))
             throw new UserError('Unexpected configuration request fields.');
           if (
@@ -647,27 +1007,38 @@ export function registerResolvers(sdk: Sdk) {
             createSettingsPorts(sdk),
             createBatchPorts(sdk),
           );
+          if (action === 'options')
+            return batch.options(raw.accountId, String(payload.projectId ?? ''));
           if (action === 'preview' || action === 'start') {
             if (
               (payload.name !== undefined && typeof payload.name !== 'string') ||
               (payload.type !== undefined && typeof payload.type !== 'string') ||
               (payload.allowShared !== undefined && typeof payload.allowShared !== 'boolean') ||
-              (payload.unlink !== undefined && typeof payload.unlink !== 'boolean') ||
-              (payload.refreshAfterSave !== undefined &&
-                typeof payload.refreshAfterSave !== 'boolean')
+              (payload.allowSharedScreens !== undefined &&
+                typeof payload.allowSharedScreens !== 'boolean') ||
+              (payload.unlink !== undefined && typeof payload.unlink !== 'boolean')
             )
               throw new UserError('Invalid work type.');
+            // Every configuration names its reload choice; removing setup names none.
+            const reloadAfterSave =
+              payload.unlink === true && payload.reloadAfterSave === undefined
+                ? undefined
+                : reloadInput(payload.reloadAfterSave);
             const input = {
               ...(typeof payload.name === 'string' ? { name: payload.name } : {}),
               ...(typeof payload.type === 'string' ? { type: payload.type } : {}),
               ...(payload.allowShared === true ? { allowShared: true } : {}),
+              ...(payload.allowSharedScreens === true ? { allowSharedScreens: true } : {}),
               ...(payload.unlink === true ? { unlink: true } : {}),
-              ...(typeof payload.refreshAfterSave === 'boolean'
-                ? { refreshAfterSave: payload.refreshAfterSave }
-                : {}),
+              ...(reloadAfterSave ? { reloadAfterSave } : {}),
             };
             if (action === 'preview')
-              return batch.preview(raw.accountId, String(payload.projectId ?? ''), input);
+              return batch.preview(raw.accountId, String(payload.projectId ?? ''), {
+                ...input,
+                ...(payload.screenTypes !== undefined
+                  ? { screenTypes: screenTypesInput(payload.screenTypes)! }
+                  : {}),
+              });
             if (
               !Array.isArray(payload.entries) ||
               payload.entries.some(
@@ -675,14 +1046,22 @@ export function registerResolvers(sdk: Sdk) {
                   !record(e) ||
                   typeof e.projectId !== 'string' ||
                   typeof e.fingerprint !== 'string' ||
-                  Object.keys(e).some((k) => !['projectId', 'fingerprint'].includes(k)),
+                  Object.keys(e).some(
+                    (k) => !['projectId', 'fingerprint', 'screenTypes'].includes(k),
+                  ),
               )
             )
               throw new UserError('Invalid reviewed spaces.');
             return batch.start(
               raw.accountId,
               input,
-              payload.entries as { projectId: string; fingerprint: string }[],
+              (payload.entries as Record<string, unknown>[]).map((e) => ({
+                projectId: e.projectId as string,
+                fingerprint: e.fingerprint as string,
+                ...(e.screenTypes !== undefined
+                  ? { screenTypes: screenTypesInput(e.screenTypes)! }
+                  : {}),
+              })),
               Number(payload.revision),
             );
           }

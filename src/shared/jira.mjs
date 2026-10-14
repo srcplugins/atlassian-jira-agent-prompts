@@ -22,6 +22,8 @@ const definitiveRejections = {
   'issue-edit': [400, 401, 403, 404, 409, 422, 429],
   'issuetype-create': [400, 401, 403, 409, 429],
   'issuetypescheme-add': [400, 401, 403, 404, 429],
+  'screen-field-add': [400, 401, 403, 404, 429],
+  'screen-field-remove': [400, 401, 403, 404, 429],
 };
 
 /**

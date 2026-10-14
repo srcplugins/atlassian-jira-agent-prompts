@@ -1,4 +1,4 @@
-import './typescript-loader.mjs';
+import './support/typescript-loader.mjs';
 import test from 'node:test';
 import { assertRovoReadContract } from './support/contracts.mjs';
 const { registerRovo } = await import('../src/integration.ts');

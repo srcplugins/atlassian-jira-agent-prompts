@@ -11,7 +11,8 @@ import {
   renameSync,
   unlinkSync,
 } from 'node:fs';
-import { chromium, expect } from '@playwright/test';
+import { chromium } from '@playwright/test';
+import { expect } from './support/expect.mjs';
 import {
   activeTarget,
   fixtureProject,
@@ -26,6 +27,13 @@ import {
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { spaceSettings } from './support/space-settings.mjs';
 import { agentPromptsFixture, setupRunSpace } from './support/fixture.mjs';
+import { setupCleanup } from './support/setup-cleanup.mjs';
+import {
+  chooseScreenTypes,
+  nextStep,
+  reviewConfiguration,
+  reviewStep,
+} from './support/configuration-dialog.mjs';
 
 const [mode, recoveryId] = process.argv.slice(2);
 const fault = process.env.NATIVE_SETUP_FAULT;
@@ -33,12 +41,25 @@ assert.ok(!fault || ['concurrent', 'lost-response'].includes(fault));
 // Abandoned mode: admin A leaves a reviewed configuration ready after its first space; a second
 // administrator (saved admin2 session) must be able to review and release it.
 const abandoned = process.env.NATIVE_SETUP_ABANDONED === '1';
-// Bulk mode: configure both spaces with an existing type, reload off then on, then remove setup from both.
+// Bulk mode: configure both spaces with an existing type, reload off then on, then remove setup from
+// both; screens of one chosen work type gain and lose the field, and a field placed by hand is kept.
 const bulk = process.env.NATIVE_SETUP_BULK === '1';
 // Rejected mode: a type with the reviewed new name is created directly in Jira before Apply.
 const rejected = process.env.NATIVE_SETUP_REJECTED === '1';
-assert.ok([abandoned, bulk, rejected].filter(Boolean).length <= 1, 'Choose one mode');
-assert.ok(!(abandoned || bulk || rejected) || (!fault && process.env.NATIVE_SETUP_SHARED !== '1'));
+// Shared screens mode: three spaces use the first space's screens; two are configured.
+const sharedScreens = process.env.NATIVE_SETUP_SCREENS === '1';
+// Steps mode: ten new work types in the first space get their own edit and view screens, so its
+// 20 screen changes cannot fit one step. The second space's default screens are the first new
+// type's, and an unused screen scheme names one of the new screens.
+const steps = process.env.NATIVE_SETUP_STEPS === '1';
+assert.ok(
+  [abandoned, bulk, rejected, sharedScreens, steps].filter(Boolean).length <= 1,
+  'Choose one mode',
+);
+assert.ok(
+  !(abandoned || bulk || rejected || sharedScreens || steps) ||
+    (!fault && process.env.NATIVE_SETUP_SHARED !== '1'),
+);
 assert.ok(mode === 'run' || (mode === 'cleanup' && /^[0-9a-f-]{36}$/.test(recoveryId)));
 assert.equal(activeTarget().host, siteFor('primary'));
 assert.equal(
@@ -77,7 +98,12 @@ const j =
         id,
         site: activeTarget().site,
         shared: process.env.NATIVE_SETUP_SHARED === '1',
-        fixtures: (process.env.NATIVE_SETUP_SHARED === '1' ? [0, 1, 2] : [0, 1]).map((n) => ({
+        sharedScreens,
+        steps,
+        fixtures: (process.env.NATIVE_SETUP_SHARED === '1' || sharedScreens
+          ? [0, 1, 2]
+          : [0, 1]
+        ).map((n) => ({
           key: `NP${id.replaceAll('-', '').slice(0, 7).toUpperCase()}${n}`,
           marker: setupRunSpace(id, n),
         })),
@@ -87,7 +113,7 @@ const j =
       };
 assert.equal(j.id, id);
 assert.equal(j.site, activeTarget().site);
-assert.equal(j.fixtures.length, j.shared ? 3 : 2);
+assert.equal(j.fixtures.length, j.shared || j.sharedScreens ? 3 : 2);
 const persist = () => {
   writeFileSync(`${path}.tmp`, JSON.stringify(j, null, 2) + '\n', { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
@@ -95,6 +121,11 @@ const persist = () => {
 persist();
 const r = await tokenRequest();
 const api = client(r);
+const { pages, mappings, known, emptyProject, fieldTab, cleanup } = setupCleanup({
+  j,
+  api,
+  persist,
+});
 let browser;
 const stage = (value) => {
   j.stage = value;
@@ -160,151 +191,50 @@ async function applyWithFault(page, target) {
     await page.unroute(pattern);
   }
 }
-async function pages(endpoint) {
-  const out = [];
-  for (let start = 0, n = 0; n < 100; n++) {
-    const v = await api(
-      `${endpoint}${endpoint.includes('?') ? '&' : '?'}startAt=${start}&maxResults=100`,
-    );
-    assert.ok(Array.isArray(v?.values));
-    assert.equal(v.startAt, start);
-    out.push(...v.values);
-    if (v.isLast === true) return out;
-    assert.ok(v.values.length > 0);
-    start += v.values.length;
+// The screens a fixture space's work type uses for the given operations. The template gives each
+// space its own schemes and screens; in shared screens mode every space uses the first space's.
+// Anything else stops the run before the app changes a screen.
+async function typeScreens(f, typeId, ops = ['edit', 'view']) {
+  const owner = j.sharedScreens ? j.fixtures[0] : f;
+  const members = j.sharedScreens ? j.fixtures : [f];
+  const assigned = await pages(`/issuetypescreenscheme/project?projectId=${f.project.id}`);
+  assert.equal(assigned.length, 1);
+  const itss = assigned[0].issueTypeScreenScheme;
+  assert.ok(itss.name.startsWith(`${owner.key}:`), 'Fixture screens must be the run’s own');
+  assert.deepEqual(
+    (await pages(`/issuetypescreenscheme/${itss.id}/project`)).map((p) => String(p.id)).sort(),
+    members.map((m) => m.project.id).sort(),
+  );
+  const rows = await pages(`/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=${itss.id}`);
+  const row =
+    rows.find((m) => m.issueTypeId === typeId) ?? rows.find((m) => m.issueTypeId === 'default');
+  const scheme = (
+    await pages(`/screenscheme?id=${row.screenSchemeId}&expand=issueTypeScreenSchemes`)
+  )[0];
+  assert.ok(scheme.name.startsWith(`${owner.key}:`));
+  assert.deepEqual(
+    scheme.issueTypeScreenSchemes.values.map((x) => String(x.id)),
+    [String(itss.id)],
+  );
+  const ids = [...new Set(ops.map((op) => String(scheme.screens[op] ?? scheme.screens.default)))];
+  for (const screen of ids) {
+    const found = await pages(`/screens?id=${screen}`);
+    assert.equal(found.length, 1);
+    assert.ok(found[0].name.startsWith(`${owner.key}:`), 'Fixture screens must be the run’s own');
   }
-  throw Error('Complete pagination required');
+  return ids;
 }
-const mappings = async () =>
-  (await pages('/issuetypescheme/mapping'))
-    .map((x) => `${x.issueTypeSchemeId}:${x.issueTypeId}`)
-    .sort();
-// Mappings of schemes that existed at the baseline. Schemes created meanwhile by unrelated work on
-// the shared site are ignored here; one that acquires the synthetic type still fails cleanup.
-const known = (values) => {
-  const schemes = new Set(j.mappingBaseline.map((value) => value.split(':')[0]));
-  return values.filter((value) => schemes.has(value.split(':')[0]));
-};
-async function emptyProject(f) {
-  const p = await api(`/project/${f.project.id}`);
-  assert.equal(p?.key, f.key);
-  assert.equal(p.description, f.marker);
-  assert.equal(p.style, 'classic');
-  assert.equal(p.projectTypeKey, 'software');
-  const found = await api('/search/jql', 'POST', {
-    jql: `project = ${f.project.id}`,
-    maxResults: 1,
-    fields: ['summary'],
-  });
-  assert.equal(found.isLast, true);
-  assert.equal(found.issues.length, 0);
-  const assignment = await pages(`/issuetypescheme/project?projectId=${f.project.id}`);
-  assert.equal(assignment.length, 1);
-  const current = assignment[0].issueTypeScheme.id;
-  assert.ok(current === f.scheme.id || (f.shareIntent && current === j.fixtures[0].scheme.id));
-  const expected = [];
-  for (const member of j.fixtures) {
-    if (!member.project || member.projectDeleted) continue;
-    const assigned = await pages(`/issuetypescheme/project?projectId=${member.project.id}`);
-    assert.equal(assigned.length, 1);
-    if (assigned[0].issueTypeScheme.id === current) expected.push(member.project.id);
+/** A level-0 work type other than the prompt type whose edit and view screens are not the prompt
+ * type's create screen, so the field and the create screen fix are observed separately. */
+async function screenType(f, issueTypes, prompt) {
+  const create = await typeScreens(f, prompt.id, ['create']);
+  for (const type of issueTypes.filter(
+    (x) => !x.subtask && x.id !== prompt.id && x.hierarchyLevel === 0,
+  )) {
+    const screens = await typeScreens(f, type.id);
+    if (!screens.some((s) => create.includes(s))) return { type, screens, create: create[0] };
   }
-  const schemes = await pages(`/issuetypescheme?id=${current}&expand=projects`);
-  assert.equal(schemes.length, 1);
-  assert.notEqual(schemes[0].isDefault, true);
-  assert.equal(schemes[0].projects.isLast, true);
-  assert.deepEqual(schemes[0].projects.values.map((x) => x.id).sort(), expected.sort());
-  return p;
-}
-async function cleanup() {
-  // Reconcile exact unique intents without repeating creation.
-  for (const f of j.fixtures) {
-    if (!f.project && f.projectIntent) {
-      const p = await api(`/project/${f.key}`);
-      assert.equal(p?.description, f.marker);
-      f.project = { id: String(p.id), key: p.key };
-      persist();
-    }
-    if (!f.project) continue;
-    if (f.projectDeleteIntent && (await api(`/project/${f.project.id}`)) === null) {
-      f.projectDeleted = true;
-      persist();
-    }
-    if (!f.scheme) {
-      const found = await pages(`/issuetypescheme/project?projectId=${f.project.id}`);
-      assert.equal(found.length, 1);
-      f.scheme = found[0].issueTypeScheme;
-      persist();
-    }
-    if (!f.projectDeleted) await emptyProject(f);
-  }
-  if (!j.type && j.typeIntent) {
-    const matches = (await api('/issuetype')).filter(
-      (x) => x.name === j.typeName || x.name === j.renamed,
-    );
-    assert.equal(matches.length, 1, 'Type outcome is ambiguous; inspect without retry');
-    j.type = matches[0];
-    persist();
-  }
-  if (j.type && !j.typeDeleted) {
-    const t = await api(`/issuetype/${j.type.id}`);
-    if (t === null) assert.equal(j.typeDeleteIntent, true);
-    else {
-      assert.ok([j.typeName, j.renamed].includes(t.name));
-      assert.equal(t.description, 'Reusable instructions managed through Agent Prompts for Jira.');
-      assert.equal(t.hierarchyLevel, 0);
-      assert.equal(t.subtask, false);
-      const found = await api('/search/jql', 'POST', {
-        jql: `issuetype = ${t.id}`,
-        fields: ['summary'],
-        maxResults: 1,
-      });
-      assert.equal(found.isLast, true);
-      assert.equal(found.issues.length, 0);
-      verifyTypeMappings(j.mappingBaseline, await mappings(), {
-        type: t.id,
-        schemes: (j.shared ? j.fixtures.slice(0, 1) : j.fixtures).map((f) => f.scheme.id),
-        defaultScheme: j.defaultScheme,
-        attached: false,
-      });
-      j.typeDeleteIntent = true;
-      persist();
-      await api(`/issuetype/${t.id}`, 'DELETE');
-      assert.equal(await api(`/issuetype/${t.id}`), null);
-    }
-    j.typeDeleted = true;
-    persist();
-    assert.deepEqual(known(await mappings()), j.mappingBaseline);
-  }
-  for (const f of j.fixtures) {
-    if (!f.project) continue;
-    if (!f.projectDeleted) {
-      await emptyProject(f);
-      f.projectDeleteIntent = true;
-      persist();
-      await api(`/project/${f.project.id}?enableUndo=false`, 'DELETE');
-      assert.equal(await api(`/project/${f.project.id}`), null);
-      f.projectDeleted = true;
-      persist();
-    }
-  }
-  for (const f of j.fixtures) {
-    if (!f.scheme) continue;
-    const remaining = await pages(`/issuetypescheme?id=${f.scheme.id}&expand=projects`);
-    if (remaining.length) {
-      assert.equal(remaining.length, 1);
-      assert.equal(remaining[0].id, f.scheme.id);
-      assert.notEqual(remaining[0].isDefault, true);
-      assert.equal(remaining[0].projects.total, 0);
-      assert.equal(remaining[0].name, f.scheme.name);
-      f.schemeDeleteIntent = true;
-      persist();
-      await api(`/issuetypescheme/${f.scheme.id}`, 'DELETE');
-      assert.equal((await pages(`/issuetypescheme?id=${f.scheme.id}`)).length, 0);
-    }
-  }
-  j.clean = true;
-  persist();
+  throw Error('Template work type with its own screens required');
 }
 try {
   const owner = await api('/myself');
@@ -408,7 +338,7 @@ try {
       const all = page.getByRole('checkbox', { name: 'Select all matching spaces', exact: true });
       await all.click();
       await expect(all).toBeChecked();
-      if (j.shared && query !== primary.key) {
+      if ((j.shared || j.sharedScreens) && query !== primary.key) {
         const excluded = page
           .getByRole('table', { name: 'Space configuration', exact: true })
           .getByRole('row')
@@ -459,12 +389,7 @@ try {
     async function applyExisting(name) {
       await dialog(primary.key);
       await chooseExisting(name);
-      const plan = await observeAction(
-        page,
-        'configuration-preview',
-        () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
-        t,
-      );
+      const plan = await reviewConfiguration(page, t);
       await acknowledgeShared(plan.attach && plan.scheme.projectIds.length > 1);
       await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
       await finish();
@@ -479,34 +404,120 @@ try {
       return {
         type: health.state?.data?.type,
         reload: health.state?.data?.refreshAfterSave === true,
+        screens: health.state?.data?.screenTypes ?? [],
       };
+    }
+    const next = () => nextStep(page);
+    const review = () => reviewStep(page);
+    const modal = page.getByRole('dialog');
+    // Each review line is a lozenge followed by its text, so a line is matched by its text alone.
+    const line = (text) => modal.getByText(text, { exact: true });
+    const apply = () => page.getByRole('button', { name: 'Apply changes', exact: true }).click();
+    // Apply waits for the shared screen approval whenever a reviewed screen change reaches
+    // another space, and never asks for it otherwise.
+    async function acknowledgeScreens(required) {
+      const ack = page.getByRole('checkbox', {
+        name: 'I approve the shared screen changes for all listed affected spaces.',
+        exact: true,
+      });
+      if (!required) return expect(ack).toHaveCount(0);
+      await expect(page.getByRole('button', { name: 'Apply changes', exact: true })).toBeDisabled();
+      await ack.click();
+      await expect(ack).toBeChecked();
+    }
+    const choose = (f, name) => chooseScreenTypes(page, f.key, name);
+    async function appField() {
+      const field = (await api('/field')).find(
+        (x) => x.schema?.custom?.includes(`/${t.appId}/`) && x.name === 'Agent Prompts',
+      );
+      assert.ok(field, 'Agent Prompts field required');
+      return field.id;
     }
     const task = original.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
     assert.ok(task);
     if (bulk) {
+      j.field = await appField();
+      // Task is the prompt type; another work type with its own screens gets the field.
+      const own = await screenType(primary, original.issueTypes, task);
+      const second = await screenType(j.fixtures[1], original.issueTypes, task);
+      assert.equal(second.type.id, own.type.id);
+      const kind = own.type;
+      // Journaled before any write, so cleanup removes the field from all of them.
+      j.screens = [...own.screens, ...second.screens];
+      j.manualScreen = second.screens[0];
+      j.createScreen = own.create;
+      j.requiredRemoved = [];
+      persist();
+      for (const screen of j.screens) assert.equal(await fieldTab(screen), undefined);
+      stage('bulk-manual-field');
+      // An administrator already placed the field on the second space's screen by hand.
+      const manualTab = String((await api(`/screens/${j.manualScreen}/tabs`))[0].id);
+      j.manualIntent = true;
+      persist();
+      await api(`/screens/${j.manualScreen}/tabs/${manualTab}/fields`, 'POST', {
+        fieldId: j.field,
+      });
+      assert.equal(await fieldTab(j.manualScreen), manualTab);
+      stage('bulk-create-screen');
+      // The first space's prompt create screen loses Description, and Summary if Jira allows it.
+      for (const required of ['description', 'summary']) {
+        const tab = await fieldTab(j.createScreen, required);
+        assert.ok(tab, `${required} on the create screen`);
+        const entry = { screen: j.createScreen, tab, field: required };
+        j.requiredRemoved.push(entry);
+        persist();
+        try {
+          await api(`/screens/${j.createScreen}/tabs/${tab}/fields/${required}`, 'DELETE');
+        } catch (e) {
+          if (required !== 'summary' || !e.definitiveRejection) throw e;
+          entry.rejected = true;
+          persist();
+        }
+        assert.equal(await fieldTab(j.createScreen, required), entry.rejected ? tab : undefined);
+      }
+      const restored = j.requiredRemoved.filter((x) => !x.rejected);
+      const ownFieldOn = async (present) => {
+        for (const screen of own.screens)
+          assert.equal(!!(await fieldTab(screen)), present, `Field on ${screen}`);
+        assert.equal(await fieldTab(j.manualScreen), manualTab, 'Field placed by hand is kept');
+      };
       for (const reload of [false, true]) {
         stage(`bulk-configure-${reload ? 'reload' : 'plain'}`);
         await openConfiguration();
         await dialog(primary.key.slice(0, -1));
         await chooseExisting(task.name);
-        const box = page.getByRole('checkbox', {
+        const choice = `${reload ? 'On' : 'Off'} for all selected spaces`;
+        const picker = page.getByRole('combobox', {
           name: 'Reload work item after saving prompts',
           exact: true,
         });
-        if ((await box.isChecked()) !== reload) await box.click();
-        await expect(box).toBeChecked({ checked: reload });
-        await page.getByRole('button', { name: 'Review changes', exact: true }).click();
-        await expect(
-          page.getByText(`Reload after saving: ${reload ? 'On' : 'Off'} for all selected`, {
-            exact: false,
-          }),
-        ).toBeVisible();
-        await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
+        await picker.click();
+        await page.getByRole('option', { name: choice, exact: true }).click();
+        await next();
+        if (!reload) for (const f of j.fixtures) await choose(f, kind.name);
+        await review();
+        if (!reload) {
+          // Every screen except the one where the field was placed by hand.
+          await expect(line(/^Agent Prompts to /)).toHaveCount(
+            own.screens.length + second.screens.length - 1,
+          );
+          await expect(line(/^Description to /)).toHaveCount(1);
+          await expect(line(/^Summary to /)).toHaveCount(restored.length - 1);
+        } else await expect(line('No changes')).toHaveCount(1);
+        await expect(line(/^Agent Prompts on .+ \(added outside the app\)$/)).toHaveCount(1);
+        // Each space's screens are its own, so no shared screen approval is asked for.
+        await acknowledgeScreens(false);
+        await expect(modal.getByText('Reload after saving', { exact: true })).toBeVisible();
+        await expect(modal.getByText(reload ? 'On' : 'Off', { exact: true })).toBeVisible();
+        await apply();
         const done = await finish();
         assert.equal(done.data.status, 'complete');
         assert.equal(done.data.entries.length, 2);
+        assert.deepEqual(done.data.screenEffects ?? [], []);
         for (const f of j.fixtures)
-          assert.deepEqual(await configured(f), { type: task.id, reload });
+          assert.deepEqual(await configured(f), { type: task.id, reload, screens: [kind.id] });
+        await ownFieldOn(true);
+        for (const x of j.requiredRemoved) assert.ok(await fieldTab(x.screen, x.field), x.field);
         assert.deepEqual(known(await mappings()), j.mappingBaseline);
       }
       stage('bulk-remove-setup-cancel');
@@ -514,45 +525,508 @@ try {
       await dialog(primary.key.slice(0, -1));
       await chooseMode('Remove setup from selected spaces');
       await expect(
-        page.getByRole('checkbox', { name: 'Reload work item after saving prompts', exact: true }),
+        page.getByRole('combobox', { name: 'Reload work item after saving prompts', exact: true }),
       ).toHaveCount(0);
-      await page.getByRole('button', { name: 'Review changes', exact: true }).click();
-      await expect(page.getByText('Remove setup and preferences', { exact: true })).toHaveCount(2);
+      await review();
+      await expect(line('App setup and preferences')).toHaveCount(2);
+      // Only the screens the app changed; the field placed by hand is not the app's to remove.
+      await expect(line(/^Agent Prompts from /)).toHaveCount(
+        own.screens.length + second.screens.length - 1,
+      );
+      await expect(line('No changes')).toHaveCount(0);
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
       for (const f of j.fixtures)
-        assert.deepEqual(await configured(f), { type: task.id, reload: true });
+        assert.deepEqual(await configured(f), { type: task.id, reload: true, screens: [kind.id] });
+      await ownFieldOn(true);
       stage('bulk-remove-setup');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
       await chooseMode('Remove setup from selected spaces');
-      await page.getByRole('button', { name: 'Review changes', exact: true }).click();
-      await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
+      await review();
+      await apply();
       const removed = await finish();
       assert.equal(removed.data.input.unlink, true);
       assert.ok(removed.data.entries.every((e) => e.status === 'done'));
       for (const f of j.fixtures)
-        assert.deepEqual(await configured(f), { type: undefined, reload: false });
+        assert.deepEqual(await configured(f), { type: undefined, reload: false, screens: [] });
+      await ownFieldOn(false);
       assert.deepEqual(known(await mappings()), j.mappingBaseline);
       for (const f of j.fixtures) await emptyProject(f);
       stage('bulk-reconfigure');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
       await chooseExisting(task.name);
-      await page.getByRole('button', { name: 'Review changes', exact: true }).click();
-      await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
+      await next();
+      await review();
+      // Removing setup cleared the work types, so reconfiguring changes no screen.
+      await expect(line('No changes')).toHaveCount(2);
+      // The reload choice starts on keep; removal cleared the preference, so it stays off.
+      await expect(modal.getByText('Keep each space’s setting', { exact: true })).toBeVisible();
+      await apply();
       await finish();
-      for (const f of j.fixtures) assert.equal((await configured(f)).type, task.id);
+      for (const f of j.fixtures)
+        assert.deepEqual(await configured(f), { type: task.id, reload: false, screens: [] });
+      await ownFieldOn(false);
       assert.deepEqual(known(await mappings()), j.mappingBaseline);
-      j.bulkVerified = { projects: 2, reloadOff: true, reloadOn: true, setupRemoved: true };
+      stage('bulk-select-type');
+      await openConfiguration();
+      await dialog(primary.key);
+      await chooseExisting(task.name);
+      await next();
+      await choose(primary, kind.name);
+      await review();
+      await expect(line(/^Agent Prompts to /)).toHaveCount(own.screens.length);
+      await apply();
+      await finish();
+      assert.deepEqual((await configured(primary)).screens, [kind.id]);
+      await ownFieldOn(true);
+      stage('bulk-deselect-type');
+      await openConfiguration();
+      await dialog(primary.key);
+      await chooseExisting(task.name);
+      await next();
+      // The picker starts on the saved selection, so emptying it notes what it was.
+      await choose(primary);
+      await expect(modal.getByText(`Was: ${kind.name}`, { exact: true })).toBeVisible();
+      await review();
+      await expect(line(/^Agent Prompts from /)).toHaveCount(own.screens.length);
+      await apply();
+      await finish();
+      assert.deepEqual((await configured(primary)).screens, []);
+      assert.deepEqual((await configured(j.fixtures[1])).screens, []);
+      await ownFieldOn(false);
+      assert.deepEqual(known(await mappings()), j.mappingBaseline);
+      j.bulkVerified = {
+        projects: 2,
+        reloadOff: true,
+        reloadOn: true,
+        setupRemoved: true,
+        screenType: kind.name,
+        screensAdded: own.screens.length,
+        screensRemoved: own.screens.length,
+        manualFieldKept: true,
+        createScreenRestored: restored.map((x) => x.field),
+        typeDeselected: true,
+      };
       j.passed = true;
       persist();
+    } else if (sharedScreens) {
+      j.field = await appField();
+      stage('share-owned-screens');
+      const assigned = await pages(
+        `/issuetypescreenscheme/project?projectId=${primary.project.id}`,
+      );
+      assert.equal(assigned.length, 1);
+      const itss = assigned[0].issueTypeScreenScheme;
+      assert.ok(itss.name.startsWith(`${primary.key}:`));
+      for (const f of j.fixtures.slice(1)) {
+        await emptyProject(f);
+        f.screenShareIntent = true;
+        persist();
+        await api('/issuetypescreenscheme/project', 'PUT', {
+          issueTypeScreenSchemeId: String(itss.id),
+          projectId: f.project.id,
+        });
+        const now = await pages(`/issuetypescreenscheme/project?projectId=${f.project.id}`);
+        assert.equal(now.length, 1);
+        assert.equal(String(now[0].issueTypeScreenScheme.id), String(itss.id));
+      }
+      const own = await screenType(primary, original.issueTypes, task);
+      for (const f of j.fixtures.slice(1))
+        assert.deepEqual((await typeScreens(f, own.type.id)).sort(), [...own.screens].sort());
+      const kind = own.type;
+      j.screens = own.screens;
+      persist();
+      const fieldOn = async (present) => {
+        for (const screen of own.screens)
+          assert.equal(!!(await fieldTab(screen)), present, `Field on ${screen}`);
+      };
+      await fieldOn(false);
+      const impact = page.getByRole('table', { name: 'Shared screen impact', exact: true });
+      const outside = impact.getByRole('row').filter({ hasText: j.fixtures[2].key });
+      stage('shared-screens-configure');
+      await openConfiguration();
+      await dialog(primary.key.slice(0, -1));
+      await chooseExisting(task.name);
+      await next();
+      for (const f of j.fixtures.slice(0, 2)) await choose(f, kind.name);
+      await review();
+      // Every screen change lists all three spaces, including the one not being configured.
+      await expect(impact.getByRole('row')).toHaveCount(1 + Math.min(5, 3 * own.screens.length));
+      await expect(outside.first()).toContainText('Agent Prompts added');
+      await acknowledgeScreens(true);
+      await apply();
+      const done = await finish();
+      assert.equal(done.data.status, 'complete');
+      assert.equal(done.data.entries.length, 2);
+      // Added once, by the first space; the second space joined the change.
+      assert.deepEqual(
+        (done.data.screenEffects ?? [])
+          .filter((e) => e.field === j.field)
+          .map((e) => `${e.screen.id}:${e.action}`)
+          .sort(),
+        own.screens.map((screen) => `${screen}:add`).sort(),
+      );
+      for (const f of j.fixtures.slice(0, 2))
+        assert.deepEqual((await configured(f)).screens, [kind.id]);
+      assert.equal((await configured(j.fixtures[2])).type, undefined);
+      await fieldOn(true);
+      stage('shared-screens-deselect');
+      await openConfiguration();
+      await dialog(primary.key);
+      await chooseExisting(task.name);
+      await next();
+      await choose(primary);
+      await review();
+      // The second space still uses the screens, so the field stays and nothing needs approval.
+      await expect(line(/^Agent Prompts on .+ \(another configured space uses it\)$/)).toHaveCount(
+        own.screens.length,
+      );
+      await acknowledgeScreens(false);
+      await apply();
+      await finish();
+      assert.deepEqual((await configured(primary)).screens, []);
+      assert.deepEqual((await configured(j.fixtures[1])).screens, [kind.id]);
+      await fieldOn(true);
+      stage('shared-screens-remove-setup');
+      await openConfiguration();
+      await dialog(primary.key.slice(0, -1));
+      await chooseMode('Remove setup from selected spaces');
+      await review();
+      // Only the second space still had the field on the screens, so it removes it.
+      await expect(line(/^Agent Prompts from /)).toHaveCount(own.screens.length);
+      await expect(outside.first()).toContainText('Agent Prompts removed');
+      await acknowledgeScreens(true);
+      await apply();
+      const removed = await finish();
+      assert.equal(removed.data.input.unlink, true);
+      assert.ok(removed.data.entries.every((e) => e.status === 'done'));
+      for (const f of j.fixtures.slice(0, 2))
+        assert.deepEqual(await configured(f), { type: undefined, reload: false, screens: [] });
+      await fieldOn(false);
+      assert.deepEqual(known(await mappings()), j.mappingBaseline);
+      j.sharedScreensVerified = {
+        selected: 2,
+        affected: 3,
+        screensAdded: own.screens.length,
+        keptForOtherSpace: true,
+        screensRemoved: own.screens.length,
+      };
+      j.passed = true;
+      persist();
+    } else if (steps) {
+      j.field = await appField();
+      const second = j.fixtures[1];
+      async function itssOf(f) {
+        const assigned = await pages(`/issuetypescreenscheme/project?projectId=${f.project.id}`);
+        assert.equal(assigned.length, 1);
+        const itss = assigned[0].issueTypeScreenScheme;
+        assert.ok(itss.name.startsWith(`${f.key}:`), 'Fixture screens must be the run’s own');
+        assert.deepEqual(
+          (await pages(`/issuetypescreenscheme/${itss.id}/project`)).map((p) => String(p.id)),
+          [f.project.id],
+        );
+        return String(itss.id);
+      }
+      j.steps = {
+        marker: `Setup run ${id} screen fixture.`,
+        itss: [await itssOf(primary), await itssOf(second)],
+        types: Array.from({ length: 10 }, (_, n) => ({ name: `Steps ${id} ${n}` })),
+        screens: Array.from({ length: 20 }, (_, n) => ({
+          name: `${primary.key}: steps ${n >> 1} ${n % 2 ? 'view' : 'edit'}`,
+        })),
+        schemes: [
+          ...Array.from({ length: 10 }, (_, n) => ({ name: `${primary.key}: steps ${n}` })),
+          { name: `${primary.key}: steps unused` },
+        ],
+      };
+      persist();
+      const s = j.steps;
+      stage('steps-types');
+      assert.ok(!(await api('/issuetype')).some((x) => x.name.startsWith(`Steps ${id}`)));
+      for (const x of s.types) {
+        x.intent = true;
+        persist();
+        const created = await api('/issuetype', 'POST', {
+          name: x.name,
+          description: s.marker,
+          hierarchyLevel: 0,
+        });
+        x.id = String(created.id);
+        persist();
+      }
+      await emptyProject(primary);
+      s.attachIntent = true;
+      persist();
+      await api(`/issuetypescheme/${primary.scheme.id}/issuetype`, 'PUT', {
+        issueTypeIds: s.types.map((x) => x.id),
+      });
+      const offered = (await emptyProject(primary)).issueTypes.map((x) => String(x.id));
+      for (const x of s.types) assert.ok(offered.includes(x.id), `${x.name} in the first space`);
+      stage('steps-screens');
+      for (const x of s.screens) {
+        assert.ok(
+          !(await pages(`/screens?queryString=${encodeURIComponent(x.name)}`)).some(
+            (v) => v.name === x.name,
+          ),
+        );
+        x.intent = true;
+        persist();
+        x.id = String((await api('/screens', 'POST', { name: x.name, description: s.marker })).id);
+        persist();
+        // Jira gives a new screen one field tab; add it only where Jira did not.
+        if (!(await api(`/screens/${x.id}/tabs`)).length)
+          await api(`/screens/${x.id}/tabs`, 'POST', { name: 'Field Tab' });
+        assert.equal((await api(`/screens/${x.id}/tabs`)).length, 1);
+      }
+      // Journaled before any app write, so cleanup removes the field from all of them.
+      j.screens = s.screens.map((x) => x.id);
+      persist();
+      stage('steps-screen-schemes');
+      for (const [n, x] of s.schemes.entries()) {
+        const [edit, view] = n < 10 ? [s.screens[2 * n], s.screens[2 * n + 1]] : [s.screens[0]];
+        x.intent = true;
+        persist();
+        const created = await api('/screenscheme', 'POST', {
+          name: x.name,
+          description: s.marker,
+          screens: view
+            ? { default: Number(edit.id), edit: Number(edit.id), view: Number(view.id) }
+            : { default: Number(edit.id) },
+        });
+        x.id = String(created.id);
+        persist();
+      }
+      stage('steps-mappings');
+      s.mappingIntent = true;
+      persist();
+      await api(`/issuetypescreenscheme/${s.itss[0]}/mapping`, 'PUT', {
+        issueTypeMappings: s.types.map((x, n) => ({
+          issueTypeId: x.id,
+          screenSchemeId: s.schemes[n].id,
+        })),
+      });
+      const rows = (itss) =>
+        pages(`/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=${itss}`);
+      const mapped = await rows(s.itss[0]);
+      for (const [n, x] of s.types.entries())
+        assert.equal(
+          String(mapped.find((m) => String(m.issueTypeId) === x.id)?.screenSchemeId),
+          s.schemes[n].id,
+        );
+      const fallback = (await rows(s.itss[1])).find((m) => m.issueTypeId === 'default');
+      s.defaultFrom = String(fallback.screenSchemeId);
+      s.defaultIntent = true;
+      persist();
+      await api(`/issuetypescreenscheme/${s.itss[1]}/mapping/default`, 'PUT', {
+        screenSchemeId: s.schemes[0].id,
+      });
+      assert.equal(
+        String((await rows(s.itss[1])).find((m) => m.issueTypeId === 'default').screenSchemeId),
+        s.schemes[0].id,
+      );
+      // What Jira embeds for a screen scheme used by two work type screen schemes (the app then
+      // reads the full mapping) and for one used by none (the app reads no spaces).
+      const expansion = async (scheme) =>
+        (await pages(`/screenscheme?id=${scheme}&expand=issueTypeScreenSchemes`))[0]
+          .issueTypeScreenSchemes;
+      const shared = await expansion(s.schemes[0].id);
+      const unused = await expansion(s.schemes[10].id);
+      s.jira = {
+        sharedExpansion: shared
+          ? {
+              values: shared.values?.length,
+              isLast: shared.isLast,
+              total: shared.total,
+              maxResults: shared.maxResults,
+            }
+          : 'omitted',
+        unusedExpansion: unused
+          ? { values: unused.values?.length, isLast: unused.isLast, total: unused.total }
+          : 'omitted',
+      };
+      persist();
+      for (const screen of j.screens) assert.equal(await fieldTab(screen), undefined);
+      const names = s.screens.map((x) => x.name);
+      const attached = s.types.map((x) => `${primary.scheme.id}:${x.id}`);
+      const impact = page.getByRole('table', { name: 'Shared screen impact', exact: true });
+      const outside = impact.getByRole('row').filter({ hasText: second.key });
+      // Every configuration-advance response in order; a partial step leaves the space's entry
+      // with how many changes it made and the reviewed changes still to make.
+      function watchSteps() {
+        const seen = [];
+        const reads = [];
+        const find = (value) => {
+          if (typeof value === 'string') {
+            try {
+              return find(JSON.parse(value));
+            } catch {
+              return null;
+            }
+          }
+          if (!value || typeof value !== 'object') return null;
+          if (typeof value.ok === 'boolean' && ('value' in value || 'error' in value)) return value;
+          for (const child of Object.values(value)) {
+            const found = find(child);
+            if (found) return found;
+          }
+          return null;
+        };
+        const listener = (response) => {
+          let input;
+          try {
+            input = response.request().postDataJSON()?.variables?.input;
+          } catch {
+            return;
+          }
+          if (
+            input?.payload?.call?.functionKey !== 'configuration-advance' ||
+            input.payload.context?.environmentId !== t.environmentId ||
+            !input.extensionId?.includes(t.appId)
+          )
+            return;
+          reads.push(
+            response
+              .json()
+              .then(find)
+              .then((r) => {
+                const d = r?.value?.data;
+                const e = d?.entries?.[0];
+                seen.push(
+                  r?.ok
+                    ? {
+                        status: d.status,
+                        applied: e.applied,
+                        remaining: e.remaining?.length,
+                        message: e.message,
+                      }
+                    : { error: r?.error ?? 'unreadable' },
+                );
+              }),
+          );
+        };
+        page.on('response', listener);
+        return async () => {
+          page.off('response', listener);
+          await Promise.allSettled(reads);
+          return seen;
+        };
+      }
+      // Apply, then wait for the space to finish over several steps. The dialog shows the
+      // count between steps; a step that makes no progress stops on Continue reviewed changes.
+      async function stepped(kind) {
+        const stop = watchSteps();
+        try {
+          await apply();
+          await expect(page.getByText(/^\d+ of 20 screen changes made$/).first()).toBeVisible({
+            timeout: 120000,
+          });
+          await expect(
+            page
+              .getByRole('heading', { name: 'Configuration complete', exact: true })
+              .or(page.getByRole('heading', { name: 'Configuration ended', exact: true }))
+              .or(page.getByRole('button', { name: 'Continue reviewed changes', exact: true })),
+          ).toBeVisible({ timeout: 300000 });
+        } finally {
+          s[kind] = await stop();
+          persist();
+        }
+        const seen = s[kind];
+        assert.ok(seen.every((x) => !x.error));
+        const partial = seen.filter((x) => x.remaining);
+        assert.ok(partial.length >= 1, `${kind}: one step made every change`);
+        partial.forEach((x, i) => {
+          assert.equal(x.status, 'ready');
+          assert.equal(x.applied + x.remaining, 20);
+          assert.ok(i === 0 || x.applied > partial[i - 1].applied);
+          assert.equal(
+            x.message,
+            `${x.applied} of 20 screen changes made. Continuing with the rest.`,
+          );
+        });
+        assert.equal(seen.at(-1).status, 'complete');
+        return finish();
+      }
+      stage('steps-configure');
+      await openConfiguration();
+      await dialog(primary.key);
+      await chooseExisting(task.name);
+      await next();
+      for (const x of s.types) await choose(primary, x.name);
+      const reviewed = Date.now();
+      await review();
+      // A blocked review names its reason only on the page, so the journal keeps it.
+      s.reviewMs = Date.now() - reviewed;
+      s.blocked = await modal.getByText(/^Blocked: /).allTextContents();
+      persist();
+      assert.deepEqual(s.blocked, []);
+      await expect(line(/^Agent Prompts to /)).toHaveCount(names.length);
+      for (const name of names) await expect(line(`Agent Prompts to ${name}`)).toHaveCount(1);
+      // The first new type's screens are the second space's default screens as well.
+      await expect(impact.getByRole('row')).toHaveCount(5);
+      await expect(outside).toHaveCount(2);
+      await expect(outside.first()).toContainText('Agent Prompts added');
+      await acknowledgeScreens(true);
+      const done = await stepped('configure');
+      assert.equal(done.data.status, 'complete');
+      assert.ok(done.data.entries.every((e) => e.status === 'done'));
+      assert.deepEqual(
+        (done.data.screenEffects ?? [])
+          .filter((e) => e.field === j.field)
+          .map((e) => `${e.screen.id}:${e.action}`)
+          .sort(),
+        [`${s.screens[0].id}:add`, `${s.screens[1].id}:add`].sort(),
+      );
+      for (const screen of j.screens) assert.ok(await fieldTab(screen), `Field on ${screen}`);
+      const health = await openConfiguration();
+      assert.equal(health.state.data.type, task.id);
+      assert.deepEqual([...health.state.data.screenTypes].sort(), s.types.map((x) => x.id).sort());
+      assert.equal(
+        health.checks.find((c) => c.label === 'Agent Prompts on screens')?.ok,
+        true,
+        'Health check of the screens',
+      );
+      assert.equal((await configured(second)).type, undefined);
+      stage('steps-remove-setup');
+      await openConfiguration();
+      await dialog(primary.key);
+      await chooseMode('Remove setup from selected spaces');
+      await review();
+      await expect(modal.getByText(/^Blocked: /)).toHaveCount(0);
+      await expect(line(/^Agent Prompts from /)).toHaveCount(names.length);
+      await expect(outside.first()).toContainText('Agent Prompts removed');
+      await acknowledgeScreens(true);
+      const removed = await stepped('remove');
+      assert.equal(removed.data.input.unlink, true);
+      assert.ok(removed.data.entries.every((e) => e.status === 'done'));
+      for (const screen of j.screens)
+        assert.equal(await fieldTab(screen), undefined, `Field on ${screen}`);
+      assert.deepEqual(await configured(primary), { type: undefined, reload: false, screens: [] });
+      // Jira may also add a new work type to the default scheme; deleting the type removes it.
+      const ours = new Set(s.types.map((x) => `${j.defaultScheme}:${x.id}`));
+      assert.deepEqual(
+        known(await mappings()).filter((m) => !ours.has(m)),
+        [...j.mappingBaseline, ...attached].sort(),
+      );
+      j.stepsVerified = {
+        workTypes: s.types.length,
+        screens: s.screens.length,
+        configureSteps: s.configure.length,
+        removeSteps: s.remove.length,
+        sharedWith: second.key,
+        jira: s.jira,
+      };
+      j.passed = true;
+      persist();
+      console.log(JSON.stringify({ stepsVerified: j.stepsVerified }));
     } else if (rejected) {
       stage('rejected-review');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
       await chooseMode('Create a new type');
       await page.getByRole('textbox', { name: 'New type name', exact: true }).fill(j.typeName);
-      await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+      await next();
+      await review();
       await expect(page.getByRole('button', { name: 'Apply changes', exact: true })).toBeEnabled();
       // Someone creates the same name in Jira between review and Apply.
       stage('rejected-type');
@@ -596,12 +1070,7 @@ try {
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
       await chooseExisting(j.typeName);
-      const plan = await observeAction(
-        page,
-        'configuration-preview',
-        () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
-        t,
-      );
+      const plan = await reviewConfiguration(page, t);
       assert.equal(plan.type, j.type.id);
       await page.getByRole('button', { name: 'Apply changes', exact: true }).click();
       await finish();
@@ -623,12 +1092,7 @@ try {
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
       await chooseExisting(existing.name);
-      await observeAction(
-        page,
-        'configuration-preview',
-        () => page.getByRole('button', { name: 'Review changes', exact: true }).click(),
-        t,
-      );
+      await reviewConfiguration(page, t);
       // Admin A walks away after the first space: the second step never reaches the app.
       const pattern = '**/gateway/api/graphql/**';
       let advances = 0;
@@ -708,7 +1172,8 @@ try {
         await b.getByRole('button', { name: 'Configure selected', exact: true }).click();
         await b.getByRole('combobox', { name: 'Existing type', exact: true }).click();
         await b.getByRole('option', { name: existing.name, exact: true }).click();
-        await b.getByRole('button', { name: 'Review changes', exact: true }).click();
+        await nextStep(b);
+        await reviewStep(b);
         await b.getByRole('button', { name: 'Apply changes', exact: true }).click();
         await expect(
           b.getByRole('heading', { name: 'Configuration complete', exact: true }),
@@ -731,7 +1196,9 @@ try {
       stage('configuration-review');
       await openConfiguration();
       const catalog = await dialog(primary.key.slice(0, -1));
-      for (const f of j.fixtures) assert.ok(catalog.projects.some((p) => p.id === f.project.id));
+      // The catalog lists work types only; the dialog takes the spaces from the page's inventory.
+      assert.equal(catalog.typesAvailable, true);
+      assert.equal('projects' in catalog, false);
       await expect(
         page.getByRole('heading', { name: 'Configure 2 spaces', exact: true }),
       ).toBeVisible();
@@ -739,7 +1206,8 @@ try {
       await page.getByRole('combobox', { name: 'Prompt work type', exact: true }).click();
       await page.getByRole('option', { name: 'Create a new type', exact: true }).click();
       await page.getByRole('textbox', { name: 'New type name', exact: true }).fill(j.typeName);
-      await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+      await next();
+      await review();
       if (j.shared) {
         const impact = page.getByRole('table', { name: 'Shared scheme impact', exact: true });
         await expect(impact.getByRole('row')).toHaveCount(4);

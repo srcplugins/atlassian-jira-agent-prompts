@@ -330,10 +330,13 @@ test('the status regions exist before any outcome and announce search and save r
 });
 
 test('a load failure without an unresolved save offers Try again instead of saved-state recovery', async () => {
-  const f = fixture({ firstLoadFails: 'Add the Agent Prompts field to this work item’s screen.' });
+  const f = fixture({
+    firstLoadFails:
+      'The Agent Prompts field could not be identified in Jira. Check that the app is installed and its field is not in the trash.',
+  });
   await f.mount();
   assert.equal(f.nodes('SaveRecovery').length, 0);
-  assert.match(f.text(), /Add the Agent Prompts field/);
+  assert.match(f.text(), /Agent Prompts field could not be identified/);
   assert.deepEqual(
     f.calls.map((c) => c.name),
     ['load', 'save-status'],

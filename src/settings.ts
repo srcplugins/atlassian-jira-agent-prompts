@@ -1,5 +1,6 @@
 import {
   hash,
+  limited,
   numeric,
   JiraRejected,
   JiraUnavailable,
@@ -22,6 +23,10 @@ export class NotApplied extends UserError {
 }
 const uncertainSetup =
   'Configuration stopped with an uncertain or partial result. Check the space again, then choose Check outcome. No write was retried; do not create another type.';
+const uncertainScreens =
+  'Screen changes stopped with an uncertain or partial result. Check the reviewed screens in Jira, then review this space again. No write was retried; a field the app finds without its record is treated as added outside the app and is never removed by it.';
+const uncertainScreensAfterType =
+  'The work type was added to the space, but screen changes stopped with an uncertain or partial result. Choose Check outcome, then check the reviewed screens in Jira and review this space again. No write was retried.';
 /** Jira or storage was briefly unavailable rather than refusing the request. An unclassified
  * error is a defect, not an outage: repeating the step would fail the same way. */
 export function transient(error: unknown) {
@@ -53,6 +58,10 @@ interface SettingsData {
   refreshAfterSave?: boolean;
   type?: string;
   previousTypes?: string[];
+  /** Work types whose edit and view screens should show the Agent Prompts field. */
+  screenTypes?: string[];
+  /** Screens on which this space is listed in the app's ownership record. */
+  screens?: string[];
   pending?: { name?: string; type?: string; scheme: string; started: number };
 }
 export interface SettingsRecord {
@@ -68,26 +77,122 @@ interface Scheme {
   /** False when Jira listed only part of a shared scheme's spaces: usable, never changed. */
   complete?: false;
 }
+type ScreenOp = 'create' | 'edit' | 'view';
+export interface ScreenInfo {
+  id: string;
+  name: string;
+  tabs: { id: string; fields: string[] }[];
+}
+interface Space {
+  id: string;
+  key?: string;
+  name?: string;
+}
+/** The app added `field` to the screen; `projects` are the spaces relying on that. The field is
+ * removed only when the last of them no longer needs it. */
+interface ScreenRecordData {
+  field: string;
+  projects: string[];
+}
+export interface ScreenRecord {
+  revision: number;
+  data: ScreenRecordData;
+}
+/** One reviewed screen change. Jira writes are add, remove (the Agent Prompts field) and require
+ * (Summary or Description on the prompt type's create screen); join, leave and drop only update
+ * the app's ownership records. */
+export interface ScreenChange {
+  action: 'add' | 'join' | 'leave' | 'remove' | 'drop' | 'require';
+  screen: { id: string; name: string };
+  tab?: string;
+  field: string;
+  types: string[];
+  /** Ownership record revision the change was reviewed against; 0 when there is none. */
+  record: number;
+  impact?: { spaces: number; shared: boolean; digest: string };
+}
+type Write = Omit<ScreenChange, 'screen' | 'record' | 'impact'>;
+export const screenWrite = (c: ScreenChange) => ['add', 'remove', 'require'].includes(c.action);
+const byNumber = (a: string, b: string) => a.length - b.length || a.localeCompare(b);
+export function sortScreenChanges(changes: ScreenChange[]) {
+  return [...changes].sort(
+    (a, b) =>
+      byNumber(a.screen.id, b.screen.id) ||
+      a.field.localeCompare(b.field) ||
+      a.action.localeCompare(b.action),
+  );
+}
 export interface SettingsPorts {
   get(project: string): Promise<SettingsRecord | undefined>;
-  cas(project: string, revision: number, data: SettingsData): Promise<void>;
+  /** With `screen`, the ownership record is written (or deleted when `data` is null) in the same
+   * storage transaction, conditioned on its revision. */
+  cas(
+    project: string,
+    revision: number,
+    data: SettingsData,
+    screen?: { id: string; revision: number; data: ScreenRecordData | null },
+  ): Promise<void>;
   types(): Promise<WorkType[]>;
   scheme(project: string): Promise<Scheme>;
   create(name: string): Promise<string>;
   attach(scheme: string, type: string): Promise<void>;
-  impact(
-    project: string,
-    type: string,
-    field: string,
-  ): Promise<{ keys: string[]; incomplete: boolean }>;
   createFields(project: string, type: string): Promise<string[]>;
+  /** The screen used for each requested work type and operation; no type means the default. */
+  screenUses(project: string, uses: { type?: string; op: ScreenOp }[]): Promise<string[]>;
+  /** Screens in order, undefined for a screen Jira no longer has. Tabs list `field` where it is;
+   * every field only for the screens in `full`. A screen without `field` lists all its tabs. */
+  screens(ids: string[], field: string, full?: string[]): Promise<(ScreenInfo | undefined)[]>;
+  /** The spaces using a screen; incomplete when there are too many, or the reads ran out of time. */
+  screenImpact(
+    screen: string,
+  ): Promise<{ projects: Space[]; complete: boolean; timedOut?: boolean }>;
+  addScreenField(screen: string, tab: string, field: string): Promise<void>;
+  removeScreenField(screen: string, tab: string, field: string): Promise<void>;
+  screenRecord(screen: string): Promise<ScreenRecord | undefined>;
+  /** Milliseconds this request can still spend before it must have finished its writes. */
+  timeLeft(): number;
+}
+/** The Configure choice for each space's reload preference: keep it, or set it on or off. */
+export type ReloadChoice = 'keep' | 'on' | 'off';
+export function reloadInput(value: unknown): ReloadChoice {
+  if (value !== 'keep' && value !== 'on' && value !== 'off')
+    throw new UserError('Invalid display preference.');
+  return value;
 }
 export interface SettingsInput {
   unlink?: boolean;
-  refreshAfterSave?: boolean;
+  /** Absent, like `keep`, leaves the space's saved preference unchanged. */
+  reloadAfterSave?: ReloadChoice;
   allowShared?: boolean;
+  allowSharedScreens?: boolean;
   type?: string;
   name?: string;
+  screenTypes?: string[];
+}
+/** A requested work type selection for screens: up to 50 distinct IDs, sorted. */
+export function screenTypesInput(value: unknown) {
+  if (value === undefined) return undefined;
+  if (
+    !Array.isArray(value) ||
+    value.length > 50 ||
+    new Set(value).size !== value.length ||
+    value.some((id) => typeof id !== 'string')
+  )
+    throw new UserError('Choose up to 50 distinct work types for screens.');
+  return value.map(numeric).sort(byNumber);
+}
+function screenRecordData(value: ScreenRecord | undefined) {
+  if (value === undefined) return undefined;
+  const data = value?.data as Partial<ScreenRecordData> | undefined;
+  if (
+    !Number.isSafeInteger(value?.revision) ||
+    value.revision < 1 ||
+    typeof data?.field !== 'string' ||
+    !Array.isArray(data.projects) ||
+    data.projects.some((id) => typeof id !== 'string')
+  )
+    throw new UserError('A screen ownership record is unreadable. Check the screen in Jira.');
+  return data as ScreenRecordData;
 }
 export function createSettings(p: Ports, s: SettingsPorts) {
   async function admin(c: Context) {
@@ -104,8 +209,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       s.scheme(c.projectId),
     ]);
     const state = record ?? { revision: 0, data: {} };
-    const selected = types.find((t) => t.id === state.data.type);
-    return { project, state, types, selected, scheme };
+    return { project, state, types, scheme };
   }
   /** Removing setup's checks against the reviewed revision, before its one storage write. */
   async function removalTarget(c: Context, revision: number) {
@@ -119,14 +223,136 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       );
     return current;
   }
+  /** Screen changes for one space: the Agent Prompts field on the edit and view screens of the
+   * selected work types, removal from screens this space no longer needs, and (when `prompt` is
+   * given) Summary and Description on the prompt type's create screen. */
+  async function screenPlan(
+    projectId: string,
+    data: SettingsData,
+    selected: string[],
+    prompt?: { type?: string },
+  ) {
+    const owned = data.screens ?? [];
+    const changes: ScreenChange[] = [];
+    const present: { id: string; name: string }[] = [];
+    const labels: Record<string, Space[]> = {};
+    if (!selected.length && !owned.length && !prompt)
+      return { screens: { changes, present }, labels };
+    const field = await p.field();
+    const uses = selected.flatMap((type) =>
+      (['edit', 'view'] as const).map((op) => ({ type, op })),
+    );
+    const ids = await s.screenUses(projectId, [
+      ...uses,
+      ...(prompt ? [{ ...(prompt.type ? { type: prompt.type } : {}), op: 'create' as const }] : []),
+    ]);
+    const needed = new Map<string, string[]>();
+    uses.forEach((u, i) => {
+      const id = ids[i]!;
+      needed.set(id, [...new Set([...(needed.get(id) ?? []), u.type])]);
+    });
+    const promptScreen = prompt ? ids[uses.length] : undefined;
+    const all = [...new Set([...needed.keys(), ...owned, ...(promptScreen ? [promptScreen] : [])])]
+      .map(numeric)
+      .sort(byNumber);
+    if (all.length > 50)
+      throw new UserError('Too many screens to review at once. Select fewer work types.');
+    const [details, records] = await Promise.all([
+      s.screens(all, field, promptScreen ? [promptScreen] : []),
+      Promise.all(all.map((id) => s.screenRecord(id))),
+    ]);
+    // Jira writes wait for who uses each screen, which is read once every change is known.
+    const writes: { screen: { id: string; name: string }; revision: number; change: Write }[] = [];
+    for (const [i, id] of all.entries()) {
+      const info = details[i];
+      const stored = records[i];
+      const recordData = screenRecordData(stored);
+      const revision = stored?.revision ?? 0;
+      const ours = recordData?.field === field ? recordData : undefined;
+      const listed = !!ours?.projects.includes(projectId);
+      const tab = info?.tabs.find((t) => t.fields.includes(field));
+      const types = needed.get(id) ?? [];
+      const screen = { id, name: info?.name ?? `Screen ${id}` };
+      if ((needed.has(id) || id === promptScreen) && !info)
+        throw new UserError('A screen used by this space could not be read. Check Jira settings.');
+      const write = (change: Write) => writes.push({ screen, revision, change });
+      if (needed.has(id)) {
+        if (!tab) {
+          if (!info!.tabs.length)
+            throw new UserError(`The screen ${screen.name} has no tabs. Add one in Jira settings.`);
+          write({ action: 'add', tab: info!.tabs[0]!.id, field, types });
+        } else if (ours) {
+          if (!listed || !owned.includes(id))
+            changes.push({ action: 'join', screen, field, types, record: revision });
+        } else {
+          // Added outside the app: never recorded, so never removed by the app.
+          present.push(screen);
+          if (owned.includes(id))
+            changes.push({ action: 'drop', screen, field, types, record: revision });
+        }
+      } else if (owned.includes(id)) {
+        if (!listed || !info || !tab)
+          changes.push({ action: 'drop', screen, field, types, record: revision });
+        else if (ours!.projects.some((p) => p !== projectId))
+          changes.push({ action: 'leave', screen, field, types, record: revision });
+        else write({ action: 'remove', tab: tab.id, field, types });
+      }
+      if (id === promptScreen)
+        for (const required of ['summary', 'description'])
+          if (!info!.tabs.some((t) => t.fields.includes(required))) {
+            if (!info!.tabs.length)
+              throw new UserError(
+                `The screen ${screen.name} has no tabs. Add one in Jira settings.`,
+              );
+            write({ action: 'require', tab: info!.tabs[0]!.id, field: required, types: [] });
+          }
+    }
+    const written = [...new Set(writes.map((w) => w.screen.id))];
+    const impacts = new Map(
+      (await limited(written, (id) => s.screenImpact(id))).map((impact, i) => [
+        written[i]!,
+        impact,
+      ]),
+    );
+    for (const { screen, revision, change } of writes) {
+      const impact = impacts.get(screen.id)!;
+      if (impact.timedOut)
+        throw new JiraUnavailable(
+          `The spaces using the screen ${screen.name} could not all be read in time. Review this space again.`,
+        );
+      if (!impact.complete)
+        throw new UserError(
+          `The screen ${screen.name} is used by more spaces than can be reviewed. Change it in Jira settings instead.`,
+        );
+      labels[screen.id] = impact.projects;
+      changes.push({
+        ...change,
+        screen,
+        record: change.action === 'require' ? 0 : revision,
+        impact: {
+          spaces: impact.projects.length,
+          shared: impact.projects.some((p) => p.id !== projectId),
+          digest: hash(impact.projects.map((p) => p.id)),
+        },
+      });
+    }
+    return {
+      screens: {
+        changes: sortScreenChanges(changes),
+        present,
+        ...(promptScreen ? { promptScreen } : {}),
+      },
+      labels,
+    };
+  }
   async function plan(c: Context, input: SettingsInput) {
-    if (input.refreshAfterSave !== undefined && typeof input.refreshAfterSave !== 'boolean')
-      throw new UserError('Invalid display preference.');
+    if (input.reloadAfterSave !== undefined) reloadInput(input.reloadAfterSave);
     if (input.unlink) {
       if (
         input.type !== undefined ||
         input.name !== undefined ||
-        input.refreshAfterSave !== undefined
+        input.reloadAfterSave !== undefined ||
+        input.screenTypes !== undefined
       )
         throw new UserError('Removing setup cannot include a type or preference change.');
       const project = await admin(c);
@@ -135,6 +361,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         throw new UserError(
           'Resolve the unfinished configuration before removing this space’s setup.',
         );
+      const { screens, labels } = await screenPlan(c.projectId, state.data, []);
       const result = {
         unlink: true,
         revision: state.revision,
@@ -145,13 +372,12 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         scheme: { id: '', name: '', projectIds: [] as string[], isDefault: false } as Scheme,
         project: { id: project.id, key: project.key },
         previousTypes: state.data.previousTypes ?? [],
-        promptKeys: [] as string[],
-        promptIncomplete: false,
-        usingKeys: [] as string[],
-        usingIncomplete: false,
         typeName: 'Remove setup',
+        screenTypes: [] as string[],
+        availableTypes: [] as { id: string; name: string }[],
+        screens,
       };
-      return { ...result, fingerprint: hash([c.accountId, result]) };
+      return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
     }
     const value = await inspect(c);
     if (value.state.data.pending)
@@ -197,15 +423,34 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       throw new UserError(
         'This space already has twenty previous prompt types, the most the app keeps. Keep the current type.',
       );
-    const prompts =
-      changing && value.selected
-        ? await p.search(c.projectId, old!)
-        : { prompts: [], incomplete: !!old && !value.selected };
-    const links = changing
-      ? await s.impact(c.projectId, old!, await p.field())
-      : { keys: [], incomplete: false };
+    // The prompt type itself is excluded: its own screens get Summary and Description instead.
+    const availableTypes = value.project.issueTypes
+      .filter((t) => t.id !== type)
+      .map((t) => ({ id: t.id, name: t.name }))
+      .sort((a, b) => byNumber(a.id, b.id));
+    const requested = screenTypesInput(input.screenTypes);
+    if (requested?.some((id) => !availableTypes.some((t) => t.id === id)))
+      throw new UserError('Choose work types used in this space for the Agent Prompts field.');
+    const screenTypes =
+      requested ??
+      (value.state.data.screenTypes ?? []).filter((id) => availableTypes.some((t) => t.id === id));
+    // A screen the app can't change blocks the space, but its work types are still offered so a
+    // different selection can avoid that screen.
+    let planned: Awaited<ReturnType<typeof screenPlan>>;
+    let blocked: string | undefined;
+    try {
+      planned = await screenPlan(c.projectId, value.state.data, screenTypes, {
+        ...(type ? { type } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof UserError) || transient(error)) throw error;
+      planned = { screens: { changes: [], present: [] }, labels: {} };
+      blocked = error.message;
+    }
+    const { screens, labels } = planned;
     const result = {
-      ...(input.refreshAfterSave !== undefined ? { refreshAfterSave: input.refreshAfterSave } : {}),
+      ...(blocked ? { blocked } : {}),
+      ...(input.reloadAfterSave !== undefined ? { reloadAfterSave: input.reloadAfterSave } : {}),
       revision: value.state.revision,
       old,
       type,
@@ -214,13 +459,13 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       scheme: value.scheme,
       project: { id: value.project.id, key: value.project.key },
       previousTypes,
-      promptKeys: prompts.prompts.map((t) => t.key),
-      promptIncomplete: prompts.incomplete,
-      usingKeys: links.keys,
-      usingIncomplete: links.incomplete,
       typeName: name ?? value.types.find((t) => t.id === type)!.name,
+      screenTypes,
+      availableTypes,
+      screens,
     };
-    return { ...result, fingerprint: hash([c.accountId, result]) };
+    // Space names for the screen impact review are display-only, so outside the fingerprint.
+    return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
   }
   return {
     async preferences(c: Context, input: { revision: number; refreshAfterSave: boolean }) {
@@ -300,7 +545,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
             ok,
             detail: ok
               ? 'The summary and description fields are available when creating this type.'
-              : 'Add the summary and description fields to the type’s create screen in Jira settings.',
+              : 'Add the summary and description fields to the type’s create screen: use Reconfigure space to review adding them, or change the screen in Jira settings.',
           });
         } catch {
           checks.push({
@@ -308,6 +553,58 @@ export function createSettings(p: Ports, s: SettingsPorts) {
             ok: false,
             detail:
               'Could not verify create fields. Check Create work items permission and the type’s screen configuration.',
+          });
+        }
+      }
+      const screenTypes = state.data.screenTypes ?? [];
+      const recorded = state.data.screens ?? [];
+      if (screenTypes.length || recorded.length) {
+        try {
+          const field = await p.field();
+          const ids = screenTypes.length
+            ? [
+                ...new Set(
+                  await s.screenUses(
+                    c.projectId,
+                    screenTypes.flatMap((type) =>
+                      (['edit', 'view'] as const).map((op) => ({ type, op })),
+                    ),
+                  ),
+                ),
+              ]
+            : [];
+          // Screens the app still lists this space on although the selection no longer uses them,
+          // for example after an interrupted removal.
+          const extra = recorded.filter((id) => !ids.includes(id));
+          const all = [...ids, ...extra];
+          const info = await s.screens(all, field);
+          const name = (id: string) => info[all.indexOf(id)]?.name ?? `screen ${id}`;
+          const missing = ids.filter(
+            (id, i) => !info[i]?.tabs.some((t) => t.fields.includes(field)),
+          );
+          const problems = [
+            ...(missing.length
+              ? [`The field is missing from ${missing.map(name).join(', ')}.`]
+              : []),
+            ...(extra.length
+              ? [
+                  `The app still records adding the field to ${extra.map(name).join(', ')}, which the selected work types don’t use.`,
+                ]
+              : []),
+          ];
+          checks.push({
+            label: 'Agent Prompts on screens',
+            ok: !problems.length,
+            detail: !problems.length
+              ? 'The field is on the edit and view screens of the selected work types.'
+              : `${problems.join(' ')} Use Reconfigure space to review the screen changes.`,
+          });
+        } catch {
+          checks.push({
+            label: 'Agent Prompts on screens',
+            ok: false,
+            detail:
+              'The screens of the selected work types could not be checked. Inspect them in Jira settings.',
           });
         }
       }
@@ -322,20 +619,160 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       };
     },
     preview: plan,
-    async apply(c: Context, input: SettingsInput & { fingerprint: string }) {
+    /** The Work types step's data for a space: the work types it offers for the Agent Prompts
+     * field and its saved selection among them. The dialog leaves out the prompt type it knows;
+     * the review checks the selection against the prompt type again. */
+    async options(c: Context) {
+      const project = await admin(c);
+      const record = await s.get(c.projectId);
+      const availableTypes = project.issueTypes
+        .map((t) => ({ id: t.id, name: t.name }))
+        .sort((a, b) => byNumber(a.id, b.id));
+      return {
+        availableTypes,
+        screenTypes: (record?.data.screenTypes ?? []).filter((id) =>
+          availableTypes.some((t) => t.id === id),
+        ),
+      };
+    },
+    /**
+     * `planned` is this invocation's own review of the same input (a configuration step reviews
+     * the space, then applies); without it the space is reviewed here.
+     */
+    async apply(
+      c: Context,
+      input: SettingsInput & { fingerprint: string },
+      planned?: Awaited<ReturnType<typeof plan>>,
+    ) {
       // Before the claim nothing is written, so every failure is NotApplied. A retry is only
       // meaningful when Jira or storage was briefly unavailable.
       let preview: Awaited<ReturnType<typeof plan>>;
+      let field = '';
       try {
-        preview = await plan(c, input);
+        preview = planned ?? (await plan(c, input));
+        if ('blocked' in preview && preview.blocked) throw new UserError(preview.blocked);
         if (preview.fingerprint !== input.fingerprint)
           throw new UserError(
             'Configuration or its visible impact changed. Review the change again.',
           );
+        if (preview.screens.changes.some((ch) => ch.impact?.shared) && !input.allowSharedScreens)
+          throw new UserError('Confirm the shared screens’ affected spaces before applying.');
+        if (preview.screens.changes.some((ch) => ch.action !== 'require')) field = await p.field();
       } catch (error) {
         throw notApplied(error, transient(error));
       }
-      // Removing setup has one storage write; only its failure stays uncertain.
+      // A request stopped by the platform mid-way leaves an uncertain result, so this step makes
+      // only the screen changes that fit in the time left (about a second each, after up to two
+      // type writes); the rest are reported back and applied by the next step after a new check.
+      const budget = Math.floor((s.timeLeft() - 3_000) / 1_000) - 2;
+      if (budget < Math.min(1, preview.screens.changes.length))
+        throw notApplied(
+          new UserError('Too little time was left in this request to apply the changes.'),
+          true,
+        );
+      const changes = preview.screens.changes.slice(0, budget);
+      const outcome = {
+        saved: true as const,
+        /** Reviewed changes left for a later step, by screen and field. */
+        remaining: preview.screens.changes
+          .slice(budget)
+          .map((ch) => ({ screen: ch.screen.id, field: ch.field })),
+      };
+      // Counted before each Jira write: only a failure before the first write, or a documented
+      // rejection of that first write, proves Jira is unchanged.
+      let sent = 0;
+      // Any storage write may have committed despite an error.
+      let stored = false;
+      let revision = 0;
+      let data: SettingsData = {};
+      /** Applies the reviewed screen changes in order. Each Jira write is followed by one storage
+       * transaction that records it, so a recorded screen is always one the app changed. */
+      async function screenPhase() {
+        const touched: ScreenChange[] = [];
+        for (const ch of changes) {
+          const existing = await s.screenRecord(ch.screen.id);
+          if (ch.action !== 'require' && (existing?.revision ?? 0) !== ch.record)
+            throw new UserError(
+              'A screen’s Agent Prompts setup changed during configuration. Review this space again.',
+            );
+          const current = screenRecordData(existing);
+          const ours = current?.field === field ? current : undefined;
+          const others = (ours?.projects ?? []).filter((id) => id !== c.projectId);
+          const id = ch.screen.id;
+          let next: ScreenRecordData | null | undefined;
+          let joined: boolean;
+          if (ch.action === 'require') {
+            sent++;
+            await s.addScreenField(id, ch.tab!, ch.field);
+            touched.push(ch);
+            continue;
+          } else if (ch.action === 'add') {
+            sent++;
+            await s.addScreenField(id, ch.tab!, field);
+            touched.push(ch);
+            next = { field, projects: [...others, c.projectId].sort(byNumber) };
+            joined = true;
+          } else if (ch.action === 'join') {
+            if (!ours) throw new UserError('A screen ownership record changed. Review again.');
+            next = { field, projects: [...others, c.projectId].sort(byNumber) };
+            joined = true;
+          } else if (ch.action === 'remove') {
+            if (others.length) throw new UserError('A screen ownership record changed.');
+            sent++;
+            await s.removeScreenField(id, ch.tab!, field);
+            touched.push(ch);
+            next = null;
+            joined = false;
+          } else {
+            // leave or drop: only this space's entry in the record goes.
+            next =
+              ours && ours.projects.includes(c.projectId)
+                ? others.length
+                  ? { field, projects: others }
+                  : null
+                : undefined;
+            joined = false;
+          }
+          const { screens: listed = [], ...rest } = data;
+          const screens = listed.filter((x) => x !== id);
+          if (joined) screens.push(id);
+          data = screens.length ? { ...rest, screens: screens.sort(byNumber) } : rest;
+          // The selection is saved with the first recorded change, so after a partial result the
+          // health check and the next review compare Jira with what was chosen.
+          if (!input.unlink) {
+            delete data.screenTypes;
+            if (preview.screenTypes.length) data.screenTypes = preview.screenTypes;
+          }
+          stored = true;
+          await s.cas(
+            c.projectId,
+            revision,
+            data,
+            next === undefined ? undefined : { id, revision: ch.record, data: next },
+          );
+          revision++;
+        }
+        // Confirm Jira shows each written change before reporting success.
+        const ids = [...new Set(touched.map((ch) => ch.screen.id))];
+        const full = [
+          ...new Set(touched.filter((ch) => ch.field !== field).map((ch) => ch.screen.id)),
+        ];
+        const after = ids.length ? await s.screens(ids, field, full) : [];
+        for (const ch of touched) {
+          const info = after[ids.indexOf(ch.screen.id)];
+          const shown = !!info?.tabs.some((t) => t.fields.includes(ch.field));
+          if (shown !== (ch.action !== 'remove'))
+            throw new UserError('Jira has not confirmed a screen change.');
+        }
+      }
+      /** A failure without a claim: unchanged only before any write or when Jira rejected the
+       * first one. A storage failure before any Jira write keeps its own message. */
+      function screenFailure(error: unknown) {
+        if (!stored && (sent === 0 || (sent === 1 && error instanceof JiraRejected)))
+          return notApplied(error, sent === 0 && transient(error));
+        return sent === 0 && error instanceof UserError ? error : new UserError(uncertainScreens);
+      }
+      // Removing setup clears the space's setup after removing the screens it alone relied on.
       if (input.unlink) {
         let current: SettingsRecord;
         try {
@@ -343,16 +780,29 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         } catch (error) {
           throw notApplied(error, transient(error));
         }
-        // Keep previous type IDs so prompts already selected on work items stay removable if the
-        // space is set up again. Never modify Jira work items or shared schemes.
-        const previousTypes = Array.from(
-          new Set([
-            ...(current.data.previousTypes ?? []),
-            ...(current.data.type ? [current.data.type] : []),
-          ]),
-        );
-        await s.cas(c.projectId, current.revision, { previousTypes });
-        return { saved: true };
+        revision = current.revision;
+        data = current.data;
+        try {
+          await screenPhase();
+          // Setup stays until its last screen change, so a later step can finish the removal.
+          if (outcome.remaining.length) return outcome;
+          // Keep previous type IDs so prompts already selected on work items stay removable if
+          // the space is set up again. Never modify Jira work items or shared schemes.
+          const previousTypes = Array.from(
+            new Set([
+              ...(current.data.previousTypes ?? []),
+              ...(current.data.type ? [current.data.type] : []),
+            ]),
+          );
+          stored = true;
+          await s.cas(c.projectId, revision, {
+            previousTypes,
+            ...(data.screens?.length ? { screens: data.screens } : {}),
+          });
+        } catch (error) {
+          throw screenFailure(error);
+        }
+        return outcome;
       }
       let current: SettingsRecord;
       try {
@@ -366,18 +816,32 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       } catch (error) {
         throw notApplied(error, transient(error));
       }
-      if (!preview.attach) {
-        await s.cas(c.projectId, current.revision, {
-          ...current.data,
-          ...(input.refreshAfterSave !== undefined
-            ? { refreshAfterSave: input.refreshAfterSave }
+      revision = current.revision;
+      data = current.data;
+      const configured = (type: string): SettingsData => {
+        const rest: SettingsData = { ...data };
+        delete rest.screenTypes;
+        return {
+          ...rest,
+          // Keep never writes the preference, so a space without one stays off.
+          ...(input.reloadAfterSave === 'on' || input.reloadAfterSave === 'off'
+            ? { refreshAfterSave: input.reloadAfterSave === 'on' }
             : {}),
-          type: preview.type!,
+          type,
           previousTypes: preview.previousTypes,
-        });
-        return { saved: true };
+          ...(preview.screenTypes.length ? { screenTypes: preview.screenTypes } : {}),
+        };
+      };
+      if (!preview.attach) {
+        try {
+          await screenPhase();
+          stored = true;
+          await s.cas(c.projectId, revision, configured(preview.type!));
+        } catch (error) {
+          throw screenFailure(error);
+        }
+        return outcome;
       }
-      let revision = current.revision;
       const pending: NonNullable<SettingsData['pending']> = {
         ...(preview.name ? { name: preview.name } : {}),
         ...(preview.type ? { type: preview.type } : {}),
@@ -385,8 +849,10 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         started: Date.now(),
       };
       // A lost response here may have committed the claim, so failure stays uncertain.
-      await s.cas(c.projectId, revision++, { ...current.data, pending });
+      data = { ...current.data, pending };
+      await s.cas(c.projectId, revision++, data);
       const claimed = revision;
+      let screensStarted = false;
       async function verifyScheme() {
         const fresh = await s.scheme(c.projectId);
         if (hash(fresh) !== hash(preview.scheme))
@@ -394,9 +860,6 @@ export function createSettings(p: Ports, s: SettingsPorts) {
             'The space scheme changed during configuration, before any further Jira write. Review this space again.',
           );
       }
-      // Counted before each Jira write: only a failure before the first write, or a documented
-      // rejection of that first write, proves Jira is unchanged.
-      let sent = 0;
       try {
         // A claim serializes this app, not concurrent changes in Jira settings.
         // Check before the first global side effect as well as before attachment.
@@ -404,7 +867,8 @@ export function createSettings(p: Ports, s: SettingsPorts) {
           await verifyScheme();
           sent++;
           pending.type = await s.create(preview.name!);
-          await s.cas(c.projectId, revision++, { ...current.data, pending });
+          data = { ...current.data, pending };
+          await s.cas(c.projectId, revision++, data);
         }
         // Recheck scheme ownership after creation before modifying it.
         await verifyScheme();
@@ -414,14 +878,12 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         await verifyScheme();
         if (!project.issueTypes.some((t) => t.id === pending.type))
           throw new UserError('Jira has not confirmed the type association.');
-        await s.cas(c.projectId, revision, {
-          ...current.data,
-          ...(input.refreshAfterSave !== undefined
-            ? { refreshAfterSave: input.refreshAfterSave }
-            : {}),
-          type: pending.type,
-          previousTypes: preview.previousTypes,
-        });
+        // The claim stays through the screen changes, so a partial result keeps its outcome check.
+        screensStarted = true;
+        await screenPhase();
+        const final = configured(pending.type);
+        delete final.pending;
+        await s.cas(c.projectId, revision, final);
       } catch (error) {
         const unchanged =
           revision === claimed && (sent === 0 || (sent === 1 && error instanceof JiraRejected));
@@ -434,9 +896,9 @@ export function createSettings(p: Ports, s: SettingsPorts) {
           // The revision moved, so the reviewed fingerprint no longer applies: review again.
           throw notApplied(error, false);
         }
-        throw new UserError(uncertainSetup);
+        throw new UserError(screensStarted ? uncertainScreensAfterType : uncertainSetup);
       }
-      return { saved: true };
+      return outcome;
     },
     async recover(c: Context) {
       const project = await admin(c);

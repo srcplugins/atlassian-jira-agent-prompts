@@ -33,6 +33,8 @@ const runners = [
   setup('abandoned configuration, second administrator', { NATIVE_SETUP_ABANDONED: '1' }),
   setup('bulk configuration and setup removal', { NATIVE_SETUP_BULK: '1' }),
   setup('type name taken after review', { NATIVE_SETUP_REJECTED: '1' }),
+  setup('shared screens', { NATIVE_SETUP_SCREENS: '1' }),
+  setup('screen changes over several steps', { NATIVE_SETUP_STEPS: '1' }),
   step('Access runner', runner('access', 'run'), { NATIVE_ACCESS_TESTS: '1' }),
   step('Rovo runner', runner('rovo'), { NATIVE_ROVO_TESTS: '1' }),
 ];
