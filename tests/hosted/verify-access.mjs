@@ -29,6 +29,7 @@ import {
   installation,
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
+import { openField } from './support/snapshots.mjs';
 import { spaceSettings } from './support/space-settings.mjs';
 import { chooseScreenTypes, nextStep, reviewStep } from './support/configuration-dialog.mjs';
 
@@ -44,7 +45,9 @@ assert.equal(process.env.NATIVE_ACCESS_TESTS, '1', 'Explicit NATIVE_ACCESS_TESTS
 const { actors } = identityFixture();
 const directory = `${activeTarget().directory}/native-access-runs`;
 mkdirSync(directory, { recursive: true });
-const id = mode === 'run' ? randomUUID() : recoveryId;
+// A suite names the run, so it can clean this run up after a failure.
+const id = mode === 'run' ? (process.env.FORGE_TEST_RUN_ID ?? randomUUID()) : recoveryId;
+assert.match(id, /^[0-9a-f-]{36}$/);
 const path = `${directory}/${id}.json`;
 const lock = `${directory}/access.lock`;
 if (existsSync(lock)) {
@@ -503,12 +506,7 @@ try {
     const open = async (p) => {
       await p.goto(`${j.site}/browse/${target.key}`);
       await expect(readView(p)).toBeVisible({ timeout: 60000 });
-      const loaded = await observeAction(
-        p,
-        'load',
-        () => readView(p).click({ position: { x: 2, y: 2 } }),
-        t,
-      );
+      const loaded = await observeAction(p, 'load', () => openField(p, readView(p)), t);
       await expect(
         editor(p).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
       ).toBeEnabled();
@@ -657,10 +655,15 @@ try {
       refused = find(JSON.parse(text)) ?? null;
       return route.fulfill({ response, body: text });
     });
-    await readView(member).click({ position: { x: 2, y: 2 } });
-    await expect(
-      editor(member).getByText('This needs the Jira permission Administer Jira.', { exact: true }),
-    ).toBeVisible({ timeout: 45000 });
+    // Like openField, click again only while Jira still shows the read view.
+    const refusal = editor(member).getByText('This needs the Jira permission Administer Jira.', {
+      exact: true,
+    });
+    await expect(async () => {
+      if (await readView(member).isVisible())
+        await readView(member).click({ position: { x: 2, y: 2 }, timeout: 5000 });
+      await expect(refusal).toBeVisible({ timeout: 10000 });
+    }).toPass({ timeout: 45000, intervals: [1000, 3000] });
     await member.unroute(pattern);
     assert.deepEqual(refused, {
       ok: false,

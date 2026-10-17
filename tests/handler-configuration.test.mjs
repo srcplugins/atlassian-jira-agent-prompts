@@ -238,8 +238,7 @@ function store() {
   };
 }
 
-function harness() {
-  const site = jira();
+function harness(site = jira()) {
   const kv = store();
   const route = (strings, ...values) =>
     strings.reduce(
@@ -649,4 +648,128 @@ test('a configuration run saved with the retired reload option stops without a c
     revision: 1,
     data: { type: '10', refreshAfterSave: true },
   });
+});
+
+/** Team-managed spaces 101…(100 + n), each with its own Prompt, Task and Story work types and a
+ * subtask; only Task's layout has the field. Every write, and every scheme, global type or screen
+ * request, fails the test. */
+function teamJira(n) {
+  const spaces = Array.from({ length: n }, (_, i) => String(101 + i));
+  const reads = [];
+  const answer = (method, path) => {
+    const url = new URL(`https://jira.invalid${path}`);
+    const query = Object.fromEntries(url.searchParams);
+    const route = `${method} ${url.pathname}`;
+    if (method !== 'GET') throw Error(`Unexpected Jira write: ${route}`);
+    reads.push(route);
+    if (route === 'GET /rest/api/3/mypermissions')
+      return { permissions: { ADMINISTER: { havePermission: true } } };
+    if (route === 'GET /rest/api/3/field')
+      return [{ id: FIELD, schema: { custom: 'exact-field' } }];
+    const space = url.pathname.match(/^\/rest\/api\/3\/project\/(\d+)$/)?.[1];
+    if (spaces.includes(space))
+      return {
+        id: space,
+        key: `T${space}`,
+        name: `Team ${space}`,
+        style: 'next-gen',
+        projectTypeKey: 'software',
+        issueTypes: [
+          { id: `${space}0`, name: 'Prompt', subtask: false, hierarchyLevel: 0 },
+          { id: `${space}1`, name: 'Task', subtask: false, hierarchyLevel: 0 },
+          { id: `${space}2`, name: 'Story', subtask: false, hierarchyLevel: 0 },
+          { id: `${space}9`, name: 'Subtask', subtask: true, hierarchyLevel: -1 },
+        ],
+      };
+    const meta = url.pathname.match(
+      /^\/rest\/api\/3\/issue\/createmeta\/(\d+)\/issuetypes\/(\d+)$/,
+    );
+    if (meta && spaces.includes(meta[1])) {
+      assert.deepEqual(query, { startAt: '0', maxResults: '200' });
+      const fields = ['summary', 'description', ...(meta[2] === `${meta[1]}1` ? [FIELD] : [])];
+      return { total: fields.length, fields: fields.map((fieldId) => ({ fieldId })) };
+    }
+    throw Error(`Unexpected Jira request: ${route}`);
+  };
+  const api = {
+    asUser: () => ({
+      requestJira: async (path, options = {}) => {
+        const body = answer(options.method ?? 'GET', path);
+        return { ok: true, status: 200, json: async () => structuredClone(body) };
+      },
+    }),
+    asApp: () => {
+      throw Error('Unexpected asApp actor');
+    },
+  };
+  return { api, reads, spaces };
+}
+
+test('team-managed spaces are configured through the resolvers with three reads a step and no Jira write', async () => {
+  const permissions = 'GET /rest/api/3/mypermissions';
+  for (const n of [1, 5, 40]) {
+    const site = teamJira(n);
+    const h = harness(site);
+    const input = { reloadAfterSave: 'keep' };
+    const entries = [];
+    for (const id of site.spaces) {
+      const before = site.reads.length;
+      const options = await h.call('configuration-options', { projectId: id });
+      assert.deepEqual(options, {
+        teamManaged: true,
+        promptTypes: [
+          { id: `${id}0`, name: 'Prompt' },
+          { id: `${id}1`, name: 'Task' },
+          { id: `${id}2`, name: 'Story' },
+        ],
+      });
+      const preview = await h.call('configuration-preview', {
+        projectId: id,
+        type: `${id}0`,
+        ...input,
+      });
+      // Each call: the site administration check, the space's, and the space itself.
+      const space = [permissions, permissions, `GET /rest/api/3/project/${id}`];
+      assert.deepEqual(site.reads.slice(before), [...space, ...space]);
+      entries.push({ projectId: id, fingerprint: preview.fingerprint, type: `${id}0` });
+    }
+    let r = await h.call('configuration-start', { ...input, entries, revision: 0 });
+    assert.deepEqual(r.data.input, { reloadAfterSave: 'keep' });
+    const before = site.reads.length;
+    while (r.data.status === 'ready')
+      r = await h.call('configuration-advance', { id: r.data.id, revision: r.revision });
+    assert.equal(r.data.status, 'complete');
+    // A step: the run's administration check, then the space's check and the space for its
+    // review, which the apply reuses.
+    assert.deepEqual(
+      site.reads.slice(before),
+      site.spaces.flatMap((id) => [permissions, permissions, `GET /rest/api/3/project/${id}`]),
+    );
+    for (const id of site.spaces)
+      assert.deepEqual(h.kv.records.get(`config-${id}`).data, {
+        type: `${id}0`,
+        previousTypes: [],
+      });
+  }
+});
+
+test('team-managed health reads the space, the field and one create metadata page per standard work type', async () => {
+  const site = teamJira(1);
+  const h = harness(site);
+  const health = await h.call('settings-health', { projectId: '101' });
+  assert.deepEqual(site.reads, [
+    'GET /rest/api/3/mypermissions',
+    'GET /rest/api/3/project/101',
+    'GET /rest/api/3/field',
+    'GET /rest/api/3/issue/createmeta/101/issuetypes/1010',
+    'GET /rest/api/3/issue/createmeta/101/issuetypes/1011',
+    'GET /rest/api/3/issue/createmeta/101/issuetypes/1012',
+  ]);
+  assert.deepEqual(health.layouts, [
+    { id: '1010', name: 'Prompt', present: false },
+    { id: '1011', name: 'Task', present: true },
+    { id: '1012', name: 'Story', present: false },
+  ]);
+  assert.equal(health.project.teamManaged, true);
+  assert.equal(health.checks[0].ok, false);
 });

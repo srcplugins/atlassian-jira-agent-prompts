@@ -34,6 +34,20 @@
       "lowerLevelTests": ["tests/settings.test.mjs", "tests/boundary.test.mjs"]
     },
     {
+      "id": "NPL-12",
+      "behavior": "Team-managed space: field placement shown, the space's own prompt type set through Configure, Save and Sync, and setup removal",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "The persistent marked team-managed space (prepare-team-managed.mjs: Prompt work type, the field on the Task layout only); disposable marked Prompt and Task work items",
+      "assertion": "The space is listed on the Team-managed tab and its row lists Task under Agent Prompts on layouts; health shows the field on Task only; the one-screen dialog's confirmation names the space's own Prompt type and no Jira change; the snapshot journey's description checks; after removal the type is cleared and kept as previous; the space's work types and every type's create metadata unchanged",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/settings.test.mjs",
+        "tests/configuration-batch.test.mjs",
+        "tests/handler-configuration.test.mjs",
+        "tests/configuration-dialog.test.mjs"
+      ]
+    },
+    {
       "id": "NPL-03",
       "behavior": "Initially null Description add/remove and recovery after reopening",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
@@ -133,9 +147,9 @@
       "unattended": true,
       "script": "tests/hosted/verify-rovo.mjs",
       "optIn": "NATIVE_ROVO_TESTS",
-      "command": "NATIVE_ROVO_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-rovo.mjs (runs in the full and release suites of forge-test.mjs)",
-      "fixture": "One journal-owned ordinary-description source in the Agent Prompts fixture space in the current configured type; consenting owner session; shared space lock; existing unresolved scale journal blocks execution",
-      "assertion": "Jira search returns the fixture; two fresh chats search its exact key and retrieve its withheld name, then read complete normalized instructions withheld from chat input; independent Jira inventory unchanged throughout reads",
+      "command": "NATIVE_ROVO_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-rovo.mjs, and with NATIVE_ROVO_SPACE=team-managed (both run in the full and release suites of forge-test.mjs)",
+      "fixture": "One journal-owned ordinary-description source in the Agent Prompts fixture space in the current configured type, or in team-managed mode in the persistent marked team-managed space in its own Prompt type, set through Configure; consenting owner session; shared space lock; existing unresolved scale journal blocks execution",
+      "assertion": "Jira search returns the fixture; two fresh chats search its exact key and retrieve its withheld name, then read complete normalized instructions withheld from chat input; independent Jira inventory unchanged throughout reads; team-managed mode then removes setup, keeps the type as previous and finds the space's work types and every type's create metadata unchanged",
       "cleanup": "Exact run-owned fixture deleted with guarded verification; complete original inventory restored; private UUID artifacts retained, failed reads remain failed",
       "version": "Unattended in every hosted suite run",
       "lowerLevelTests": ["tests/hosted-rovo.test.mjs", "tests/boundary.test.mjs"]
@@ -217,6 +231,19 @@
       "cleanup": "Site-specific durable fixture journal and space lock; explicit cleanup <run-uuid>; verified work item absence and setup removal. Interrupted runs require inspection.",
       "version": "Current development; Rovo eligibility checked separately",
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
+    },
+    {
+      "id": "NPL-TEAM-FIXTURE",
+      "method": "fixture-runner",
+      "unattended": false,
+      "script": "tests/hosted/prepare-team-managed.mjs",
+      "optIn": "NATIVE_TEAM_MANAGED_PREPARE",
+      "command": "NATIVE_TEAM_MANAGED_PREPARE=1 JIRA_SITE=<primary site> node tests/hosted/prepare-team-managed.mjs",
+      "fixture": "Creates once, or verifies, the persistent marked team-managed space on the primary site that NPL-12 and the team-managed Rovo run use; journaled before creation",
+      "assertion": "The space's marker, key, team-managed style and software type are checked before any step; each space administrator step (the Agent Prompts field added and placed on the Task layout only, the Prompt work type, its workflow starting in Prompt available, that status hidden on the board) is checked in Jira first and runs only when missing",
+      "cleanup": "Persistent prepared space, never deleted; an unresolved creation journal stops a rerun until inspected",
+      "version": "Run when the space is missing or its manual setup changed; not part of any suite",
+      "lowerLevelTests": ["tests/hosted-coverage.test.mjs"]
     }
   ]
 }

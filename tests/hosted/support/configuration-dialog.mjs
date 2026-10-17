@@ -18,8 +18,18 @@ export async function nextStep(page) {
  * step. When removing setup it previews from the first step.
  */
 export async function reviewStep(page) {
-  await page.getByRole('button', { name: 'Review changes', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Changes', exact: true })).toBeVisible(previewed);
+  // Jira can fail a read of a space created moments earlier (HTTP 5xx). Back and Review changes
+  // previews only that space again, and a preview writes nothing; after two retries a failure stands.
+  for (let attempt = 0; ; attempt++) {
+    await page.getByRole('button', { name: 'Review changes', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Changes', exact: true })).toBeVisible(
+      previewed,
+    );
+    const failed = page.getByText(/^Blocked: Jira request failed \(HTTP 5\d\d\)/);
+    if (attempt === 2 || (await failed.count()) === 0) return;
+    await page.getByRole('button', { name: 'Back', exact: true }).click();
+    await page.waitForTimeout(5000);
+  }
 }
 
 /** Goes from the first step to the review unchanged and returns a selected space's preview. */

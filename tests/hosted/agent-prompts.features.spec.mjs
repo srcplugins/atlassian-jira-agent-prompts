@@ -1,4 +1,4 @@
-import { editor, snapshotJourney } from './support/snapshots.mjs';
+import { editor, expandPrompts, openField, snapshotJourney } from './support/snapshots.mjs';
 import {
   expect,
   installation,
@@ -13,9 +13,17 @@ import {
   isMarker,
   markers,
 } from '@srcplugins/atlassian-forge-test-framework/core';
-import { agentPromptsFixture } from './support/fixture.mjs';
+import { agentPromptsFixture, teamManagedFixture } from './support/fixture.mjs';
 import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
 import { reviewConfiguration } from './support/configuration-dialog.mjs';
+import {
+  checkSpace,
+  configureOwnType,
+  details,
+  globalConfiguration,
+  jiraConfiguration,
+  removeSetup,
+} from './support/team-managed.mjs';
 test.use({ fixtureApp: agentPromptsFixture });
 test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
   test.skip(
@@ -72,38 +80,7 @@ async function configuration(page, owned, global = false) {
   const t = installation('agent-prompts');
   if (global) await globalConfiguration(page, t);
   else await spaceSettings(page, owned.project.key);
-  await expect(page.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled({
-    timeout: 60000,
-  });
-  await page.getByRole('textbox', { name: 'Find a space', exact: true }).fill(owned.project.key);
-  await page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }).click();
-  const health = await observeAction(
-    page,
-    'settings-health',
-    () => page.getByRole('button', { name: 'Check selected', exact: true }).click(),
-    t,
-    owned.project.id,
-  );
-  return health;
-}
-/** Opens the global configuration page and returns the space inventory it loads. */
-function globalConfiguration(page, t) {
-  return observeAction(
-    page,
-    'settings-projects',
-    () =>
-      page.goto(
-        `${activeTarget().site}/jira/settings/apps/configure/${t.appId}/${t.environmentId}`,
-      ),
-    t,
-  );
-}
-async function details(page, key) {
-  await page
-    .getByRole('row')
-    .filter({ has: page.getByRole('checkbox', { name: `Select ${key}`, exact: true }) })
-    .getByRole('button', { name: 'View details', exact: true })
-    .click();
+  return checkSpace(page, t, owned.project.key, owned.project.id);
 }
 
 test('NPL-02 selected space health and cancelled modal preserve Jira', async ({ page, owned }) => {
@@ -260,9 +237,10 @@ test('NPL-05 unified global configuration checks selected spaces and selects acr
   );
   expect(catalog.typesAvailable).toBe(true);
   expect('projects' in catalog).toBe(false);
+  // Select all covers the company-managed tab only; team-managed spaces are configured apart.
   await expect(
     page.getByRole('heading', {
-      name: `Configure ${inventory.projects.length} spaces`,
+      name: `Configure ${inventory.projects.filter((p) => !p.teamManaged).length} spaces`,
       exact: true,
     }),
   ).toBeVisible();
@@ -343,12 +321,7 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
     .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
     .locator('..')
     .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
-  const loaded = await observeAction(
-    page,
-    'load',
-    () => readView.click({ position: { x: 2, y: 2 } }),
-    t,
-  );
+  const loaded = await observeAction(page, 'load', () => openField(page, readView), t);
   owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
   owned.run.persist();
   expect(loaded.prompts.map((p) => p.id)).toContain(source.id);
@@ -437,12 +410,7 @@ test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-on
   let loaded;
   const open = async () => {
     await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
-    loaded = await observeAction(
-      page,
-      'load',
-      () => readView.click({ position: { x: 2, y: 2 } }),
-      t,
-    );
+    loaded = await observeAction(page, 'load', () => openField(page, readView), t);
     await expect(
       editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
     ).toBeEnabled();
@@ -603,12 +571,7 @@ test('NPL-08 opt-in work item reload follows a confirmed save and restores the s
       .locator(
         '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
       );
-    const loaded = await observeAction(
-      page,
-      'load',
-      () => read.click({ position: { x: 2, y: 2 } }),
-      t,
-    );
+    const loaded = await observeAction(page, 'load', () => openField(page, read), t);
     owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
     owned.run.persist();
     expect(loaded.refreshAfterSave).toBe(true);
@@ -637,8 +600,7 @@ test('NPL-08 opt-in work item reload follows a confirmed save and restores the s
     await expect(
       editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
     ).toHaveCount(0);
-    await page.getByRole('button', { name: 'Agent Prompts', exact: true }).click();
-    await expect(page.getByText('RELOAD-SENTINEL', { exact: false })).toBeVisible();
+    await expandPrompts(page, 'RELOAD-SENTINEL');
     await page.screenshot({
       path: testInfo.outputPath('automatic-work-item-reload.png'),
       fullPage: true,
@@ -658,7 +620,7 @@ test('NPL-08 opt-in work item reload follows a confirmed save and restores the s
       });
       expect(found.issues.some((i) => i.id === second.id)).toBe(true);
     }).toPass({ timeout: 30000, intervals: [1000, 3000] });
-    await read.click({ position: { x: 2, y: 2 } });
+    await openField(page, read);
     const picker = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
     await expect(picker).toBeEnabled();
     await observeAction(
@@ -696,7 +658,7 @@ test('NPL-08 opt-in work item reload follows a confirmed save and restores the s
       expect(saved.fields[field.id]).toEqual(keys);
     }
     await saveAndReload(two, [sourceIssue.key, secondIssue.key]);
-    await read.click({ position: { x: 2, y: 2 } });
+    await openField(page, read);
     await expect(picker).toBeEnabled();
     await editor(page)
       .getByRole('button', {
@@ -744,12 +706,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
     .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
     .locator('..')
     .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
-  const loaded = await observeAction(
-    page,
-    'load',
-    () => readView.click({ position: { x: 2, y: 2 } }),
-    t,
-  );
+  const loaded = await observeAction(page, 'load', () => openField(page, readView), t);
   expect(loaded.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
   const search = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
   const first = await observeAction(page, 'search', () => search.fill(`prompt ${term}`), t);
@@ -790,7 +747,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
   for (const name of ['Light', 'Dark']) {
     await theme(name);
     await page.goto(`${activeTarget().site}/browse/${before.key}`);
-    await observeAction(page, 'load', () => readView.click({ position: { x: 2, y: 2 } }), t);
+    await observeAction(page, 'load', () => openField(page, readView), t);
     await expect(editor(page).locator('html')).toHaveAttribute(
       'data-color-mode',
       name.toLowerCase(),
@@ -809,4 +766,63 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
     await picker.press('Escape');
     await editor(page).getByRole('button', { name: 'Discard changes', exact: true }).click();
   }
+});
+
+test.describe('team-managed space', () => {
+  test.use({ fixtureProfile: teamManagedFixture });
+  test('NPL-12 team-managed space: field placement, own prompt type, Save and Sync, setup removal', async ({
+    page,
+    owned,
+  }, testInfo) => {
+    const t = installation('agent-prompts');
+    const key = owned.project.key;
+    const jira = () => jiraConfiguration(owned.api, owned.project.id);
+    const before = await jira();
+    const prompt = before.types.find(([, name]) => name === 'Prompt')?.[0];
+    expect(prompt).toBeTruthy();
+    let health = await configuration(page, owned, true);
+    expect(health.project.teamManaged).toBe(true);
+    // An interrupted earlier run may have left the space set up.
+    if (health.state.data.type) {
+      await removeSetup(page, t, key);
+      health = await configuration(page, owned, true);
+    }
+    // The site has both kinds, so the space is listed on the team-managed tab with its layouts.
+    await expect(page.getByRole('tab', { name: /^Team-managed \(\d+\)$/ })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await expect(
+      page
+        .getByRole('row')
+        .filter({ has: page.getByRole('checkbox', { name: `Select ${key}`, exact: true }) })
+        .getByText('Task', { exact: true }),
+    ).toBeVisible();
+    // The prepared space has the field on the Task layout only.
+    expect(health.layouts.filter((l) => l.present).map((l) => l.name)).toEqual(['Task']);
+
+    await details(page, key);
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByText('Agent Prompts on layouts', { exact: true })).toBeVisible();
+    await expect(
+      dialog.getByRole('link', { name: 'Work type settings', exact: true }),
+    ).toHaveAttribute(
+      'href',
+      `${activeTarget().site}/jira/software/projects/${key}/settings/issuetypes`,
+    );
+    await configureOwnType(page, t, { key, type: prompt, name: 'Prompt' });
+    health = await configuration(page, owned, true);
+    expect(health.state.data.type).toBe(prompt);
+    expect(health.checks.every((c) => c.ok)).toBe(true);
+
+    // Picking, Save and Sync work as in a company-managed space.
+    await snapshotJourney({ page, owned, blank: false, testInfo });
+
+    await configuration(page, owned, true);
+    await removeSetup(page, t, key);
+    health = await configuration(page, owned, true);
+    expect(health.state.data.type).toBeUndefined();
+    expect(health.state.data.previousTypes).toContain(prompt);
+    expect(await jira()).toEqual(before);
+  });
 });

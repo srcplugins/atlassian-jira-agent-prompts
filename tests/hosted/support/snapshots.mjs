@@ -12,6 +12,34 @@ export function editor(page) {
   const t = installation('agent-prompts');
   return page.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
 }
+/**
+ * Opens the field's editor from its read view. On a slower host (GitHub's runners) Jira can drop
+ * a click on a freshly loaded work item before it is interactive, so click again until the
+ * editor shows. Opening only reads; a second click lands only when the first opened nothing.
+ * When Jira fails the editor's own read, press its Try again, which only reads again.
+ */
+export async function openField(page, readView) {
+  const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  const retry = editor(page).getByRole('button', { name: 'Try again', exact: true });
+  await expect(async () => {
+    if (await retry.isVisible()) await retry.click({ timeout: 5000 });
+    else if (!(await combo.isVisible()))
+      await readView.click({ position: { x: 2, y: 2 }, timeout: 5000 });
+    await expect(combo).toBeVisible({ timeout: 5000 });
+  }).toPass({ timeout: 40000, intervals: [1000, 3000] });
+}
+/**
+ * Expands the description's Agent Prompts section until `text` shows. Like `openField`, a click
+ * on a freshly loaded work item can be dropped; click only while the section reports collapsed.
+ */
+export async function expandPrompts(page, text) {
+  const section = page.getByRole('button', { name: 'Agent Prompts', exact: true });
+  await expect(async () => {
+    if ((await section.getAttribute('aria-expanded', { timeout: 5000 })) !== 'true')
+      await section.click({ timeout: 5000 });
+    await expect(page.getByText(text, { exact: false })).toBeVisible({ timeout: 5000 });
+  }).toPass({ timeout: 40000, intervals: [1000, 3000] });
+}
 // The field bundle embeds Atlaskit feature-gate endpoints but declares no egress, so Forge's CSP
 // must block them. Watch only the app's own iframe: Jira's host page uses the same services.
 const telemetryHosts =
@@ -143,7 +171,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   const loaded = await observeAction(
     page,
     'load',
-    () => readView.click({ position: { x: 2, y: 2 } }),
+    () => openField(page, readView),
     installation('agent-prompts'),
   );
   owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
@@ -182,12 +210,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
       await observeAction(page, 'save', click, installation('agent-prompts'));
     }
     if (loaded.refreshAfterSave) {
-      await observeAction(
-        page,
-        'load',
-        () => readView.click({ position: { x: 2, y: 2 } }),
-        installation('agent-prompts'),
-      );
+      await openField(page, readView);
     } else {
       await expect(
         editor(page).getByText(action === 'Sync' ? '✓ Synced' : 'Saved.', { exact: true }),
@@ -245,8 +268,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   }
   // Only the test explicitly reloads, after asserting the editor remained mounted.
   await page.reload();
-  await page.getByRole('button', { name: 'Agent Prompts', exact: true }).click();
-  await expect(page.getByText(sentinel, { exact: false })).toBeVisible();
+  await expandPrompts(page, sentinel);
   // Ordinary API edits are now sufficient: no synced-block publishing.
   const updated = adf(`${sentinel}-UPDATED`);
   source.expected.descriptionVariants = [...source.expected.descriptionVariants, updated];
@@ -255,7 +277,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   expect((await owned.api(`/issue/${target.id}?fields=description`)).fields.description).toEqual(
     linked.description,
   );
-  await readView.click({ position: { x: 2, y: 2 } });
+  await openField(page, readView);
   await expect(combo).toBeEnabled();
   const expectedRefresh = structuredClone(expectedLinked);
   expectedRefresh.content.at(-1).content.splice(1, Infinity, ...updated.content);
@@ -286,7 +308,7 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   owned.run.persist();
   if (blank) {
     await page.reload();
-    await readView.click({ position: { x: 2, y: 2 } });
+    await openField(page, readView);
     await expect(combo).toBeEnabled();
     await expect(page.getByText(/earlier save|outcome is uncertain/i)).toHaveCount(0);
   }
@@ -320,7 +342,7 @@ export async function resumeSavedJourney({ page, owned, backup }) {
   const loaded = await observeAction(
     page,
     'load',
-    () => readView.click({ position: { x: 2, y: 2 } }),
+    () => openField(page, readView),
     installationTarget,
   );
   expect(loaded.ids).toEqual([source.id]);

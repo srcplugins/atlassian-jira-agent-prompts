@@ -46,6 +46,7 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
       issueTypes: [],
     };
     const allowed = { body: { permissions: { ADMINISTER: { havePermission: true } } } };
+    const failedRead = [{ status: 500 }, { status: 500 }, { status: 500 }];
     const stored = {
       revision: 2,
       data: {
@@ -57,7 +58,9 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
       ...forgeContract(
         allowed,
         { body: project },
-        { status: 500 },
+        // A read failing with a 5xx is tried three times before the check reports it. The other
+        // scheme reads answer while it pauses, so its second and third tries follow them.
+        failedRead[0],
         { body: { isLast: true, values: [{ issueTypeScheme: { id: '9' } }] } },
         {
           body: {
@@ -72,8 +75,9 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
             ],
           },
         },
+        ...failedRead.slice(1),
         { body: [{ id: 'customfield_1', schema: { custom: 'exact' } }] },
-        ...(pending ? [allowed, { body: project }, { status: 500 }] : []),
+        ...(pending ? [allowed, { body: project }, ...failedRead] : []),
       ),
       kvs: {
         entity: () => ({ get: async () => structuredClone(stored) }),
@@ -103,6 +107,9 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
     assert.ok(!ui.labels().some((label) => /remove setup|unlink|apply change/i.test(label)));
     if (pending) {
       await ui.click('Check outcome');
+      // The failed type read is tried again after timed pauses, beyond what settle waits for.
+      while (replies.length < 2) await new Promise((resolve) => setTimeout(resolve, 50));
+      await ui.settle();
       assert.match(replies[1].value.message, /outcome remains unknown/);
       assert.equal(
         ui.nodes('Checkbox').find((n) => n.props.label.startsWith('I inspected')).props.isChecked,
@@ -168,6 +175,84 @@ test('Jira configuration is always visible with absolute new-tab links and no te
     ],
   );
   assert.deepEqual(calls, []);
+});
+
+test('a team-managed space shows where the field is and links to its own space settings', async () => {
+  const calls = [];
+  const ui = fixture(
+    async (name) => {
+      calls.push(name);
+    },
+    {
+      initialHealth: {
+        project: { id: '1', key: 'TEAM', teamManaged: true, issueTypes: [] },
+        state: { revision: 2, data: { type: '10430' } },
+        types: [
+          { id: '10426', name: 'Task' },
+          { id: '10427', name: 'Story' },
+          { id: '10430', name: 'Prompt' },
+        ],
+        layouts: [
+          { id: '10426', name: 'Task', present: true },
+          { id: '10427', name: 'Story', present: false },
+        ],
+        checks: [{ label: 'Agent Prompts on layouts', ok: true, detail: 'On Task.' }],
+      },
+    },
+  );
+  await ui.mount();
+  const text = ui.nodes('Text').map((n) => [n.props.children].flat(Infinity).join(''));
+  assert.ok(text.includes('Agent Prompts on layouts'));
+  assert.ok(text.includes('Task'));
+  assert.ok(text.includes('Prompt'));
+  assert.ok(!text.includes('Screens'));
+  assert.ok(!text.some((t) => t.startsWith('Work type scheme')));
+  assert.ok(text.some((t) => /This team-managed space is set up by hand/.test(t)));
+  const links = ui.nodes('Link');
+  assert.ok(links.every((n) => n.props.openNewTab));
+  assert.deepEqual(
+    links.map((n) => n.props.href),
+    [
+      'https://example.atlassian.net/jira/software/projects/TEAM/settings/fields',
+      'https://example.atlassian.net/jira/software/projects/TEAM/settings/issuetypes',
+    ],
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('a team-managed layout that could not be read is not shown as missing the field', async () => {
+  const layoutsText = async (layouts) => {
+    const ui = fixture(async () => {}, {
+      initialHealth: {
+        project: { id: '1', key: 'TEAM', teamManaged: true, issueTypes: [] },
+        state: { revision: 2, data: { type: '10430' } },
+        types: [
+          { id: '10426', name: 'Task' },
+          { id: '10427', name: 'Story' },
+          { id: '10430', name: 'Prompt' },
+        ],
+        layouts,
+        checks: [],
+      },
+    });
+    await ui.mount();
+    const text = ui.nodes('Text').map((n) => [n.props.children].flat(Infinity).join(''));
+    return text[text.indexOf('Agent Prompts on layouts') + 1];
+  };
+  assert.equal(
+    await layoutsText([
+      { id: '10426', name: 'Task', present: false },
+      { id: '10427', name: 'Story' },
+    ]),
+    'Not known',
+  );
+  assert.equal(
+    await layoutsText([
+      { id: '10426', name: 'Task', present: false },
+      { id: '10427', name: 'Story', present: false },
+    ]),
+    'None',
+  );
 });
 
 test('preferences preserve revision validation and explicit save, including failure feedback', async () => {

@@ -34,17 +34,26 @@ export function manifestFindings(source, nodeMajor) {
   return failures;
 }
 
-export function dependencyPinFindings(pkg) {
+/**
+ * Exact versions, the verified local Forge CLI archive, or a GitHub release tag or full commit
+ * hash. During development a GitHub dependency may follow a branch (CI tests its latest commit);
+ * a release must pin one of the immutable forms.
+ */
+export function dependencyPinFindings(pkg, { release = false } = {}) {
+  const github = release
+    ? /^github:[\w.-]+\/[\w.-]+#(?:v\d+\.\d+\.\d+|[0-9a-f]{40})$/
+    : /^github:[\w.-]+\/[\w.-]+#[\w./-]+$/;
   const failures = [];
   for (const group of ['dependencies', 'devDependencies'])
     for (const [name, version] of Object.entries(pkg[group] ?? {}))
-      // Exact versions, the verified local Forge CLI archive, or a GitHub release tag.
       if (
         !/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(version) &&
         !/^file:\.local\/toolchain\/[\w.-]+\.tgz$/.test(version) &&
-        !/^github:[\w.-]+\/[\w.-]+#v\d+\.\d+\.\d+$/.test(version)
+        !github.test(version)
       )
-        failures.push(`package.json: ${name} must use an exact version.`);
+        failures.push(
+          `package.json: ${name} must use an exact version${release ? ', release tag or full commit hash for a release' : ''}.`,
+        );
   return failures;
 }
 
@@ -381,12 +390,14 @@ export function publicRepositoryFindings(appDir) {
     .flatMap((file) => publicRepositoryFindingsIn(file, readFileSync(join(appDir, file), 'utf8')));
 }
 
-export function pluginFindings(appDir) {
+export function pluginFindings(appDir, { release = false } = {}) {
   return [
     ...manifestFindings(readFileSync(join(appDir, 'manifest.yml'), 'utf8'), nodeMajor(appDir)).map(
       (finding) => `manifest.yml: ${finding}`,
     ),
-    ...dependencyPinFindings(JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8'))),
+    ...dependencyPinFindings(JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')), {
+      release,
+    }),
     ...readmeFindings(appDir),
     ...hostTermFindings(appDir),
     ...compatFindings(appDir),
@@ -398,11 +409,16 @@ export function pluginFindings(appDir) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const findings = pluginFindings(resolve(process.argv[2] ?? '.'));
+  // --release (the Publish workflow) also refuses a GitHub dependency that follows a branch.
+  const args = process.argv.slice(2);
+  const release = args.includes('--release');
+  const findings = pluginFindings(resolve(args.find((arg) => arg !== '--release') ?? '.'), {
+    release,
+  });
   for (const finding of findings) console.error(finding);
   if (findings.length) process.exitCode = 1;
   else
     console.log(
-      'Manifest defaults and handlers, exact pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts and public-repository rules passed.',
+      `Manifest defaults and handlers, ${release ? 'release' : 'dependency'} pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts and public-repository rules passed.`,
     );
 }

@@ -1,16 +1,22 @@
 # Shared srcplugins file, synchronized across repositories.
 name: Hosted
 
-# The full hosted suite (forge-test.mjs) on every push to a feature branch: deploy this commit to
-# the Forge development environment, upgrade the owned site's installation, then every unattended
-# journey and runner. Site, accounts and evidence stay private: values come from the `acceptance`
-# environment's secrets and are masked, and reports and journals are uploaded only age-encrypted.
-# Setup: the test framework's docs/ci.md.
+# Hosted suites (forge-test.mjs): deploy this commit to the Forge development environment,
+# upgrade the owned site's installation, then the suite's unattended journeys and runners. A push
+# to a feature branch runs the features suite; a "Hosted: <choice>" line in its commit message
+# picks another: full, none, or comma-separated step names (the full suite's prerequisites and the
+# steps whose names contain them, for example "Hosted: bulk, rovo"). Marking a pull request ready
+# for review runs the full suite, and Publish runs the release suite. Site, accounts and evidence
+# stay private: values come from the `acceptance` environment's secrets and are masked, and
+# reports and journals are uploaded only age-encrypted. Setup: the test framework's docs/ci.md.
 
 on:
   push:
     # Dependabot branches get no environment secrets, so the suite could not run there.
     branches-ignore: [main, 'dependabot/**']
+    paths-ignore: ['**.md']
+  pull_request:
+    types: [ready_for_review]
   workflow_dispatch:
     inputs:
       suite:
@@ -18,6 +24,12 @@ on:
         type: choice
         options: [full, features]
         default: full
+      only:
+        description: >-
+          Optional: comma-separated step names; runs the suite's prerequisites and the steps whose
+          names contain them
+        required: false
+        default: ''
       cleanup:
         description: >-
           Instead of the suite, after inspecting a failed run: one guarded cleanup as "<target> <run-uuid>".
@@ -50,6 +62,10 @@ defaults:
 jobs:
   hosted:
     name: Hosted suite
+    # Pull requests from forks get no environment secrets.
+    if: >-
+      !contains(github.event.head_commit.message, 'Hosted: none') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     environment: acceptance
@@ -59,13 +75,34 @@ jobs:
       cancel-in-progress: false
     env:
       CI: 'true'
-      SUITE: ${{ inputs.suite || 'full' }}
       CLEANUP: ${{ inputs.cleanup }}
       DEPLOY_TAG: ${{ inputs.deploy_tag }}
     steps:
+      - name: Choose the suite
+        env:
+          EVENT: ${{ github.event_name }}
+          MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_ONLY: ${{ inputs.only }}
+        run: |
+          suite=${INPUT_SUITE:-full}
+          only=$INPUT_ONLY
+          if [ "$EVENT" = push ]; then
+            suite=features
+            choice=$(printf '%s\n' "$MESSAGE" | sed -n 's/^Hosted: *//p' | tail -n 1)
+            case "$choice" in
+              '' | features) ;;
+              full) suite=full ;;
+              *) suite=full only=$choice ;;
+            esac
+          fi
+          [[ "$only" =~ ^[A-Za-z0-9\ ,:-]*$ ]] || { echo "::error::Step names may use letters, digits, spaces, commas, colons and hyphens"; exit 1; }
+          echo "SUITE=$suite" >> "$GITHUB_ENV"
+          echo "ONLY=$only" >> "$GITHUB_ENV"
+          echo "Suite: $suite${only:+ (only $only)}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -74,13 +111,42 @@ jobs:
       - name: GitHub dependencies over HTTPS
         env:
           TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
-        run: git config --global url."https://${TOKEN:+x-access-token:$TOKEN@}github.com/".insteadOf ssh://git@github.com/
+          OWNER: ${{ vars.SRCPLUGINS_REPO_OWNER }}
+          PREFIX: ${{ vars.SRCPLUGINS_REPO_PREFIX }}
+        run: |
+          base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
+          git config --global url."$base".insteadOf ssh://git@github.com/
+          # A development copy sets these repository variables to read its sibling copies:
+          # srcplugins/<name> then resolves to <owner>/<prefix><name> (see the factory's ci.md).
+          [ -n "$OWNER$PREFIX" ] || exit 0
+          [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
+            { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
+          for from in ssh://git@github.com/srcplugins/ https://github.com/srcplugins/; do
+            git config --global --add url."$base${OWNER:-srcplugins}/$PREFIX".insteadOf "$from"
+          done
+          echo "srcplugins repositories resolve to ${OWNER:-srcplugins}/$PREFIX<name>"
       - name: Install dependencies
         run: |
           node config/prepare-forge-cli.mjs
           npm ci --no-audit --no-fund
           sudo apt-get update > /dev/null
           sudo apt-get install -y --no-install-recommends age > /dev/null
+      # During development the test framework may follow a branch: test that branch's latest
+      # commit rather than the one the lockfile recorded. A release pins a tag or commit.
+      - name: Test framework version
+        run: |
+          spec=$(node -p "require('./package.json').devDependencies['@srcplugins/atlassian-forge-test-framework'] ?? ''")
+          ref=${spec#*#}
+          repo=${spec#github:}
+          repo=${repo%%#*}
+          if [[ "$spec" != github:*#* || "$ref" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|[0-9a-f]{40})$ ]]; then
+            echo "Test framework: $spec"
+            exit 0
+          fi
+          [ -z "$DEPLOY_TAG" ] || { echo "::error::A release must pin the test framework to a tag or commit"; exit 1; }
+          sha=$(git ls-remote --exit-code "ssh://git@github.com/$repo.git" "refs/heads/$ref" | cut -f1)
+          npm install --no-save --no-audit --no-fund "git+ssh://git@github.com/$repo.git#$sha"
+          echo "Test framework: $ref at $sha"
       # Site configuration and credentials are scoped to the steps that use them, never to
       # the install step.
       - name: Restore sessions and mask private values
@@ -95,18 +161,21 @@ jobs:
           npx forge-test mask
           npx forge-test restore
           npx forge-test mask
-      # Run journals carry fixture ownership between runs, encrypted to the owner and this
-      # workflow. An unresolved journal makes the next run refuse instead of ignoring leftovers.
+      # Run journals carry fixture ownership between runs, encrypted to the owner, the optional
+      # debugging agent and this workflow. An unresolved journal makes the next run refuse
+      # instead of ignoring leftovers.
       - name: Restore run journals
         id: state
         env:
           GH_TOKEN: ${{ github.token }}
           CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
           OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+          AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
         run: |
           # Fail before the suite if this run's journals could not be encrypted afterwards.
           [ -n "$OWNER" ] || { echo "::error::OWNER_AGE_RECIPIENT is not set"; exit 1; }
           printf x | age -r "$OWNER" > /dev/null || { echo "::error::OWNER_AGE_RECIPIENT is not an age recipient"; exit 1; }
+          [ -z "$AGENT" ] || printf x | age -r "$AGENT" > /dev/null || { echo "::error::AGENT_AGE_RECIPIENT is not an age recipient"; exit 1; }
           # The API doesn't list newest first and pages at 100; runs are serial, so the newest
           # unexpired state is current.
           # gh refuses --slurp with its own --jq, so the merged pages go through jq.
@@ -135,7 +204,9 @@ jobs:
           FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
-        run: npx forge-test suite "$SUITE"
+        # A failed lane or runner cleans up through its declared cleanup and the suite moves on;
+        # a cleanup that refuses stops it, leaving the journal for "cleanup" above.
+        run: npx forge-test suite "$SUITE" ${ONLY:+--only "$ONLY"}
       - name: Guarded cleanup of a failed run
         if: env.CLEANUP != ''
         env:
@@ -170,15 +241,19 @@ jobs:
         env:
           CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
           OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+          AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
           ci=$(age-keygen -y <(printf '%s' "$CI_AGE_KEY"))
+          # The owner and, when set, the agent that debugs failures can read both archives.
+          readers=(-r "$OWNER")
+          [ -z "$AGENT" ] || readers+=(-r "$AGENT")
           cd .local
           find sites -path '*/e2e/*runs/*.json' > "$RUNNER_TEMP/journals.txt"
-          tar -czf - -T "$RUNNER_TEMP/journals.txt" | age -r "$OWNER" -r "$ci" > "$RUNNER_TEMP/out/journals.tar.age"
+          tar -czf - -T "$RUNNER_TEMP/journals.txt" | age "${readers[@]}" -r "$ci" > "$RUNNER_TEMP/out/journals.tar.age"
           find sites \( -name '*-report.json' -o -path '*-results/*' -o -path '*/e2e/*runs/*.png' -o -path '*/e2e/*runs/*.txt' \) -type f \
             > "$RUNNER_TEMP/evidence.txt"
-          tar -czf - -T "$RUNNER_TEMP/evidence.txt" | age -r "$OWNER" > "$RUNNER_TEMP/out/evidence.tar.age"
+          tar -czf - -T "$RUNNER_TEMP/evidence.txt" | age "${readers[@]}" > "$RUNNER_TEMP/out/evidence.tar.age"
       - name: Save run journals
         if: always() && steps.state.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -186,7 +261,7 @@ jobs:
           name: hosted-state
           path: ${{ runner.temp }}/out/journals.tar.age
           retention-days: 90
-      - name: Save evidence (owner key only)
+      - name: Save evidence (owner and agent keys only)
         if: always() && steps.state.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

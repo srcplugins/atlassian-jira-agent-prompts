@@ -131,20 +131,38 @@ export function Settings({
                   </Text>
                   <Text>Agent Prompts</Text>
                 </Stack>
-                <Stack space="space.050">
-                  <Text size="small" color="color.text.subtle">
-                    Screens
-                  </Text>
-                  <Text>
-                    {(health.state.data.screenTypes ?? [])
-                      .map(
-                        (id) =>
-                          health.project.issueTypes.find((type) => type.id === id)?.name ??
-                          `Work type ID ${id}`,
-                      )
-                      .join(', ') || 'Not set'}
-                  </Text>
-                </Stack>
+                {'layouts' in health ? (
+                  <Stack space="space.050">
+                    <Text size="small" color="color.text.subtle">
+                      Agent Prompts on layouts
+                    </Text>
+                    <Text>
+                      {health.layouts
+                        .filter((layout) => layout.present)
+                        .map((layout) => layout.name)
+                        .join(', ') ||
+                        // A layout that could not be read is never shown as missing the field.
+                        (health.layouts.some((layout) => layout.present === undefined)
+                          ? 'Not known'
+                          : 'None')}
+                    </Text>
+                  </Stack>
+                ) : (
+                  <Stack space="space.050">
+                    <Text size="small" color="color.text.subtle">
+                      Screens
+                    </Text>
+                    <Text>
+                      {(health.state.data.screenTypes ?? [])
+                        .map(
+                          (id) =>
+                            health.project.issueTypes.find((type) => type.id === id)?.name ??
+                            `Work type ID ${id}`,
+                        )
+                        .join(', ') || 'Not set'}
+                    </Text>
+                  </Stack>
+                )}
               </Inline>
               <Inline space="space.200" alignBlock="center" shouldWrap>
                 {configurationAction}
@@ -254,23 +272,49 @@ export function Settings({
               <Heading as="h3" size="small">
                 Jira configuration
               </Heading>
-              <Text color="color.text.subtle">
-                Work type scheme: {health.scheme?.name ?? 'Could not be checked'}
-              </Text>
-              <Inline space="space.200" shouldWrap>
-                <Link
-                  openNewTab
-                  href={`${siteUrl}/plugins/servlet/project-config/${health.project.key}/issuetypes`}
-                >
-                  Work type settings
-                </Link>
-                <Link
-                  openNewTab
-                  href={`${siteUrl}/plugins/servlet/project-config/${health.project.key}/screens`}
-                >
-                  Screen settings
-                </Link>
-              </Inline>
+              {health.project.teamManaged ? (
+                <>
+                  <Text color="color.text.subtle">
+                    This team-managed space is set up by hand: add Agent Prompts in Fields, place it
+                    on the layouts of the work types that use prompts, and create the prompt work
+                    type in Work types. The app changes nothing in these settings.
+                  </Text>
+                  <Inline space="space.200" shouldWrap>
+                    <Link
+                      openNewTab
+                      href={`${siteUrl}/jira/software/projects/${health.project.key}/settings/fields`}
+                    >
+                      Field settings
+                    </Link>
+                    <Link
+                      openNewTab
+                      href={`${siteUrl}/jira/software/projects/${health.project.key}/settings/issuetypes`}
+                    >
+                      Work type settings
+                    </Link>
+                  </Inline>
+                </>
+              ) : (
+                <>
+                  <Text color="color.text.subtle">
+                    Work type scheme: {health.scheme?.name ?? 'Could not be checked'}
+                  </Text>
+                  <Inline space="space.200" shouldWrap>
+                    <Link
+                      openNewTab
+                      href={`${siteUrl}/plugins/servlet/project-config/${health.project.key}/issuetypes`}
+                    >
+                      Work type settings
+                    </Link>
+                    <Link
+                      openNewTab
+                      href={`${siteUrl}/plugins/servlet/project-config/${health.project.key}/screens`}
+                    >
+                      Screen settings
+                    </Link>
+                  </Inline>
+                </>
+              )}
             </Stack>
           </Box>
         </>

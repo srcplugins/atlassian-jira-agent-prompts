@@ -18,6 +18,7 @@ export interface InventoryProject {
   id: string;
   key: string;
   name: string;
+  teamManaged: boolean;
 }
 export interface BatchData {
   id: string;
@@ -28,6 +29,8 @@ export interface BatchData {
     fingerprint: string;
     /** The work types reviewed for this space's screens; absent keeps its saved selection. */
     screenTypes?: string[];
+    /** A team-managed space's own prompt work type. A run's entries all name one, or none do. */
+    type?: string;
     status: 'waiting' | 'done';
     message?: string;
     /** Screen changes already made for this space when one step could not make them all. */
@@ -55,7 +58,8 @@ export interface BatchPorts {
   get(): Promise<BatchRecord | undefined>;
   cas(revision: number, data: BatchData): Promise<void>;
 }
-function batchInput(input: SettingsInput): SettingsInput {
+/** `own`: the run's spaces are team-managed and each names its own type, so the run has none. */
+function batchInput(input: SettingsInput, own = false): SettingsInput {
   if (input.unlink !== undefined && typeof input.unlink !== 'boolean')
     throw new UserError('Invalid setup removal option.');
   if (input.allowSharedScreens !== undefined && typeof input.allowSharedScreens !== 'boolean')
@@ -76,6 +80,16 @@ function batchInput(input: SettingsInput): SettingsInput {
   }
   // Configure always names its reload choice; keep leaves each space's saved preference.
   const preference = { reloadAfterSave: reloadInput(input.reloadAfterSave) };
+  if (own) {
+    if (
+      input.name !== undefined ||
+      input.type !== undefined ||
+      input.allowShared ||
+      input.allowSharedScreens
+    )
+      throw new UserError('Team-managed spaces use their own work types and change no schemes.');
+    return preference;
+  }
   if ((typeof input.name === 'string') === (typeof input.type === 'string'))
     throw new UserError('Create one type or choose one existing type.');
   const shared = {
@@ -180,7 +194,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
     async start(
       actor: string,
       input: SettingsInput,
-      entries: { projectId: string; fingerprint: string; screenTypes?: string[] }[],
+      entries: { projectId: string; fingerprint: string; screenTypes?: string[]; type?: string }[],
       revision: number,
     ) {
       await w.admin();
@@ -201,18 +215,27 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         )
       )
         throw new UserError('Review one to 200 distinct spaces before confirming.');
+      // One run configures one kind of space: team-managed spaces each name their own type,
+      // company-managed spaces share the run's.
+      const typed = entries.filter((e) => e.type !== undefined).length;
+      if (typed && typed !== entries.length)
+        throw new UserError('Configure company-managed and team-managed spaces separately.');
       const data: BatchData = {
         id: randomUUID(),
         actor,
-        input: batchInput(input),
+        input: batchInput(input, typed > 0),
         entries: entries.map((e) => {
           const screenTypes = screenTypesInput(e.screenTypes);
           if (screenTypes && input.unlink)
             throw new UserError('Removing setup cannot include work types for screens.');
+          const type = e.type === undefined ? undefined : numeric(e.type);
+          if (type && (input.unlink || screenTypes))
+            throw new UserError('A team-managed space names only its own prompt work type.');
           return {
             projectId: numeric(e.projectId),
             fingerprint: e.fingerprint,
             ...(screenTypes ? { screenTypes } : {}),
+            ...(type ? { type } : {}),
             status: 'waiting' as const,
           };
         }),
@@ -243,28 +266,43 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
       // For later spaces, compare the newly created type against the original
       // name-based review. Only the known type identity changes; impact and scheme
       // facts must still match. No new spaces are discovered during execution.
-      const input = {
-        ...(d.type
-          ? {
-              type: d.type,
-              ...(d.input.allowShared ? { allowShared: true } : {}),
-              ...(d.input.allowSharedScreens ? { allowSharedScreens: true } : {}),
-              ...(d.input.reloadAfterSave !== undefined
-                ? { reloadAfterSave: d.input.reloadAfterSave }
-                : {}),
-            }
-          : d.input),
-        ...(entry.screenTypes ? { screenTypes: entry.screenTypes } : {}),
-      };
+      const reload =
+        d.input.reloadAfterSave !== undefined ? { reloadAfterSave: d.input.reloadAfterSave } : {};
+      // A team-managed space reviewed its own type; a company-managed run shares the run's type.
+      const input = entry.type
+        ? { type: entry.type, ...reload }
+        : {
+            ...(d.type
+              ? {
+                  type: d.type,
+                  ...(d.input.allowShared ? { allowShared: true } : {}),
+                  ...(d.input.allowSharedScreens ? { allowSharedScreens: true } : {}),
+                  ...reload,
+                }
+              : d.input),
+            ...(entry.screenTypes ? { screenTypes: entry.screenTypes } : {}),
+          };
       // Nothing is written before the claim below. A refusal here ends the batch, since retrying
       // would repeat it; only a briefly unavailable Jira or storage keeps the batch ready.
       let fresh: Awaited<ReturnType<typeof settings.preview>>;
       let reviewedScreens: typeof fresh.screens;
       try {
         // The saved run's options are checked again, so a run saved in another shape stops here.
-        batchInput(d.input);
+        batchInput(
+          d.input,
+          d.entries.every((e) => e.type !== undefined),
+        );
         fresh = await settings.preview(c, input);
         if ('blocked' in fresh && fresh.blocked) throw new UserError(fresh.blocked);
+        // The entry's shape must match the space's kind, so a run that names its spaces' own
+        // types never reaches a company-managed space's scheme. Removal names no type.
+        const teamManaged = 'teamManaged' in fresh && !!fresh.teamManaged;
+        if (!d.input.unlink && !!entry.type !== teamManaged)
+          throw new UserError(
+            teamManaged
+              ? 'A team-managed space names its own prompt work type.'
+              : 'A company-managed space uses the run’s prompt work type.',
+          );
         const facts = Object.fromEntries(
           Object.entries(fresh).filter(([key]) => !['fingerprint', 'screenProjects'].includes(key)),
         );
@@ -336,11 +374,15 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         return { revision: revision + 1, data: stopped };
       }
       const running: BatchData = { ...d, status: 'running', started: Date.now() };
+      // A team-managed space's only write is its saved setup, so nothing in Jira is in doubt.
+      const storageOnly = 'teamManaged' in fresh && !!fresh.teamManaged;
+      const uncertain = storageOnly
+        ? 'This space’s saved setup may not have been updated; nothing in Jira was changed.'
+        : 'This space may be partially configured.';
       const attention: BatchData = {
         ...running,
         status: 'attention',
-        message:
-          'This space may be partially configured. Use Space configuration to inspect its saved setup and Jira state. No write was retried.',
+        message: `${uncertain} Use Space configuration to inspect its saved setup${storageOnly ? '' : ' and Jira state'}. No write was retried.`,
       };
       await w.cas(revision, running);
       async function finish(data: BatchData) {
@@ -402,7 +444,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         return finish({
           ...attention,
           entries: d.entries.map((e, i) => (i === d.index ? { ...e, message: error.message } : e)),
-          message: `This space may be partially configured. ${error.message}`,
+          message: `${uncertain} ${error.message}`,
         });
       }
       try {
@@ -423,6 +465,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
             projectId: e.projectId,
             fingerprint: e.fingerprint,
             ...(e.screenTypes ? { screenTypes: e.screenTypes } : {}),
+            ...(e.type ? { type: e.type } : {}),
             status: e.status,
           };
           return partial
@@ -441,7 +484,9 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         const next: BatchData = {
           ...d,
           entries,
-          ...(result.data.type && !d.input.unlink ? { type: result.data.type } : {}),
+          // A company-managed space's type becomes the run's type, reused by later spaces; a
+          // team-managed run names no type.
+          ...(result.data.type && !d.input.unlink && !entry.type ? { type: result.data.type } : {}),
           schemeEffects: fresh.attach
             ? [...(d.schemeEffects ?? []), { id: fresh.scheme.id, fingerprint: hash(fresh.scheme) }]
             : (d.schemeEffects ?? []),

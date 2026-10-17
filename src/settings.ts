@@ -9,7 +9,7 @@ import {
   type Context,
   type Ports,
 } from './service';
-import { JiraHttpError, requireCompanyManagedSoftware } from './shared/jira.mjs';
+import { JiraHttpError, requireSoftwareSpace } from './shared/jira.mjs';
 
 /** A configuration step that provably changed nothing in Jira and left no claim in storage.
  * `retryable` means repeating the reviewed step can succeed (a brief outage); otherwise the
@@ -54,6 +54,18 @@ interface WorkType {
 function eligible(type: WorkType) {
   return type.hierarchyLevel === 0 && !type.subtask && !type.scope;
 }
+/** A team-managed space's standard work types. All of its work types are its own: Jira can't add
+ * global types to a team-managed space. */
+function ownTypes(project: { issueTypes: Omit<WorkType, 'scope'>[] }) {
+  return project.issueTypes
+    .filter((t) => t.hierarchyLevel === 0 && !t.subtask)
+    .map((t) => ({ id: t.id, name: t.name }))
+    .sort((a, b) => byNumber(a.id, b.id));
+}
+/** At most this many of a team-managed space's work types are checked for the field. */
+const layoutLimit = 50;
+/** The scheme of a review that changes no work type scheme. */
+const noScheme = (): Scheme => ({ id: '', name: '', projectIds: [], isDefault: false });
 interface SettingsData {
   refreshAfterSave?: boolean;
   type?: string;
@@ -198,11 +210,23 @@ export function createSettings(p: Ports, s: SettingsPorts) {
   async function admin(c: Context) {
     await p.allowed(numeric(c.projectId), 'ADMINISTER');
     const project = await p.project(c.projectId);
-    requireCompanyManagedSoftware(project, c.projectId);
-    return project;
+    const teamManaged = requireSoftwareSpace(project, c.projectId) === 'team-managed';
+    return { ...project, teamManaged };
   }
-  async function inspect(c: Context) {
-    const project = await admin(c);
+  /** The previous prompt types after replacing `old` with `type`, at most twenty. */
+  function previousTypesAfter(data: SettingsData, type: string | undefined) {
+    const old = data.type;
+    const changing = !!old && old !== type;
+    const previousTypes = Array.from(
+      new Set([...(data.previousTypes ?? []), ...(changing ? [old!] : [])]),
+    ).filter((id) => id !== type);
+    if (previousTypes.length > 20)
+      throw new UserError(
+        'This space already has twenty previous prompt types, the most the app keeps. Keep the current type.',
+      );
+    return previousTypes;
+  }
+  async function inspect(c: Context, project: Awaited<ReturnType<typeof admin>>) {
     const [record, types, scheme] = await Promise.all([
       s.get(c.projectId),
       s.types(),
@@ -223,6 +247,11 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       );
     return current;
   }
+  /** The screen plan of a space whose screens the app never changes. */
+  const noScreens = (): Awaited<ReturnType<typeof screenPlan>> => ({
+    screens: { changes: [], present: [] },
+    labels: {},
+  });
   /** Screen changes for one space: the Agent Prompts field on the edit and view screens of the
    * selected work types, removal from screens this space no longer needs, and (when `prompt` is
    * given) Summary and Description on the prompt type's create screen. */
@@ -345,6 +374,127 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       labels,
     };
   }
+  /** A team-managed space's checks: its prompt type, the field, and which of its work types have
+   * the field on their layout. Jira reports a layout through create metadata, one read per work
+   * type; nothing here blocks setup. */
+  async function ownHealth(
+    c: Context,
+    project: Awaited<ReturnType<typeof admin>>,
+    state: SettingsRecord,
+  ) {
+    const types = ownTypes(project);
+    const selected = types.find((t) => t.id === state.data.type);
+    const checks: { label: string; ok: boolean; detail: string }[] = [
+      {
+        label: 'Work type',
+        ok: !!selected,
+        detail: !state.data.type
+          ? 'Choose the space’s prompt work type.'
+          : selected
+            ? `${selected.name} is this space’s prompt work type. Renames are supported.`
+            : 'The configured type was deleted or is no longer a standard work type of this space. Choose a replacement.',
+      },
+    ];
+    let field: string | undefined;
+    try {
+      field = await p.field();
+      checks.push({
+        label: 'Agent Prompts field',
+        ok: true,
+        detail: 'Agent Prompts field exists.',
+      });
+    } catch (e) {
+      checks.push({
+        label: 'Agent Prompts field',
+        ok: false,
+        detail: e instanceof UserError ? e.message : 'Field could not be checked.',
+      });
+    }
+    // The prompt type is always among the checked types.
+    const checked = [...(selected ? [selected] : []), ...types.filter((t) => t !== selected)].slice(
+      0,
+      layoutLimit,
+    );
+    // Layout reads start only while more than ten seconds of the request are left, like the
+    // screen reads of a review, so a slow or failing Jira leaves the remaining layouts unknown
+    // instead of timing out the whole check.
+    const late = new Set<string>();
+    const read = await limited(checked, (t) => {
+      if (s.timeLeft() <= 10_000) {
+        late.add(t.id);
+        return Promise.resolve(undefined);
+      }
+      return s.createFields(c.projectId, t.id).then(
+        (ids) => ids,
+        () => undefined,
+      );
+    });
+    const fieldsOf = (id: string) => read[checked.findIndex((t) => t.id === id)];
+    if (selected) {
+      const ids = fieldsOf(selected.id);
+      const ok = !!ids && ['summary', 'description'].every((f) => ids.includes(f));
+      checks.push({
+        label: 'Prompt creation',
+        ok,
+        detail: late.has(selected.id)
+          ? 'The prompt type’s fields weren’t checked in time. Check this space again.'
+          : !ids
+            ? 'The prompt type’s fields could not be checked. Check the Create work items permission in this space.'
+            : ok
+              ? 'The summary and description fields are on the prompt type’s layout.'
+              : 'Add the summary and description fields to the prompt type’s layout in Space settings → Work types.',
+      });
+    }
+    const layouts = checked
+      .filter((t) => t !== selected)
+      .sort((a, b) => byNumber(a.id, b.id))
+      .map((t) => {
+        const ids = fieldsOf(t.id);
+        return {
+          id: t.id,
+          name: t.name,
+          ...(ids && field ? { present: ids.includes(field) } : {}),
+        };
+      });
+    if (field) {
+      const names = (keep: (l: (typeof layouts)[number]) => boolean) =>
+        layouts
+          .filter(keep)
+          .map((l) => l.name)
+          .join(', ');
+      const on = names((l) => l.present === true);
+      const off = names((l) => l.present === false);
+      const failed = names((l) => l.present === undefined && !late.has(l.id));
+      const unchecked = names((l) => late.has(l.id));
+      const unknown = failed || unchecked;
+      checks.push({
+        label: 'Agent Prompts on layouts',
+        ok: !!on,
+        detail: [
+          // A layout that could not be read is never counted as missing the field.
+          on
+            ? `The field is on the layout of ${on}.`
+            : unknown && !off
+              ? 'No work type’s layout could be checked.'
+              : unknown
+                ? 'The field wasn’t found on a checked work type’s layout.'
+                : 'The field is on no work type’s layout. Add it to the layouts of the work types that use prompts in Space settings → Work types.',
+          off ? `It isn’t on ${off}.` : '',
+          failed
+            ? `${failed} could not be checked. Check the Create work items permission in this space.`
+            : '',
+          unchecked ? `Not checked in time: ${unchecked}. Check this space again.` : '',
+          types.length > layoutLimit
+            ? `Only the first ${layoutLimit} work types were checked.`
+            : '',
+        ]
+          .filter(Boolean)
+          .join(' '),
+      });
+    }
+    const scheme: Scheme | undefined = undefined;
+    return { project, state, types, selected, scheme, layouts, canConfigure: true, checks };
+  }
   async function plan(c: Context, input: SettingsInput) {
     if (input.reloadAfterSave !== undefined) reloadInput(input.reloadAfterSave);
     if (input.unlink) {
@@ -361,15 +511,19 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         throw new UserError(
           'Resolve the unfinished configuration before removing this space’s setup.',
         );
-      const { screens, labels } = await screenPlan(c.projectId, state.data, []);
+      // A team-managed space has no screens for the app to change, so nothing more is read.
+      const { screens, labels } = project.teamManaged
+        ? noScreens()
+        : await screenPlan(c.projectId, state.data, []);
       const result = {
         unlink: true,
+        ...(project.teamManaged ? { teamManaged: true } : {}),
         revision: state.revision,
         old: state.data.type,
         type: undefined,
         name: undefined,
         attach: false,
-        scheme: { id: '', name: '', projectIds: [] as string[], isDefault: false } as Scheme,
+        scheme: noScheme(),
         project: { id: project.id, key: project.key },
         previousTypes: state.data.previousTypes ?? [],
         typeName: 'Remove setup',
@@ -379,7 +533,47 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       };
       return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
     }
-    const value = await inspect(c);
+    const project = await admin(c);
+    // A team-managed space's administrator creates the prompt type and places the field by hand,
+    // so its setup only records which of the space's own work types holds prompts.
+    if (project.teamManaged) {
+      if (input.name !== undefined)
+        throw new UserError(
+          'Create the prompt work type in Space settings → Work types, then choose it here.',
+        );
+      if (input.screenTypes !== undefined)
+        throw new UserError('Team-managed spaces have no screens for the app to change.');
+      if (typeof input.type !== 'string')
+        throw new UserError('Choose this space’s prompt work type.');
+      const state = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
+      if (state.data.pending)
+        throw new UserError(
+          'An earlier configuration needs an outcome check before another change.',
+        );
+      const type = numeric(input.type);
+      const chosen = ownTypes(project).find((t) => t.id === type);
+      if (!chosen) throw new UserError('Choose one of this space’s standard work types.');
+      const previousTypes = previousTypesAfter(state.data, type);
+      const { screens, labels } = noScreens();
+      const result = {
+        teamManaged: true,
+        ...(input.reloadAfterSave !== undefined ? { reloadAfterSave: input.reloadAfterSave } : {}),
+        revision: state.revision,
+        old: state.data.type,
+        type,
+        name: undefined,
+        attach: false,
+        scheme: noScheme(),
+        project: { id: project.id, key: project.key },
+        previousTypes,
+        typeName: chosen.name,
+        screenTypes: [] as string[],
+        availableTypes: [] as { id: string; name: string }[],
+        screens,
+      };
+      return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
+    }
+    const value = await inspect(c, project);
     if (value.state.data.pending)
       throw new UserError('An earlier configuration needs an outcome check before another change.');
     const creating = typeof input.name === 'string';
@@ -415,14 +609,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         'The space’s scheme association could not be confirmed. Review Jira settings.',
       );
     const old = value.state.data.type;
-    const changing = !!old && old !== type;
-    const previousTypes = Array.from(
-      new Set([...(value.state.data.previousTypes ?? []), ...(changing ? [old!] : [])]),
-    ).filter((id) => id !== type);
-    if (previousTypes.length > 20)
-      throw new UserError(
-        'This space already has twenty previous prompt types, the most the app keeps. Keep the current type.',
-      );
+    const previousTypes = previousTypesAfter(value.state.data, type);
     // The prompt type itself is excluded: its own screens get Summary and Description instead.
     const availableTypes = value.project.issueTypes
       .filter((t) => t.id !== type)
@@ -490,6 +677,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       // manual recovery controls. Mutation planning still uses strict inspect.
       const project = await admin(c);
       const state = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
+      if (project.teamManaged) return ownHealth(c, project, state);
       const [typesResult, schemeResult] = await Promise.allSettled([
         s.types(),
         s.scheme(c.projectId),
@@ -621,10 +809,24 @@ export function createSettings(p: Ports, s: SettingsPorts) {
     preview: plan,
     /** The Work types step's data for a space: the work types it offers for the Agent Prompts
      * field and its saved selection among them. The dialog leaves out the prompt type it knows;
-     * the review checks the selection against the prompt type again. */
-    async options(c: Context) {
+     * the review checks the selection against the prompt type again. A team-managed space gets
+     * its own standard work types and its saved prompt type, which may no longer be one of them,
+     * so its setup can still be removed. */
+    async options(c: Context): Promise<
+      | { teamManaged: true; promptTypes: { id: string; name: string }[]; type?: string }
+      | {
+          teamManaged?: undefined;
+          availableTypes: { id: string; name: string }[];
+          screenTypes: string[];
+        }
+    > {
       const project = await admin(c);
       const record = await s.get(c.projectId);
+      // A team-managed space offers its own work types for its prompt type instead.
+      if (project.teamManaged) {
+        const type = record?.data.type;
+        return { teamManaged: true, promptTypes: ownTypes(project), ...(type ? { type } : {}) };
+      }
       const availableTypes = project.issueTypes
         .map((t) => ({ id: t.id, name: t.name }))
         .sort((a, b) => byNumber(a.id, b.id));
@@ -670,14 +872,20 @@ export function createSettings(p: Ports, s: SettingsPorts) {
           new UserError('Too little time was left in this request to apply the changes.'),
           true,
         );
-      const changes = preview.screens.changes.slice(0, budget);
+      let changes: ScreenChange[] = [];
       const outcome = {
         saved: true as const,
         /** Reviewed changes left for a later step, by screen and field. */
-        remaining: preview.screens.changes
-          .slice(budget)
-          .map((ch) => ({ screen: ch.screen.id, field: ch.field })),
+        remaining: [] as { screen: string; field: string }[],
       };
+      /** Makes the first `count` reviewed screen changes in this step and leaves the rest. */
+      const fit = (count: number) => {
+        changes = preview.screens.changes.slice(0, count);
+        outcome.remaining = preview.screens.changes
+          .slice(count)
+          .map((ch) => ({ screen: ch.screen.id, field: ch.field }));
+      };
+      fit(budget);
       // Counted before each Jira write: only a failure before the first write, or a documented
       // rejection of that first write, proves Jira is unchanged.
       let sent = 0;
@@ -853,6 +1061,16 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       await s.cas(c.projectId, revision++, data);
       const claimed = revision;
       let screensStarted = false;
+      // Jira may not list a type it has just associated yet, so the space is read again, never
+      // the association. The port already repeats a read that fails in transit.
+      async function confirmAttached(type: string) {
+        for (let attempt = 1; ; attempt++) {
+          const project = await p.project(c.projectId);
+          if (project.issueTypes.some((t) => t.id === type)) return;
+          if (attempt === 3) throw new UserError('Jira has not confirmed the type association.');
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
       async function verifyScheme() {
         const fresh = await s.scheme(c.projectId);
         if (hash(fresh) !== hash(preview.scheme))
@@ -874,10 +1092,13 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         await verifyScheme();
         sent++;
         await s.attach(pending.scheme, pending.type);
-        const project = await p.project(c.projectId);
+        await confirmAttached(pending.type);
         await verifyScheme();
-        if (!project.issueTypes.some((t) => t.id === pending.type))
-          throw new UserError('Jira has not confirmed the type association.');
+        // The type writes and their confirming reads can take longer than the time set aside for
+        // them, so the screen changes are fitted again to the time left; the rest wait for the
+        // next step.
+        const left = Math.floor((s.timeLeft() - 3_000) / 1_000);
+        if (left < changes.length) fit(Math.max(0, left));
         // The claim stays through the screen changes, so a partial result keeps its outcome check.
         screensStarted = true;
         await screenPhase();

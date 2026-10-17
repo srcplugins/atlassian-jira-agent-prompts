@@ -101,16 +101,58 @@ export function requireCompanyManagedSoftware(project, idOrKey) {
 }
 
 /**
- * Reads JSON as the invoking user. Transport failures, non-2xx responses (as JiraHttpError) and
- * unreadable bodies become UserErrors; nothing is retried.
+ * Confirms the response is the requested Jira Software space, company-managed or team-managed, and
+ * says which. Use it where the spec's Supported spaces table marks both as Supported.
+ * @param {unknown} project
+ * @param {string} idOrKey The numeric ID or key that was requested.
+ * @returns {'company-managed' | 'team-managed'}
+ */
+export function requireSoftwareSpace(project, idOrKey) {
+  if (!isRecord(project) || (String(project.id) !== idOrKey && project.key !== idOrKey))
+    throw new UserError('Space context does not match.');
+  if (
+    project.projectTypeKey !== 'software' ||
+    (project.style !== 'classic' && project.style !== 'next-gen')
+  )
+    throw new UserError('Jira software spaces only.');
+  return project.style === 'classic' ? 'company-managed' : 'team-managed';
+}
+
+/**
+ * Runs a read up to three times, pausing between tries, while `transient` says its failure was
+ * Jira being briefly unavailable (a transport failure or a 5xx); Jira can briefly fail a read,
+ * often of a space created moments earlier. Any other failure stands at once. Never pass a write:
+ * repeating one could apply it twice.
+ * @template T
+ * @param {() => Promise<T>} read
+ * @param {(error: unknown) => boolean} transient
+ * @returns {Promise<T>}
+ */
+export async function readWithRetries(read, transient) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await read();
+    } catch (error) {
+      if (attempt === 3 || !transient(error)) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+  }
+}
+
+class JiraConnectionError extends UserError {}
+
+/**
+ * Reads JSON as the invoking user: use it only for reads (GET, or a read-only POST such as
+ * `search/jql`). Transport failures, non-2xx responses (as JiraHttpError) and unreadable bodies
+ * become UserErrors; a transport failure or 5xx is tried again up to twice (`readWithRetries`).
  * @param {Pick<import('@forge/api').FetchAPI, 'asUser'>} api
  */
 export function jiraReader(api) {
   /**
    * @param {import('@forge/api').Route} path
-   * @param {{ method?: string, headers?: Record<string, string>, body?: string }} [options]
+   * @param {{ method?: string, headers?: Record<string, string>, body?: string }} options
    */
-  return async (path, options = {}) => {
+  const readOnce = async (path, options) => {
     let response;
     try {
       response = await api.asUser().requestJira(path, {
@@ -119,7 +161,7 @@ export function jiraReader(api) {
         headers: { Accept: 'application/json', ...options.headers },
       });
     } catch {
-      throw new UserError('Jira connection failed. Try again.');
+      throw new JiraConnectionError('Jira connection failed. Try again.');
     }
     if (!response.ok) throw new JiraHttpError(response.status);
     try {
@@ -128,4 +170,15 @@ export function jiraReader(api) {
       throw new UserError('Jira returned unreadable data.');
     }
   };
+  /**
+   * @param {import('@forge/api').Route} path
+   * @param {{ method?: string, headers?: Record<string, string>, body?: string }} [options]
+   */
+  return (path, options = {}) =>
+    readWithRetries(
+      () => readOnce(path, options),
+      (error) =>
+        error instanceof JiraConnectionError ||
+        (error instanceof JiraHttpError && error.status >= 500),
+    );
 }

@@ -24,7 +24,7 @@ import {
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
-import { snapshotJourney, editor, resumeSavedJourney } from './support/snapshots.mjs';
+import { snapshotJourney, editor, openField, resumeSavedJourney } from './support/snapshots.mjs';
 import { agentPromptsFixture } from './support/fixture.mjs';
 import { reviewConfiguration } from './support/configuration-dialog.mjs';
 
@@ -295,12 +295,7 @@ try {
         .locator(
           '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
         );
-      const loaded = await observeAction(
-        page,
-        'load',
-        () => readView.click({ position: { x: 2, y: 2 } }),
-        target,
-      );
+      const loaded = await observeAction(page, 'load', () => openField(page, readView), target);
       assert.deepEqual(loaded.ids, [], 'Reinstall must not adopt old selections');
       const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
       await combo.fill(backup.sourceKey);
@@ -328,7 +323,7 @@ try {
       await api(`/issue/${backup.targetId}`, 'PUT', { fields: { description: repaired } });
       assert.deepEqual((await issueFields()).description, repaired);
       await page.reload();
-      await observeAction(page, 'load', () => readView.click({ position: { x: 2, y: 2 } }), target);
+      await observeAction(page, 'load', () => openField(page, readView), target);
       await combo.fill(backup.sourceKey);
       await combo.press('ArrowDown');
       await editor(page)

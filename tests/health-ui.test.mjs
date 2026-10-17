@@ -4,12 +4,20 @@ import { finished } from '../src/batch-status.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { hookHost, load, standIns, view } from './support/ui-harness.mjs';
-function fixture(failInventory = false, progress = null, viewer = 'admin', beforeHealth, props) {
+function fixture(
+  failInventory = false,
+  progress = null,
+  viewer = 'admin',
+  beforeHealth,
+  props,
+  team = [],
+) {
   const calls = [];
   const projects = Array.from({ length: 100 }, (_, i) => ({
     id: String(i + 1),
     key: `PR${i + 1}`,
     name: `Project ${i + 1}`,
+    teamManaged: team.includes(String(i + 1)),
   }));
   const call = async (name, p) => {
     calls.push({ name, p });
@@ -32,6 +40,10 @@ function fixture(failInventory = false, progress = null, viewer = 'admin', befor
       checks: [{ ok: p.projectId !== '4', label: 'Type', detail: 'Available' }],
     };
   };
+  return render(call, calls, props ?? (failInventory ? { projectId: '1' } : {}), viewer);
+}
+/** Mounts the space configuration view over `call`, recording calls in `calls`. */
+function render(call, calls, props, viewer = 'admin') {
   const hooks = hookHost();
   const { HealthProjects } = load('health-ui.tsx', {
     react: hooks.react,
@@ -59,13 +71,17 @@ function fixture(failInventory = false, progress = null, viewer = 'admin', befor
         'Lozenge',
         'Spinner',
         'Stack',
+        'Tab',
+        'TabList',
+        'TabPanel',
+        'Tabs',
         'Text',
         'Textfield',
       ),
     },
     './client': { call },
   });
-  const v = view(hooks, () => HealthProjects(props ?? (failInventory ? { projectId: '1' } : {})));
+  const v = view(hooks, () => HealthProjects(props));
   return {
     ...v,
     calls,
@@ -435,5 +451,189 @@ test('a failed affected-space check stays with that space and never locks config
   assert.equal(
     f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
     false,
+  );
+});
+
+test('company- and team-managed spaces each have their own tab, counts and selection', async () => {
+  const f = fixture(false, null, 'admin', undefined, undefined, ['10', '11']);
+  await f.mount();
+  const tabs = () => f.nodes('Tab').map((t) => t.props.children[0]);
+  assert.deepEqual(tabs(), ['Company-managed (98)', 'Team-managed (2)']);
+  assert.equal(f.nodes('Tabs')[0].props.selected, 0);
+  assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 98);
+  assert.match(f.text('Button'), /All spaces \(98\)/);
+  assert.doesNotMatch(f.text(), /Team-managed/);
+  f.check('Select PR1', true);
+  f.search('PR1');
+  assert.match(f.text(), /2 matches in team-managed spaces\./);
+  await f.click('Show team-managed');
+  assert.equal(f.nodes('Tabs')[0].props.selected, 1);
+  assert.match(f.text(), /0 selected/);
+  assert.deepEqual(
+    f.nodes('DynamicTable')[0].props.rows.map((r) => r.key),
+    ['10', '11'],
+  );
+  assert.ok(
+    f
+      .nodes('DynamicTable')[0]
+      .props.head.cells.some((c) => c.content === 'Agent Prompts on layouts'),
+  );
+  // The search stays across tabs and points back at the other kind's matches.
+  assert.match(f.text(), /10 matches in company-managed spaces\./);
+  f.nodes('Tabs')[0].props.onChange(0);
+  f.render();
+  assert.equal(f.nodes('DynamicTable')[0].props.head.cells.length, 5);
+});
+test('the space configuration opens on the current space’s kind', async () => {
+  const f = fixture(false, null, 'admin', undefined, { projectId: '10' }, ['10']);
+  await f.mount();
+  assert.equal(f.nodes('Tabs')[0].props.selected, 1);
+  assert.match(f.text(), /PR10 · Current space/);
+});
+test('a site with only team-managed spaces has no tabs and marks them in the list', async () => {
+  const team = Array.from({ length: 100 }, (_, i) => String(i + 1));
+  const f = fixture(false, null, 'admin', undefined, undefined, team);
+  await f.mount();
+  assert.equal(f.nodes('Tabs').length, 0);
+  assert.match(f.text(), /PR10 · Team-managed/);
+});
+test('team-managed spaces reach the dialog with their style', async () => {
+  const f = fixture(false, null, 'admin', undefined, undefined, ['10']);
+  await f.mount();
+  f.nodes('Tabs')[0].props.onChange(1);
+  f.render();
+  f.check('Select PR10', true);
+  await f.click('Configure selected');
+  const dialog = f.nodes('ConfigurationDialog')[0];
+  assert.deepEqual(JSON.parse(JSON.stringify(dialog.props.projects)), [
+    { id: '10', key: 'PR10', name: 'Project 10', teamManaged: true },
+  ]);
+  // A team-managed space's saved type is its own, never the dialog's global prompt type.
+  assert.equal('initialType' in dialog.props, false);
+});
+
+/**
+ * A partial inventory of `count` spaces (`team` marked team-managed) opened from space 500, which
+ * the inventory misses: its row is a stand-in listed as company-managed until a check shows it is
+ * team-managed.
+ */
+function standInFixture({ team = [], count = 12 } = {}) {
+  const calls = [];
+  const projects = Array.from({ length: count }, (_, i) => ({
+    id: String(i + 1),
+    key: `PR${i + 1}`,
+    name: `Project ${i + 1}`,
+    teamManaged: team.includes(String(i + 1)),
+  }));
+  const call = async (name, p) => {
+    calls.push({ name, p });
+    if (name === 'settings-projects') return { projects, incomplete: true };
+    if (name === 'configuration-status' || name === 'configuration-cancel-interrupted') return null;
+    assert.equal(name, 'settings-health');
+    const listed = projects.find((x) => x.id === p.projectId);
+    const teamManaged = listed ? listed.teamManaged : p.projectId === '500';
+    return {
+      project: { id: p.projectId, key: listed?.key ?? 'TEAM', teamManaged },
+      state: { revision: 1, data: { type: '7' } },
+      types: [{ id: '7', name: 'Prompt' }],
+      checks: [{ ok: true, label: 'Type', detail: 'Available' }],
+      ...(teamManaged ? { layouts: [{ id: '7', name: 'Prompt', present: false }] } : {}),
+    };
+  };
+  const f = render(call, calls, { projectId: '500' });
+  const rows = () => f.nodes('DynamicTable')[0].props.rows.map((r) => r.key);
+  return {
+    ...f,
+    rows,
+    tab: () => f.nodes('Tabs')[0]?.props.selected,
+    /** The kinds of the spaces the configuration dialog opened with, or undefined. */
+    dialogKinds() {
+      const dialog = f.nodes('ConfigurationDialog')[0];
+      return dialog && [...dialog.props.projects].map((p) => [p.id, p.teamManaged]);
+    },
+    async details(key) {
+      const row = f.nodes('DynamicTable')[0].props.rows.find((r) => r.key === key);
+      row.cells.at(-1).content.props.onClick();
+      await f.settle();
+      await f.click('Close');
+    },
+  };
+}
+test('a stand-in that Check selected shows is team-managed leaves the selection, and the view stays', async () => {
+  const f = standInFixture();
+  await f.mount();
+  assert.equal(f.tab(), undefined);
+  f.check('Select PR1', true);
+  f.check('Select 500', true);
+  await f.click('Check selected');
+  // The stand-in moves to the Team-managed tab; the view stays on company-managed spaces.
+  assert.equal(f.tab(), 0);
+  assert.ok(!f.rows().includes('500'));
+  assert.match(f.text(), /1 selected/);
+  assert.match(
+    f.text(),
+    /1 space is team-managed and was taken out of the selection: company-managed and team-managed spaces are configured separately\./,
+  );
+  await f.click('Configure selected');
+  assert.deepEqual(f.dialogKinds(), [['1', false]]);
+});
+test('a stand-in that View details shows is team-managed never reaches the company dialog', async () => {
+  const f = standInFixture();
+  await f.mount();
+  f.check('Select PR1', true);
+  f.check('Select PR2', true);
+  await f.click('Check selected');
+  f.check('Select 500', true);
+  await f.details('500');
+  assert.equal(f.tab(), 0);
+  assert.match(f.text(), /2 selected/);
+  await f.click('Configure selected');
+  assert.deepEqual(f.dialogKinds(), [
+    ['1', false],
+    ['2', false],
+  ]);
+});
+test('select all on the Company-managed tab, then a check that moves the stand-in, configures one kind', async () => {
+  const f = standInFixture({ team: ['10', '11'] });
+  await f.mount();
+  assert.equal(f.tab(), 0);
+  f.check('Select all matching spaces', true);
+  assert.match(f.text(), /11 selected/);
+  await f.click('Check selected');
+  assert.match(f.text(), /10 selected/);
+  await f.click('Configure selected');
+  assert.equal(f.dialogKinds().length, 10);
+  assert.ok(f.dialogKinds().every(([, team]) => !team));
+});
+test('a stand-in that moved earlier stays out of a later Configure that checks another space', async () => {
+  const f = standInFixture({ team: ['10'] });
+  await f.mount();
+  f.check('Select 500', true);
+  await f.click('Check selected');
+  // Configure selected checks only PR1, which is unchecked; the moved stand-in is not selected.
+  f.check('Select PR1', true);
+  await f.click('Configure selected');
+  assert.deepEqual(f.dialogKinds(), [['1', false]]);
+  // On the Team-managed tab the stand-in is configured on its own.
+  f.nodes('ConfigurationDialog')[0].props.onClose(false);
+  f.render();
+  f.nodes('Tabs')[0].props.onChange(1);
+  f.render();
+  f.check('Select 500', true);
+  await f.click('Configure selected');
+  assert.deepEqual(f.dialogKinds(), [['500', true]]);
+});
+test('Configure selected on an unchecked stand-in takes it out and opens nothing', async () => {
+  const f = standInFixture();
+  await f.mount();
+  f.check('Select PR1', true);
+  f.check('Select 500', true);
+  await f.click('Configure selected');
+  assert.equal(f.dialogKinds(), undefined);
+  assert.equal(f.tab(), 0);
+  assert.match(f.text(), /1 selected/);
+  assert.match(
+    f.text(),
+    /1 space is team-managed and was taken out of the selection: .* Review the selection, then configure again\./,
   );
 });

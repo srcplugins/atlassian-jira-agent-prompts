@@ -486,3 +486,16 @@ test('limited runs at most four reads at once and keeps their order', async () =
   assert.equal(most, 4);
   assert.deepEqual(await limited([], async () => 1), []);
 });
+test('the Space settings page opens in company-managed and team-managed Software spaces only', async () => {
+  const f = fixture();
+  for (const [style, projectTypeKey, ok] of [
+    ['classic', 'software', true],
+    ['next-gen', 'software', true],
+    ['next-gen', 'business', false],
+  ]) {
+    f.ports.project = async () => ({ id: '1', key: 'TEST', style, projectTypeKey, issueTypes: [] });
+    const service = createService(f.ports);
+    if (ok) assert.equal((await service.setup(c)).type, '3');
+    else await assert.rejects(service.setup(c), /^Error: Jira software spaces only\.$/);
+  }
+});

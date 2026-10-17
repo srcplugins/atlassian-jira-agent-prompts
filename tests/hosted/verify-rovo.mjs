@@ -13,9 +13,23 @@ import { openRovoChat, askRovo } from '@srcplugins/atlassian-forge-test-framewor
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { runRovoJourney } from './support/agent-prompts-rovo.mjs';
 import { expect } from './support/expect.mjs';
-import { agentPromptsFixture } from './support/fixture.mjs';
+import { agentPromptsFixture, teamManagedFixture } from './support/fixture.mjs';
 import { spaceSettings } from './support/space-settings.mjs';
+import {
+  checkSpace,
+  configureOwnType,
+  details,
+  globalConfiguration,
+  jiraConfiguration,
+  removeSetup,
+} from './support/team-managed.mjs';
 assert.equal(process.env.NATIVE_ROVO_TESTS, '1', 'Explicit supervised Rovo mode required');
+// Team-managed mode reads in the persistent team-managed space, whose prompts use the space's
+// own Prompt work type. The run sets that type through Configure and removes the setup afterwards;
+// Jira's configuration of the space must not change.
+const space = process.env.NATIVE_ROVO_SPACE;
+assert.ok(space === undefined || space === 'team-managed', 'Unknown NATIVE_ROVO_SPACE');
+const teamManaged = space === 'team-managed';
 const r = await tokenRequest();
 const api = client(r);
 let b;
@@ -24,7 +38,7 @@ let journeyStarted = false;
 const artifact = (suffix) =>
   `${activeTarget().runs}/${owned.run.state.runId}-native-rovo-${suffix}`;
 try {
-  owned = await openRun(r, agentPromptsFixture);
+  owned = await openRun(r, agentPromptsFixture, teamManaged ? { profile: teamManagedFixture } : {});
   b = await chromium.launch({ channel: 'chrome', headless: true });
   const c = await b.newContext({
     storageState: activeTarget().auth,
@@ -34,10 +48,38 @@ try {
   const p = await c.newPage();
   p.setDefaultTimeout(30000);
   const target = installation('agent-prompts');
+  const key = owned.project.key;
+  const jira = () => jiraConfiguration(owned.api, owned.project.id);
+  const before = teamManaged ? await jira() : undefined;
+  const prompt = before?.types.find(([, name]) => name === 'Prompt')?.[0];
+  assert.ok(!teamManaged || prompt, 'The team-managed space needs its own Prompt work type');
+  const health = async () => {
+    await globalConfiguration(p, target);
+    return checkSpace(p, target, key, owned.project.id);
+  };
+  // Sets the space's own Prompt type unless it is already set; another type left by an
+  // interrupted run is removed first.
+  async function setOwnType() {
+    const checked = await health();
+    assert.equal(checked.project.teamManaged, true);
+    if (checked.state.data.type === prompt) return checked;
+    if (checked.state.data.type) {
+      await removeSetup(p, target, key);
+      expect((await health()).state.data.type).toBeUndefined();
+    }
+    await details(p, key);
+    await configureOwnType(p, target, { key, type: prompt, name: 'Prompt' });
+    return health();
+  }
   journeyStarted = true;
   await runRovoJourney({
     owned,
-    setup: () => observeAction(p, 'setup', () => spaceSettings(p, owned.project.key), target),
+    setup: teamManaged
+      ? async () => {
+          const checked = await setOwnType();
+          return { project: checked.project, type: checked.state.data.type };
+        }
+      : () => observeAction(p, 'setup', () => spaceSettings(p, key), target),
     // Wait until Jira's search index returns the new source; the Rovo searches below then
     // exercise the app's own search path.
     discover: async (key) => {
@@ -81,8 +123,16 @@ try {
     capture: (stage, data) =>
       writeFileSync(artifact(`${stage}.json`), JSON.stringify(data, null, 2), { mode: 0o600 }),
   });
+  if (teamManaged) {
+    await health();
+    await removeSetup(p, target, key);
+    const removed = await health();
+    expect(removed.state.data.type).toBeUndefined();
+    expect(removed.state.data.previousTypes).toContain(prompt);
+    expect(await jira()).toEqual(before);
+  }
   console.log(
-    `Rovo ${owned.run.state.runId}: two fresh ordinary-source searches and reads matched independent Jira facts; fixture cleanup verified.`,
+    `Rovo ${owned.run.state.runId}${teamManaged ? ' (team-managed space)' : ''}: two fresh ordinary-source searches and reads matched independent Jira facts; fixture cleanup verified.`,
   );
 } catch (e) {
   if (owned)

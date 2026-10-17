@@ -17,7 +17,7 @@ const sdk = (...responses) => ({
   kvs: { entity: () => ({ get: async () => undefined }) },
   fieldType: () => 'exact-field',
 });
-test('space inventory uses asUser live-software pagination and excludes team-managed spaces', async () => {
+test('space inventory uses asUser live-software pagination and marks team-managed spaces', async () => {
   const { createBatchPorts } = await import('../src/integration.ts');
   const s = sdk(
     {
@@ -40,8 +40,9 @@ test('space inventory uses asUser live-software pagination and excludes team-man
   );
   assert.deepEqual(await createBatchPorts(s).projects(), {
     projects: [
-      { id: '1', key: 'ONE', name: 'One' },
-      { id: '3', key: 'THREE', name: 'Three' },
+      { id: '1', key: 'ONE', name: 'One', teamManaged: false },
+      { id: '2', key: 'TWO', name: 'Two', teamManaged: true },
+      { id: '3', key: 'THREE', name: 'Three', teamManaged: false },
     ],
     incomplete: false,
   });
@@ -140,7 +141,7 @@ test('actual search adapter requests metadata only and follows a bounded cursor'
   });
   assert.equal(JSON.parse(s.calls[1].body).nextPageToken, 'next');
 });
-test('denial, malformed response and network failure return safe envelopes without retry', async () => {
+test('denial and malformed responses fail at once; a network failure is read three times', async () => {
   for (const response of [
     { status: 403 },
     { status: 429 },
@@ -152,7 +153,7 @@ test('denial, malformed response and network failure return safe envelopes witho
     const result = await registerResolvers(s).setup({ context });
     assert.equal(result.ok, false);
     assert.doesNotMatch(result.error, /PRIVATE/);
-    assert.equal(s.calls.length, 1);
+    assert.equal(s.calls.length, response instanceof Error ? 3 : 1);
   }
 });
 test('work item edits distinguish documented rejections from uncertain failures without retry', async () => {
@@ -464,7 +465,7 @@ test('scheme adapter verifies complete expanded space ownership, not filtered pr
   assert.equal(s.calls[1].path, '/rest/api/3/issuetypescheme?id=9&expand=projects');
 });
 test('settings handler checks administration on the selected space before configuration writes', async () => {
-  const s = sdk();
+  const s = sdk({ status: 403 });
   assert.equal(
     (await registerResolvers(s)['settings-health']({ context, payload: { projectId: '2' } })).ok,
     false,
@@ -797,7 +798,7 @@ test('the space inventory treats a documented 404 as empty and stops paging afte
     { status: 404 },
   );
   await assert.rejects(createBatchPorts(later).projects(), /HTTP 404/);
-  // Slow pages of team-managed projects: report a partial inventory instead of timing out.
+  // Slow pages: report a partial inventory instead of timing out.
   let now = 1_000_000;
   t.mock.method(Date, 'now', () => now);
   const page = (start) => ({
@@ -824,11 +825,15 @@ test('the space inventory treats a documented 404 as empty and stops paging afte
       },
     };
   };
-  assert.deepEqual(await ports.projects(), { projects: [], incomplete: true });
+  // The first page took 8 s, so the second (ending past the 15 s budget) is the last one read.
+  const partial = await ports.projects();
+  assert.equal(partial.incomplete, true);
+  assert.equal(partial.projects.length, 200);
+  assert.ok(partial.projects.every((p) => p.teamManaged));
   assert.equal(slow.calls.length, 2);
 });
 
-test('the Rovo space lookup returns clear errors and accepts only company-managed Software', async () => {
+test('the Rovo space lookup returns clear errors and accepts only Software spaces', async () => {
   const { registerRovo } = await import('../src/integration.ts');
   const principal = { principal: { accountId: 'actor' } };
   const payload = { projectKey: 'TEST', query: '' };
@@ -837,8 +842,8 @@ test('the Rovo space lookup returns clear errors and accepts only company-manage
     [{ status: 429 }, /limiting requests/],
     [{ status: 200, invalidJson: true }, /unreadable data/],
     [
-      { body: { id: '1', key: 'TEST', projectTypeKey: 'software', style: 'next-gen' } },
-      /Company-managed/,
+      { body: { id: '1', key: 'TEST', projectTypeKey: 'business', style: 'next-gen' } },
+      /^Jira software spaces only\.$/,
     ],
     [{ body: null }, /Space context does not match/],
   ]) {
@@ -872,6 +877,39 @@ test('Rovo search returns at most twenty matches and reports more', async () => 
   assert.equal(result.value.prompts.length, 20);
   assert.equal(result.value.incomplete, true);
   assert.equal(JSON.parse(s.calls[1].body).maxResults, 20);
+});
+
+test('Rovo searches a team-managed space by its own configured work type', async () => {
+  const { registerRovo } = await import('../src/integration.ts');
+  const s = {
+    ...sdk(
+      { body: { ...project, id: '1', style: 'next-gen' } },
+      {
+        body: {
+          issues: [
+            {
+              id: '100',
+              key: 'TEST-100',
+              fields: { summary: 'Review', project: { id: '1' }, issuetype: { id: '10430' } },
+            },
+          ],
+          isLast: true,
+        },
+      },
+    ),
+    kvs: { entity: () => ({ get: async () => ({ revision: 1, data: { type: '10430' } }) }) },
+  };
+  const result = await registerRovo(s)(
+    { projectKey: 'TEST', query: '' },
+    { principal: { accountId: 'a' } },
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.value.prompts.map((p) => p.key),
+    ['TEST-100'],
+  );
+  assert.match(JSON.parse(s.calls[1].body).jql, /project = 1 AND issuetype = 10430/);
+  assert.equal(s.calls.length, 2);
 });
 
 test('one request reads a space settings record once, and a storage failure is an outage', async () => {

@@ -8,7 +8,7 @@ import {
   fixtureProject,
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { client, observeAction } from '@srcplugins/atlassian-forge-test-framework/jira';
-import { editor, snapshotJourney } from './snapshots.mjs';
+import { editor, openField, snapshotJourney } from './snapshots.mjs';
 import { spaceSettings } from './space-settings.mjs';
 
 // Keep the source journal live while probing the other installation. All writes go through
@@ -104,12 +104,7 @@ export async function runIsolationProbe({
     .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
     .locator('..')
     .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
-  const loaded = await observeAction(
-    page,
-    'load',
-    () => readView.click({ position: { x: 2, y: 2 } }),
-    target,
-  );
+  const loaded = await observeAction(page, 'load', () => openField(page, readView), target);
   assert.deepEqual(loaded.ids, [local.sourceId]);
   assert.ok(
     !loaded.prompts.some(

@@ -32,8 +32,11 @@ function ui(
         if (f.statusFailure) throw Error('Progress unavailable');
         value = await f.api.status();
       }
-      if (name === 'configuration-options')
+      if (name === 'configuration-options') {
+        // `optionsFailure` fails each listed space's next read once.
+        if (f.optionsFailure?.delete(p.projectId)) throw Error('Work types unavailable');
         value = await f.api.options(f.actor ?? 'admin', p.projectId);
+      }
       if (name === 'configuration-preview')
         value = await f.api.preview(f.actor ?? 'admin', p.projectId, p);
       if (name === 'configuration-start')
@@ -710,6 +713,33 @@ test('a space blocked by a screen still offers its work types, so another select
   assert.equal(f.state().data.status, 'complete', f.state().data.message);
   assert.equal(f.configs.get('1').data.screenTypes, undefined);
 });
+test('a space whose review failed is reviewed again by Back and Review changes', async () => {
+  const f = batchFixture();
+  const preview = f.api.preview;
+  let failures = 1;
+  f.api.preview = async (actor, projectId, input) => {
+    if (projectId === '2' && failures-- > 0)
+      throw Error('Jira request failed (HTTP 500). Check your access, then try again.');
+    return preview(actor, projectId, input);
+  };
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  const previews = () => v.payloads.filter((c) => c.name === 'configuration-preview');
+  await v.click('Next');
+  await v.click('Review changes');
+  assert.match(v.text(), /HTTP 500/);
+  assert.equal(v.hasButton('Apply changes'), false);
+  await v.click('Back');
+  await v.click('Review changes');
+  // Only the space that failed is read again.
+  assert.equal(previews().length, 4);
+  assert.equal(previews()[3].payload.projectId, '2');
+  assert.doesNotMatch(v.text(), /HTTP 500/);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete', f.state().data.message);
+});
 test('a review that returns after the selection changed is dropped', async () => {
   const f = batchFixture();
   const v = ui(f, [f.projects.get('1')]);
@@ -1046,4 +1076,188 @@ test('a space whose work types could not be read keeps the dialog on the first s
   assert.equal(count('configuration-options'), 4);
   assert.equal(v.hasButton('Review changes'), true);
   assert.deepEqual(f.writes, []);
+});
+
+/** Makes `ids` team-managed spaces with their own Prompt and Task work types, and returns the
+ * selection the health view passes. */
+function teamManaged(f, ids) {
+  for (const id of ids)
+    Object.assign(f.projects.get(id), {
+      style: 'next-gen',
+      issueTypes: [
+        { id: `${id}0`, name: 'Prompt', subtask: false, hierarchyLevel: 0 },
+        { id: `${id}1`, name: 'Task', subtask: false, hierarchyLevel: 0 },
+      ],
+    });
+  return [...f.projects.values()].map((p) => ({
+    id: p.id,
+    key: p.key,
+    name: p.name,
+    teamManaged: ids.includes(p.id),
+  }));
+}
+test('team-managed spaces are configured on one screen, then confirmed and saved', async () => {
+  const f = batchFixture(['7', '8']);
+  const selected = teamManaged(f, ['7', '8']);
+  f.configs.set('7', { revision: 1, data: { type: '70' } });
+  const v = ui(f, selected);
+  await v.mount();
+  assert.match(v.text('ModalTitle'), /Configure 2 team-managed spaces/);
+  assert.equal(v.nodes('ProgressTracker').length, 0);
+  assert.equal(
+    v.nodes('Select').some((n) => n.props.inputId === 'configuration-mode'),
+    false,
+  );
+  assert.equal(v.calls.includes('configuration-catalog'), false);
+  assert.equal(v.hasButton('Next'), false);
+  assert.equal(
+    v.nodes('Select').find((n) => n.props.inputId === 'prompt-type-7').props.value.value,
+    '70',
+  );
+  assert.equal(v.disabled('Review changes'), true);
+  v.change('Select', 'prompt-type-8', { value: '81', label: 'Task' });
+  await v.click('Review changes');
+  assert.match(v.text('Heading'), /Confirm changes/);
+  assert.match(v.text(), /Prompt type: Task/);
+  assert.match(v.text(), /Nothing in these spaces’ Jira settings changes/);
+  assert.deepEqual(
+    v.payloads.find((p) => p.name === 'configuration-preview' && p.payload.projectId === '8')
+      .payload,
+    { projectId: '8', type: '81', reloadAfterSave: 'keep' },
+  );
+  assert.equal(v.hasButton('Apply changes'), false);
+  await v.click('Save changes');
+  const start = v.payloads.find((p) => p.name === 'configuration-start').payload;
+  assert.equal('type' in start || 'name' in start, false);
+  assert.deepEqual(
+    start.entries.map((entry) => ({ ...entry, fingerprint: undefined })),
+    [
+      { projectId: '7', type: '70', fingerprint: undefined },
+      { projectId: '8', type: '81', fingerprint: undefined },
+    ],
+  );
+  assert.equal(f.state().data.status, 'complete');
+  assert.deepEqual(f.configs.get('8').data, { type: '81', previousTypes: [] });
+  assert.deepEqual(f.writes, []);
+});
+test('a team-managed space changes its saved type, or removes setup behind its own confirmation', async () => {
+  const f = batchFixture(['7']);
+  const selected = teamManaged(f, ['7']);
+  f.configs.set('7', { revision: 1, data: { type: '70' } });
+  const v = ui(f, selected);
+  await v.mount();
+  assert.equal(v.disabled('Review changes'), false);
+  v.change('Select', 'prompt-type-7', { value: '71', label: 'Task' });
+  assert.match(v.text(), /Was: Prompt\./);
+  await v.click('Remove setup…');
+  assert.match(v.text('Heading'), /Remove setup\?/);
+  assert.match(v.text(), /Work items keep the prompts already selected on them/);
+  assert.deepEqual(v.payloads.findLast((p) => p.name === 'configuration-preview').payload, {
+    projectId: '7',
+    unlink: true,
+  });
+  assert.equal(v.button('Remove setup').props.appearance, 'danger');
+  // Back leaves the removal: the space's own type choice is reviewed again.
+  await v.click('Back');
+  assert.equal(v.hasButton('Remove setup'), false);
+  await v.click('Review changes');
+  assert.match(v.text('Heading'), /Confirm changes/);
+  assert.match(v.text(), /Prompt type: Prompt → Task/);
+  await v.click('Save changes');
+  assert.deepEqual(f.configs.get('7').data, { type: '71', previousTypes: ['70'] });
+  assert.deepEqual(f.writes, []);
+});
+test('a team-managed space’s setup is removed after its confirmation', async () => {
+  const f = batchFixture(['7']);
+  const selected = teamManaged(f, ['7']);
+  f.configs.set('7', { revision: 1, data: { type: '70' } });
+  const v = ui(f, selected);
+  await v.mount();
+  await v.click('Remove setup…');
+  await v.click('Remove setup');
+  assert.equal(f.state().data.status, 'complete');
+  assert.equal(f.configs.get('7').data.type, undefined);
+  assert.deepEqual(f.writes, []);
+});
+test('a team-managed space whose saved type was deleted can still have its setup removed', async () => {
+  const f = batchFixture(['7']);
+  const selected = teamManaged(f, ['7']);
+  f.configs.set('7', { revision: 1, data: { type: '99' } });
+  const v = ui(f, selected);
+  await v.mount();
+  // The deleted type is not offered as the choice, but the space is still set up.
+  assert.equal(
+    v.nodes('Select').find((n) => n.props.inputId === 'prompt-type-7').props.value,
+    null,
+  );
+  assert.match(
+    v.text(),
+    /Was: Work type ID 99, which is no longer one of this space’s standard work types\./,
+  );
+  assert.equal(v.disabled('Review changes'), true);
+  await v.click('Remove setup…');
+  assert.match(v.text('Heading'), /Remove setup\?/);
+  await v.click('Remove setup');
+  assert.equal(f.state().data.status, 'complete');
+  assert.deepEqual(f.configs.get('7').data, { previousTypes: ['99'] });
+  assert.deepEqual(f.writes, []);
+});
+test('removing setup leaves out a selected team-managed space that has none', async () => {
+  const f = batchFixture(['7', '8']);
+  const selected = teamManaged(f, ['7', '8']);
+  f.configs.set('7', { revision: 1, data: { type: '70' } });
+  const v = ui(f, selected);
+  await v.mount();
+  await v.click('Remove setup…');
+  assert.match(v.text(), /No setup to remove; this space is left out\./);
+  await v.click('Remove setup');
+  const start = v.payloads.find((p) => p.name === 'configuration-start').payload;
+  assert.deepEqual(
+    start.entries.map((e) => e.projectId),
+    ['7'],
+  );
+  assert.match(v.text(), /Setup removed from 1 of 1 spaces\./);
+  assert.equal(f.configs.has('8'), false);
+  assert.deepEqual(f.configs.get('7').data, { previousTypes: ['70'] });
+});
+test('removing setup from company-managed spaces that have none offers nothing to apply', async () => {
+  const f = batchFixture(['1', '2']);
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'unlink' });
+  await v.click('Review changes');
+  assert.match(v.text(), /None of the selected spaces has setup to remove\./);
+  assert.equal(v.hasButton('Apply changes'), false);
+  assert.equal(await f.api.status(), null);
+});
+test('a team-managed space whose work types could not be read is read again on request', async () => {
+  const f = batchFixture(['7', '8']);
+  const selected = teamManaged(f, ['7', '8']);
+  f.optionsFailure = new Set(['8']);
+  const v = ui(f, selected);
+  await v.mount();
+  assert.match(v.text(), /Work types could not be read for .*: Work types unavailable/);
+  assert.equal(v.hasButton('Review changes'), false);
+  const reads = () => v.payloads.filter((p) => p.name === 'configuration-options');
+  assert.equal(reads().length, 2);
+  await v.click('Read work types again');
+  // Only the space that failed is read again.
+  assert.deepEqual(
+    reads()
+      .slice(2)
+      .map((p) => p.payload.projectId),
+    ['8'],
+  );
+  assert.equal(v.hasButton('Read work types again'), false);
+  v.change('Select', 'prompt-type-7', { value: '70', label: 'Prompt' });
+  v.change('Select', 'prompt-type-8', { value: '80', label: 'Prompt' });
+  await v.click('Review changes');
+  assert.match(v.text('Heading'), /Confirm changes/);
+});
+test('a team-managed space with no saved setup offers no removal', async () => {
+  const f = batchFixture(['7']);
+  const v = ui(f, teamManaged(f, ['7']));
+  await v.mount();
+  assert.equal(v.hasButton('Remove setup…'), false);
+  assert.equal(v.disabled('Review changes'), true);
 });

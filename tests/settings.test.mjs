@@ -683,6 +683,50 @@ test('for an existing type, drift before attach or a rejected attach changes not
   }
 });
 
+test('after attaching, a space read that does not list the type yet is read again, never the attach', async () => {
+  // The port already repeats a read that fails in transit, so a failed read is not repeated here.
+  for (const [faults, configured, reads] of [
+    [['stale', 'stale'], true, 3],
+    [['stale', 'stale', 'stale'], false, 3],
+    [['unavailable'], false, 1],
+    [['stale', 'unavailable'], false, 2],
+  ]) {
+    const f = fixture();
+    f.types.push({ id: '6', name: 'Runbook', subtask: false, hierarchyLevel: 0 });
+    const plan = await f.settings.preview(c, { type: '6' });
+    const read = f.p.project;
+    let attached = false;
+    const attach = f.s.attach;
+    f.s.attach = async (...args) => {
+      await attach(...args);
+      attached = true;
+    };
+    const left = [...faults];
+    let after = 0;
+    f.p.project = async () => {
+      if (attached) after++;
+      const fault = attached ? left.shift() : undefined;
+      if (fault === 'unavailable') throw new JiraUnavailable('Jira connection failed.');
+      const project = await read();
+      if (fault === 'stale') project.issueTypes = project.issueTypes.filter((t) => t.id !== '6');
+      return project;
+    };
+    const settings = createSettings(f.p, f.s);
+    const applied = settings.apply(c, { type: '6', fingerprint: plan.fingerprint });
+    if (configured) {
+      await applied;
+      assert.equal(f.state().data.type, '6');
+      assert.equal(f.state().data.pending, undefined);
+    } else {
+      await assert.rejects(applied, /uncertain/);
+      assert.ok(f.state().data.pending);
+    }
+    assert.equal(f.writes.filter((w) => w === 'attach').length, 1);
+    // The space is read only to confirm the association, at most three times.
+    assert.equal(after, reads);
+  }
+});
+
 test('a failed claim release after a rejection stays uncertain and keeps the claim', async () => {
   const f = fixture();
   const plan = await f.settings.preview(c, { name: 'Runbook' });
@@ -860,6 +904,29 @@ test('a step stops before its first write when the request has too little time l
   await f.settings.apply(c, input);
   assert.deepEqual(f.writes[0], 'add 200 customfield_1');
 });
+test('after the type is attached, the screen changes are fitted again to the time left', async () => {
+  const f = fixture();
+  f.types.push({ id: '6', name: 'Runbook', subtask: false, hierarchyLevel: 0 });
+  f.screens.use('1', '4', 'edit', '200');
+  f.screens.use('1', '4', 'view', '201');
+  const input = { type: '6', screenTypes: ['4'] };
+  const plan = await f.settings.preview(c, input);
+  assert.equal(plan.attach, true);
+  const reviewed = plan.screens.changes.length;
+  assert.ok(reviewed >= 2);
+  // Every change fits when the step starts; the association then takes most of the time.
+  const attach = f.s.attach;
+  f.s.attach = async (...args) => {
+    await attach(...args);
+    f.screens.clock.left = 4_000;
+  };
+  const outcome = await f.settings.apply(c, { ...input, fingerprint: plan.fingerprint });
+  // Four seconds leave one change after the three-second margin.
+  assert.equal(f.writes.filter((w) => w.startsWith('add')).length, 1);
+  assert.equal(outcome.remaining.length, reviewed - 1);
+  assert.equal(f.state().data.type, '6');
+  assert.equal(f.state().data.pending, undefined);
+});
 test('a step makes the screen changes that fit its time and reports the rest', async () => {
   const f = fixture();
   const types = Array.from({ length: 7 }, (_, i) => String(10 + i));
@@ -1017,4 +1084,276 @@ test('screen selection is validated against the space’s work types before any 
   );
   await assert.rejects(f.settings.preview(c, { type: '3', screenTypes: ['4', '4'] }), /distinct/);
   await assert.rejects(f.settings.preview(c, { unlink: true, screenTypes: [] }), /Removing setup/);
+});
+
+/** A team-managed space: its own work types, the field on the Task layout only, and every port
+ * that would read or change schemes, global types or screens failing the test. */
+function teamFixture({ stored, fields, timeLeft = () => 20_000 } = {}) {
+  let record = stored;
+  const writes = [];
+  const reads = [];
+  const project = {
+    id: '1',
+    key: 'TEAM',
+    style: 'next-gen',
+    projectTypeKey: 'software',
+    issueTypes: [
+      { id: '10424', name: 'Epic', subtask: false, hierarchyLevel: 1 },
+      { id: '10425', name: 'Subtask', subtask: true, hierarchyLevel: -1 },
+      { id: '10426', name: 'Task', subtask: false, hierarchyLevel: 0 },
+      { id: '10427', name: 'Story', subtask: false, hierarchyLevel: 0 },
+      { id: '10430', name: 'Prompt', subtask: false, hierarchyLevel: 0 },
+    ],
+  };
+  const layout = fields ?? {
+    10426: ['summary', 'description', 'customfield_1'],
+    10427: ['summary', 'description'],
+    10430: ['summary', 'description'],
+  };
+  const never = (name) => async () => assert.fail(`team-managed setup never calls ${name}`);
+  const p = {
+    allowed: async (_project, permission) => assert.equal(permission, 'ADMINISTER'),
+    project: async () => structuredClone(project),
+    field: async () => 'customfield_1',
+    search: never('search'),
+  };
+  const s = {
+    get: async () => structuredClone(record),
+    cas: async (_project, revision, data, screen) => {
+      assert.equal(screen, undefined);
+      if ((record?.revision ?? 0) !== revision) throw new UserError('Setup changed');
+      record = { revision: revision + 1, data: structuredClone(data) };
+      writes.push('config');
+    },
+    createFields: async (_project, type) => {
+      reads.push(type);
+      const value = layout[type];
+      if (value instanceof Error) throw value;
+      return value;
+    },
+    timeLeft,
+    ...Object.fromEntries(
+      [
+        'types',
+        'scheme',
+        'create',
+        'attach',
+        'screenUses',
+        'screens',
+        'screenImpact',
+        'addScreenField',
+        'removeScreenField',
+        'screenRecord',
+      ].map((name) => [name, never(name)]),
+    ),
+  };
+  return {
+    project,
+    writes,
+    reads,
+    settings: createSettings(p, s),
+    state: () => structuredClone(record),
+  };
+}
+test('a team-managed space is set up with one of its own work types in one storage write', async () => {
+  const f = teamFixture();
+  const plan = await f.settings.preview(c, { type: '10430', reloadAfterSave: 'on' });
+  assert.equal(plan.teamManaged, true);
+  assert.equal(plan.typeName, 'Prompt');
+  assert.equal(plan.attach, false);
+  assert.deepEqual(plan.screens.changes, []);
+  await f.settings.apply(c, {
+    type: '10430',
+    reloadAfterSave: 'on',
+    fingerprint: plan.fingerprint,
+  });
+  assert.deepEqual(f.state(), {
+    revision: 1,
+    data: { type: '10430', previousTypes: [], refreshAfterSave: true },
+  });
+  assert.deepEqual(f.writes, ['config']);
+});
+test('a team-managed review refuses a new type, screens and any type that is not its own standard type', async () => {
+  const f = teamFixture();
+  await assert.rejects(
+    f.settings.preview(c, { name: 'Prompt' }),
+    /^Error: Create the prompt work type in Space settings → Work types/,
+  );
+  await assert.rejects(
+    f.settings.preview(c, { type: '10430', screenTypes: ['10426'] }),
+    /no screens for the app to change/,
+  );
+  await assert.rejects(f.settings.preview(c, {}), /Choose this space’s prompt work type/);
+  // A global type, an epic and a subtask are not the space's own standard types.
+  for (const type of ['3', '10424', '10425'])
+    await assert.rejects(
+      f.settings.preview(c, { type }),
+      /Choose one of this space’s standard work types/,
+    );
+  assert.deepEqual(f.writes, []);
+});
+test('replacing a team-managed prompt type keeps the old one, and removing setup keeps both', async () => {
+  const f = teamFixture({
+    stored: { revision: 1, data: { type: '10430', refreshAfterSave: true } },
+  });
+  const plan = await f.settings.preview(c, { type: '10427', reloadAfterSave: 'keep' });
+  await f.settings.apply(c, {
+    type: '10427',
+    reloadAfterSave: 'keep',
+    fingerprint: plan.fingerprint,
+  });
+  assert.deepEqual(f.state().data, {
+    type: '10427',
+    previousTypes: ['10430'],
+    refreshAfterSave: true,
+  });
+  const removal = await f.settings.preview(c, { unlink: true });
+  assert.equal(removal.teamManaged, true);
+  await f.settings.apply(c, { unlink: true, fingerprint: removal.fingerprint });
+  assert.deepEqual(f.state().data, { previousTypes: ['10430', '10427'] });
+  assert.deepEqual(f.writes, ['config', 'config']);
+});
+test('a team-managed review reads no screens, even when its record lists some', async () => {
+  // Jira does not convert a space between kinds, but a record is never trusted to say so.
+  const f = teamFixture({
+    stored: { revision: 1, data: { type: '10430', previousTypes: [], screens: ['50'] } },
+  });
+  const change = await f.settings.preview(c, { type: '10427', reloadAfterSave: 'keep' });
+  const removal = await f.settings.preview(c, { unlink: true });
+  for (const plan of [change, removal]) {
+    assert.deepEqual(plan.screens, { changes: [], present: [] });
+    assert.deepEqual(plan.screenProjects, {});
+  }
+  assert.deepEqual(f.reads, []);
+});
+test('team-managed health lists where the field is placed and reads only create metadata', async () => {
+  let f = teamFixture({ stored: { revision: 1, data: { type: '10430' } } });
+  let health = await f.settings.health(c);
+  assert.deepEqual(
+    health.checks.map((check) => [check.label, check.ok]),
+    [
+      ['Work type', true],
+      ['Agent Prompts field', true],
+      ['Prompt creation', true],
+      ['Agent Prompts on layouts', true],
+    ],
+  );
+  assert.equal(health.checks[3].detail, 'The field is on the layout of Task. It isn’t on Story.');
+  assert.deepEqual(health.layouts, [
+    { id: '10426', name: 'Task', present: true },
+    { id: '10427', name: 'Story', present: false },
+  ]);
+  assert.deepEqual(
+    health.types.map((t) => t.name),
+    ['Task', 'Story', 'Prompt'],
+  );
+  // One create metadata read per standard work type, the prompt type's shared by both checks.
+  assert.deepEqual(f.reads.sort(), ['10426', '10427', '10430']);
+  assert.deepEqual(f.writes, []);
+
+  // Nowhere: needs attention. A failed read is named, never counted as missing.
+  f = teamFixture({
+    stored: { revision: 1, data: { type: '10430' } },
+    fields: {
+      10426: ['summary'],
+      10427: new JiraRejected('denied', 403),
+      10430: ['summary'],
+    },
+  });
+  health = await f.settings.health(c);
+  const byLabel = Object.fromEntries(health.checks.map((check) => [check.label, check]));
+  assert.equal(byLabel['Prompt creation'].ok, false);
+  assert.match(byLabel['Prompt creation'].detail, /Add the summary and description fields/);
+  assert.equal(byLabel['Agent Prompts on layouts'].ok, false);
+  assert.match(
+    byLabel['Agent Prompts on layouts'].detail,
+    /^The field wasn’t found on a checked work type’s layout\./,
+  );
+  assert.doesNotMatch(byLabel['Agent Prompts on layouts'].detail, /on no work type’s layout/);
+  assert.match(byLabel['Agent Prompts on layouts'].detail, /It isn’t on Task\./);
+  assert.match(byLabel['Agent Prompts on layouts'].detail, /Story could not be checked/);
+  assert.deepEqual(health.layouts[1], { id: '10427', name: 'Story' });
+
+  // Every read failed: nothing was checked, so nothing is reported as missing.
+  f = teamFixture({
+    stored: { revision: 1, data: { type: '10430' } },
+    fields: Object.fromEntries(
+      ['10426', '10427', '10430'].map((id) => [id, new JiraRejected('denied', 403)]),
+    ),
+  });
+  health = await f.settings.health(c);
+  const layoutsCheck = health.checks.find((check) => check.label === 'Agent Prompts on layouts');
+  assert.equal(layoutsCheck.ok, false);
+  assert.equal(
+    layoutsCheck.detail,
+    'No work type’s layout could be checked. Task, Story could not be checked. Check the Create work items permission in this space.',
+  );
+
+  // Not set up yet, or its type deleted: every standard type is listed and the type check fails.
+  for (const [stored, pattern] of [
+    [undefined, /Choose the space’s prompt work type/],
+    [{ revision: 1, data: { type: '999' } }, /deleted or is no longer a standard work type/],
+  ]) {
+    f = teamFixture({ stored });
+    health = await f.settings.health(c);
+    assert.equal(health.checks[0].ok, false);
+    assert.match(health.checks[0].detail, pattern);
+    assert.deepEqual(
+      health.layouts.map((l) => l.name),
+      ['Task', 'Story', 'Prompt'],
+    );
+  }
+});
+test('the Work types step offers a team-managed space its own standard work types', async () => {
+  const f = teamFixture({ stored: { revision: 1, data: { type: '10430' } } });
+  assert.deepEqual(await f.settings.options(c), {
+    teamManaged: true,
+    promptTypes: [
+      { id: '10426', name: 'Task' },
+      { id: '10427', name: 'Story' },
+      { id: '10430', name: 'Prompt' },
+    ],
+    type: '10430',
+  });
+  assert.equal('type' in (await teamFixture().settings.options(c)), false);
+  // A saved type the space no longer offers is still returned, so its setup can be removed.
+  const gone = teamFixture({ stored: { revision: 1, data: { type: '999' } } });
+  assert.equal((await gone.settings.options(c)).type, '999');
+});
+
+test('team-managed health stops starting layout reads when ten seconds of the request are left', async () => {
+  // Each read takes two seconds of the request; four run at a time.
+  let left = 22_000;
+  const ids = Array.from({ length: 50 }, (_, i) => String(20_000 + i));
+  const f = teamFixture({
+    stored: { revision: 1, data: { type: '10430' } },
+    fields: new Proxy(
+      {},
+      {
+        get: () => {
+          left -= 2_000;
+          return ['summary', 'description'];
+        },
+      },
+    ),
+    timeLeft: () => left,
+  });
+  f.project.issueTypes.push(
+    ...ids.map((id) => ({ id, name: `Type ${id}`, subtask: false, hierarchyLevel: 0 })),
+  );
+  const health = await f.settings.health(c);
+  // Reads start at 22, 20, 18, 16, 14 and 12 seconds left; the prompt type is read first.
+  assert.equal(f.reads.length, 6);
+  assert.equal(f.reads[0], '10430');
+  const byLabel = Object.fromEntries(health.checks.map((check) => [check.label, check]));
+  assert.equal(byLabel['Prompt creation'].ok, true);
+  const layouts = byLabel['Agent Prompts on layouts'];
+  assert.equal(layouts.ok, false);
+  assert.match(layouts.detail, /^The field wasn’t found on a checked work type’s layout\./);
+  assert.match(layouts.detail, /Not checked in time: .*Type 20044.*\. Check this space again\./);
+  assert.doesNotMatch(layouts.detail, /could not be checked/);
+  assert.match(layouts.detail, /Only the first 50 work types were checked\./);
+  // A layout not read in time is not known, never counted as missing the field.
+  assert.equal(health.layouts.filter((l) => 'present' in l).length, 5);
+  assert.equal(health.layouts.length, 49);
 });

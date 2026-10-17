@@ -18,7 +18,6 @@ const notAppText = new Map([
   ['/^(Agent Prompts, .*edit|Edit Agent Prompts)$/', 'Jira names the custom field editor'],
   ['/remove.*Error handling/i', 'the picker remove button for a fixture prompt'],
   ['/remove.*Unavailable prompt/i', 'the picker remove button; the label is a template literal'],
-  ["'RELOAD-SENTINEL'", 'fixture text written by the test'],
   ["'2/5 selected · Unsaved changes'", 'computed selection count'],
   ["'1/5 selected · Unsaved changes'", 'computed selection count'],
   ['/^0\\/5 selected/', 'computed selection count'],
@@ -38,15 +37,30 @@ const notAppText = new Map([
   ],
   ["'Agent Prompts added'", 'shared screen effect; the field name is computed'],
   ['/^Blocked: /', 'review result; the reason is a template literal'],
+  [
+    '/^Blocked: Jira request failed \\(HTTP 5\\d\\d\\)/',
+    'review result; JiraError in src/shared/jira.mjs fills in the status',
+  ],
   ['/^\\d+ of 20 screen changes made$/', 'computed step progress'],
+  [
+    '/^Jira request failed \\(HTTP 5\\d\\d\\)/',
+    'request error; the requester in src/integration.ts fills in the status',
+  ],
   ["'Field Tab'", 'screen tab the setup runner creates in Jira'],
+  ['/^Team-managed \\(\\d+\\)$/', 'space kind tab; the count is computed'],
+  ["'Task'", 'layout column; Jira names the work type'],
+  ['/^Show (company|team)-managed$/', 'search hint button; the kind name is computed'],
+  ['/^Configure 1 team-managed space$/', 'dialog title; the count is computed'],
 ]);
 const locator =
   /(?:getByText|\bline|getByLabel|getByPlaceholder|toContainText|toHaveText|hasText:|name:)\s*\(?\s*('(?:[^'\\]|\\.)*'|\/(?:[^/\\\n]|\\.)+\/[a-z]*)/g;
+// Runners that only drive Jira's own pages, doing a space administrator's manual setup, locate
+// Jira's labels and never app text.
+const jiraPagesOnly = new Set([join('tests', 'hosted', 'prepare-team-managed.mjs')]);
 
 test('hosted text locators match text the app renders', () => {
   const found = files('tests/hosted')
-    .filter((path) => path.endsWith('.mjs'))
+    .filter((path) => path.endsWith('.mjs') && !jiraPagesOnly.has(path))
     .flatMap((path) =>
       [...readFileSync(path, 'utf8').matchAll(locator)].map((m) => ({ path, literal: m[1] })),
     );

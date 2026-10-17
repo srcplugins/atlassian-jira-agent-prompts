@@ -36,6 +36,8 @@ import type { createSettings, ReloadChoice } from './settings';
 type Catalog = Awaited<ReturnType<ReturnType<typeof createConfigurationBatch>['catalog']>>;
 type Plan = Awaited<ReturnType<ReturnType<typeof createSettings>['preview']>>;
 type Options = Awaited<ReturnType<ReturnType<typeof createSettings>['options']>>;
+type ScreenOptions = Extract<Options, { teamManaged?: undefined }>;
+type OwnOptions = Extract<Options, { teamManaged: true }>;
 type Reviewed = { id: string; value?: Plan; error?: string };
 type ScreenChange = Plan['screens']['changes'][number];
 const fieldName = (field: string) =>
@@ -50,8 +52,12 @@ const appearance = {
 /** The changes of one reviewed space, in words; record-only screen changes are not listed. */
 function changes(plan: Plan, typeName: (id: string) => string): Change[] {
   const unlink = 'unlink' in plan && plan.unlink;
+  const own = 'teamManaged' in plan && plan.teamManaged;
   return [
     ...(unlink && plan.old ? [{ op: 'Remove', text: 'App setup and preferences' } as Change] : []),
+    ...(own && !unlink && !plan.old
+      ? [{ op: 'Add', text: `Prompt type: ${plan.typeName}` } as Change]
+      : []),
     ...(!unlink && plan.old && plan.old !== plan.type
       ? [{ op: 'Change', text: `Prompt type: ${typeName(plan.old)} → ${plan.typeName}` } as Change]
       : []),
@@ -78,20 +84,41 @@ function changes(plan: Plan, typeName: (id: string) => string): Change[] {
     })),
   ];
 }
+/** Whether a removal review has anything to remove: a saved type or a screen change. A space
+ * with neither is left out of the run. */
+const removes = (plan: Plan) => !!plan.old || plan.screens.changes.length > 0;
 const PAGE = 5;
 const pageOf = <T,>(items: T[], page: number) => items.slice(page * PAGE, (page + 1) * PAGE);
+type Layout = { name: string; present?: boolean };
+/** Where a team-managed space's Agent Prompts field is, from its last check; a layout that could
+ * not be read is never shown as missing the field. */
+function layoutHint(layouts?: Layout[]) {
+  const on = (layouts ?? []).filter((l) => l.present).map((l) => l.name);
+  if (on.length) return `Agent Prompts is on the layout of ${on.join(', ')}.`;
+  return layouts?.length && layouts.every((l) => l.present === false)
+    ? 'Agent Prompts isn’t on any work type’s layout yet. Add it in Space settings → Work types so people can choose prompts.'
+    : '';
+}
+/**
+ * Configures spaces of one kind. Company-managed spaces share a global prompt type and get screen
+ * changes over three steps; team-managed spaces each choose one of their own work types on one
+ * screen, then confirm. Saved progress, recovery and results are the same for both.
+ */
 export function ConfigurationDialog({
   projects,
   inventory,
   initialType,
+  layouts = {},
   onClose,
   onBusy,
 }: {
   projects: InventoryProject[];
   /** Every space the health view loaded, for naming spaces outside the selection; incomplete
    * when the inventory was truncated or could not be read. */
-  inventory: { projects: InventoryProject[]; incomplete: boolean };
+  inventory: { projects: Omit<InventoryProject, 'teamManaged'>[]; incomplete: boolean };
   initialType?: string;
+  /** Each checked team-managed space's work type layouts, for the field placement hint. */
+  layouts?: Record<string, Layout[]>;
   onClose: (mutated: boolean) => void;
   onBusy: (value: boolean) => void;
 }) {
@@ -113,7 +140,17 @@ export function ConfigurationDialog({
   // Work types offered per space are read once, when the Work types step first opens; they do
   // not depend on the prompt type, which is left out where they are shown. A choice starts from
   // the space's saved selection.
-  const [screenOptions, setScreenOptions] = useState<Record<string, Options['availableTypes']>>({});
+  const [screenOptions, setScreenOptions] = useState<
+    Record<string, ScreenOptions['availableTypes']>
+  >({});
+  // A team-managed space's own standard work types and its prompt type, read in the same request;
+  // the choice starts from the space's saved type while it is still one of them.
+  const [promptOptions, setPromptOptions] = useState<Record<string, OwnOptions['promptTypes']>>({});
+  const [promptChoice, setPromptChoice] = useState<Record<string, string>>({});
+  // Each team-managed space's saved type, from that read, for the "Was:" note and Remove setup.
+  const [savedPrompt, setSavedPrompt] = useState<Record<string, string>>({});
+  // A space's work types could not be read; the team-managed screen offers to read them again.
+  const [optionsFailed, setOptionsFailed] = useState(false);
   const [screenChoice, setScreenChoice] = useState<Record<string, string[]>>({});
   // Each space's saved selection, from that read, for the "Was:" note.
   const [savedTypes, setSavedTypes] = useState<Record<string, string[]>>({});
@@ -132,10 +169,27 @@ export function ConfigurationDialog({
   const reviewRevision = useRef(0);
   const active = !!record && !finished(record.data.status);
   const foreignRun = !!accountId && !!record && record.data.actor !== accountId;
-  const input =
-    mode === 'unlink'
+  // The admin page selects spaces of one kind. Team-managed spaces each use one of their own work
+  // types; the global prompt type and screens are for company-managed spaces.
+  const team = projects.length > 0 && projects.every((p) => p.teamManaged);
+  const inputOf = (m: string) =>
+    m === 'unlink'
       ? { unlink: true }
-      : { ...(mode === 'existing' ? { type } : { name }), reloadAfterSave };
+      : team
+        ? { reloadAfterSave }
+        : { ...(m === 'existing' ? { type } : { name }), reloadAfterSave };
+  const input = inputOf(mode);
+  /** The input one space is reviewed with; `m` is a mode chosen in the same click. */
+  const inputFor = (id: string, m = mode) =>
+    m !== 'unlink' && team
+      ? { ...(promptChoice[id] ? { type: promptChoice[id] } : {}), reloadAfterSave }
+      : inputOf(m);
+  const missingPrompt = mode !== 'unlink' && team && ids.some((id) => !promptChoice[id]);
+  const modeOptions = [
+    { value: 'existing', label: 'Use an existing type', isDisabled: !catalog?.typesAvailable },
+    { value: 'create', label: 'Create a new type', isDisabled: !catalog?.typesAvailable },
+    { value: 'unlink', label: 'Remove setup from selected spaces' },
+  ];
   const single = ids.length === 1;
   const reloadOptions: { value: ReloadChoice; label: string }[] = [
     { value: 'keep', label: single ? 'Keep this space’s setting' : 'Keep each space’s setting' },
@@ -210,6 +264,13 @@ export function ConfigurationDialog({
     void run(async () => {
       await Promise.all([
         (async () => {
+          // Team-managed spaces never use a global type: their own types are read at once, as
+          // their one screen shows them.
+          if (team) {
+            setCatalog({ typesAvailable: false, types: [] });
+            await readOptions(ids);
+            return;
+          }
           try {
             const c = await call<Catalog>('configuration-catalog', {});
             setCatalog(c);
@@ -246,13 +307,13 @@ export function ConfigurationDialog({
   };
   const typeName = (id: string) =>
     catalog?.types.find((t) => t.id === id)?.name ??
-    Object.values(screenOptions)
+    [...Object.values(screenOptions), ...Object.values(promptOptions)]
       .flat()
       .find((t) => t.id === id)?.name ??
     `Work type ID ${id}`;
   /** Reviews `spaces` with the current input, keeping the other spaces' reviews; false when the
    * input changed meanwhile. */
-  async function review(spaces: string[]) {
+  async function review(spaces: string[], m = mode) {
     dropPlans(spaces);
     const started = reviewRevision.current;
     setProgress({ done: 0, total: spaces.length });
@@ -261,9 +322,9 @@ export function ConfigurationDialog({
       (id) =>
         call<Plan>('configuration-preview', {
           projectId: id,
-          ...input,
+          ...inputFor(id, m),
           // The prompt type itself is never offered for its own screens.
-          ...(mode !== 'unlink' && screenChoice[id]
+          ...(m !== 'unlink' && !team && screenChoice[id]
             ? {
                 screenTypes: screenChoice[id].filter((t) => mode !== 'existing' || t !== type),
               }
@@ -295,15 +356,35 @@ export function ConfigurationDialog({
       (id) => call<Options>('configuration-options', { projectId: id }),
       (results) => setProgress({ done: results.length, total: spaces.length }),
     );
-    const fresh = read.filter((p) => p.value);
+    const company = read.flatMap((p) =>
+      p.value && !p.value.teamManaged ? [{ id: p.id, value: p.value }] : [],
+    );
+    const own = read.flatMap((p) => (p.value?.teamManaged ? [{ id: p.id, value: p.value }] : []));
     setScreenOptions((o) => ({
       ...o,
-      ...Object.fromEntries(fresh.map((p) => [p.id, p.value!.availableTypes])),
+      ...Object.fromEntries(company.map((p) => [p.id, p.value.availableTypes])),
     }));
-    const saved = Object.fromEntries(fresh.map((p) => [p.id, p.value!.screenTypes]));
+    const saved = Object.fromEntries(company.map((p) => [p.id, p.value.screenTypes]));
     setScreenChoice((c) => ({ ...saved, ...c }));
     setSavedTypes((s) => ({ ...saved, ...s }));
+    setPromptOptions((o) => ({
+      ...o,
+      ...Object.fromEntries(own.map((p) => [p.id, p.value.promptTypes])),
+    }));
+    const ownSaved = Object.fromEntries(
+      own.flatMap((p) => (p.value.type ? [[p.id, p.value.type]] : [])),
+    );
+    const ownChoice = Object.fromEntries(
+      own.flatMap((p) =>
+        p.value.type && p.value.promptTypes.some((t) => t.id === p.value.type)
+          ? [[p.id, p.value.type]]
+          : [],
+      ),
+    );
+    setPromptChoice((c) => ({ ...ownChoice, ...c }));
+    setSavedPrompt((s) => ({ ...ownSaved, ...s }));
     const failed = read.find((p) => !p.value);
+    setOptionsFailed(!!failed);
     if (failed) {
       setMessage(`Work types could not be read for ${label(failed.id)}: ${failed.error}`);
       return false;
@@ -313,15 +394,17 @@ export function ConfigurationDialog({
   /**
    * Moves to `next`. The Work types step needs only each space's work types, read once per
    * dialog; the Review step reviews the spaces whose review a change dropped (all of them at
-   * first) and keeps the rest.
+   * first) or that couldn't be reviewed, and keeps the rest.
    */
-  const goTo = (next: number) => {
+  const goTo = (next: number, m = mode) => {
     void run(async () => {
-      const unreviewed = ids.filter((id) => !plans.some((p) => p.id === id));
+      // A mode changed in the same click has not dropped the earlier review yet.
+      const unreviewed =
+        m === mode ? ids.filter((id) => !plans.some((p) => p.id === id && !p.error)) : ids;
       const ok =
         next === 2
-          ? await readOptions(ids.filter((id) => !screenOptions[id]))
-          : unreviewed.length === 0 || (await review(unreviewed));
+          ? await readOptions(ids.filter((id) => !screenOptions[id] && !promptOptions[id]))
+          : unreviewed.length === 0 || (await review(unreviewed, m));
       if (ok) {
         setPage(0);
         setStep(next);
@@ -365,17 +448,23 @@ export function ConfigurationDialog({
     }
   }
   async function apply() {
+    // A removal leaves out the spaces that have no setup, so the result counts only real removals.
+    const applied = mode === 'unlink' ? plans.filter((p) => removes(p.value!)) : plans;
     setAttempted(true);
     setUncertain(true);
-    setProgress({ done: 0, total: plans.length });
+    setProgress({ done: 0, total: applied.length });
     const current = await call<BatchRecord>('configuration-start', {
       ...input,
       ...(shared.length && sharedAck ? { allowShared: true } : {}),
       ...(sharedScreens.length && screenAck ? { allowSharedScreens: true } : {}),
-      entries: plans.map((p) => ({
+      entries: applied.map((p) => ({
         projectId: p.id,
         fingerprint: p.value!.fingerprint,
-        ...(mode === 'unlink' ? {} : { screenTypes: p.value!.screenTypes }),
+        ...(mode === 'unlink'
+          ? {}
+          : team
+            ? { type: p.value!.type! }
+            : { screenTypes: p.value!.screenTypes }),
       })),
       revision: record?.revision ?? 0,
     });
@@ -388,7 +477,8 @@ export function ConfigurationDialog({
   const steps =
     mode === 'unlink' ? ['Prompt type', 'Review'] : ['Prompt type', 'Work types', 'Review'];
   const stepIndex = step === 3 ? steps.length - 1 : step - 1;
-  const ready = plans.length === ids.length && plans.length > 0 && !plans.some((p) => !p.value);
+  const reviewed = plans.length === ids.length && plans.length > 0 && !plans.some((p) => !p.value);
+  const ready = reviewed && (mode !== 'unlink' || plans.some((p) => removes(p.value!)));
   // Apply to all offers every work type of the selected spaces except the prompt type.
   const bulkOptions = [
     ...new Map(
@@ -415,6 +505,24 @@ export function ConfigurationDialog({
       </Button>
     </Inline>
   );
+  const reloadPicker = (
+    <>
+      <Label labelFor="configuration-reload">Reload work item after saving prompts</Label>
+      <Select
+        inputId="configuration-reload"
+        isDisabled={busy}
+        options={reloadOptions}
+        value={reloadOptions.find((o) => o.value === reloadAfterSave)}
+        onChange={(o) => {
+          if (o && !Array.isArray(o)) {
+            setReloadAfterSave(o.value);
+            clearReview();
+          }
+        }}
+      />
+      <HelperMessage>Reloading can discard other unsaved edits on the work item.</HelperMessage>
+    </>
+  );
   return (
     <Modal
       width="large"
@@ -432,23 +540,76 @@ export function ConfigurationDialog({
             ? 'Configuration progress'
             : done
               ? 'Configuration results'
-              : `Configure ${ids.length} space${ids.length === 1 ? '' : 's'}`}
+              : `Configure ${ids.length}${team ? ' team-managed' : ''} space${ids.length === 1 ? '' : 's'}`}
         </ModalTitle>
       </ModalHeader>
       <ModalBody>
         <Stack space="space.150">
           {catalog && !active && !uncertain && !done && (
             <>
-              <ProgressTracker
-                label="Configuration steps"
-                items={steps.map((s, i) => ({
-                  id: s,
-                  label: s,
-                  percentageComplete: i < stepIndex ? 100 : 0,
-                  status: i < stepIndex ? 'visited' : i === stepIndex ? 'current' : 'unvisited',
-                }))}
-              />
-              {step === 1 && (
+              {!team && (
+                <ProgressTracker
+                  label="Configuration steps"
+                  items={steps.map((s, i) => ({
+                    id: s,
+                    label: s,
+                    percentageComplete: i < stepIndex ? 100 : 0,
+                    status: i < stepIndex ? 'visited' : i === stepIndex ? 'current' : 'unvisited',
+                  }))}
+                />
+              )}
+              {step === 1 && team && (
+                <>
+                  <Text>
+                    {`Choose which of ${single ? 'the space’s' : 'each space’s'} own work types holds prompts. Every work item of that type can then be chosen as a prompt.`}
+                  </Text>
+                  {pageOf(ids, page).map((id) => {
+                    const own = (promptOptions[id] ?? []).map((t) => ({
+                      value: t.id,
+                      label: t.name,
+                    }));
+                    const stale =
+                      !!savedPrompt[id] && !own.some((o) => o.value === savedPrompt[id]);
+                    const was =
+                      savedPrompt[id] && promptChoice[id] !== savedPrompt[id]
+                        ? `Was: ${typeName(savedPrompt[id])}${stale ? ', which is no longer one of this space’s standard work types' : ''}. `
+                        : '';
+                    const hint =
+                      promptOptions[id] && !own.length
+                        ? 'This space has no standard work type. Create one in Space settings → Work types, then reopen this dialog.'
+                        : layoutHint(layouts[id]);
+                    return (
+                      <Stack key={id} space="space.050">
+                        <Label
+                          labelFor={`prompt-type-${id}`}
+                        >{`Prompt work type for ${label(id)}`}</Label>
+                        <Select
+                          inputId={`prompt-type-${id}`}
+                          isSearchable
+                          isDisabled={busy || !own.length}
+                          placeholder="Choose a work type"
+                          options={own}
+                          value={own.find((o) => o.value === promptChoice[id]) ?? null}
+                          onChange={(o) => {
+                            if (o && !Array.isArray(o)) {
+                              setPromptChoice((c) => ({ ...c, [id]: o.value }));
+                              dropPlans([id]);
+                            }
+                          }}
+                        />
+                        {(was || hint) && (
+                          <Text size="small" color="color.text.subtlest">
+                            {`${was}${hint}`}
+                          </Text>
+                        )}
+                      </Stack>
+                    );
+                  })}
+                  {pager}
+                  {reloadPicker}
+                </>
+              )}
+              {step === 1 && !team && (
                 <>
                   {!catalog.typesAvailable && (
                     <Text>
@@ -466,28 +627,8 @@ export function ConfigurationDialog({
                   <Select
                     inputId="configuration-mode"
                     isDisabled={busy}
-                    options={[
-                      {
-                        value: 'existing',
-                        label: 'Use an existing type',
-                        isDisabled: !catalog.typesAvailable,
-                      },
-                      {
-                        value: 'create',
-                        label: 'Create a new type',
-                        isDisabled: !catalog.typesAvailable,
-                      },
-                      { value: 'unlink', label: 'Remove setup from selected spaces' },
-                    ]}
-                    value={{
-                      value: mode,
-                      label:
-                        mode === 'existing'
-                          ? 'Use an existing type'
-                          : mode === 'unlink'
-                            ? 'Remove setup from selected spaces'
-                            : 'Create a new type',
-                    }}
+                    options={modeOptions}
+                    value={modeOptions.find((o) => o.value === mode)}
                     onChange={(o) => {
                       if (o && !Array.isArray(o)) {
                         setMode(o.value);
@@ -541,28 +682,7 @@ export function ConfigurationDialog({
                       copied instructions and Jira work types stay in place.
                     </Text>
                   )}
-                  {mode !== 'unlink' && (
-                    <>
-                      <Label labelFor="configuration-reload">
-                        Reload work item after saving prompts
-                      </Label>
-                      <Select
-                        inputId="configuration-reload"
-                        isDisabled={busy}
-                        options={reloadOptions}
-                        value={reloadOptions.find((o) => o.value === reloadAfterSave)}
-                        onChange={(o) => {
-                          if (o && !Array.isArray(o)) {
-                            setReloadAfterSave(o.value);
-                            clearReview();
-                          }
-                        }}
-                      />
-                      <HelperMessage>
-                        Reloading can discard other unsaved edits on the work item.
-                      </HelperMessage>
-                    </>
-                  )}
+                  {mode !== 'unlink' && reloadPicker}
                   <Heading as="h3" size="small">
                     Selected spaces
                   </Heading>
@@ -688,23 +808,30 @@ export function ConfigurationDialog({
               )}
               {step === 3 && (
                 <>
-                  {mode === 'unlink' ? (
+                  {team ? (
+                    <Heading as="h3" size="small">
+                      {mode === 'unlink' ? 'Remove setup?' : 'Confirm changes'}
+                    </Heading>
+                  ) : mode === 'unlink' ? (
                     <Text>Remove setup from the selected spaces.</Text>
-                  ) : (
+                  ) : null}
+                  {mode !== 'unlink' && (
                     <Inline space="space.400" shouldWrap>
-                      <Stack space="space.025">
-                        <Text size="small" color="color.text.subtlest">
-                          Prompt work type
-                        </Text>
-                        <Text>
-                          {mode === 'create'
-                            ? `${name.trim()} (new)`
-                            : (catalog.types.find((t) => t.id === type)?.name ?? '')}
-                        </Text>
-                        <Text size="small" color="color.text.subtlest">
-                          Every work item of this type can be selected as a prompt.
-                        </Text>
-                      </Stack>
+                      {!team && (
+                        <Stack space="space.025">
+                          <Text size="small" color="color.text.subtlest">
+                            Prompt work type
+                          </Text>
+                          <Text>
+                            {mode === 'create'
+                              ? `${name.trim()} (new)`
+                              : (catalog.types.find((t) => t.id === type)?.name ?? '')}
+                          </Text>
+                          <Text size="small" color="color.text.subtlest">
+                            Every work item of this type can be selected as a prompt.
+                          </Text>
+                        </Stack>
+                      )}
                       <Stack space="space.025">
                         <Text size="small" color="color.text.subtlest">
                           Reload after saving
@@ -719,9 +846,11 @@ export function ConfigurationDialog({
                       </Stack>
                     </Inline>
                   )}
-                  <Heading as="h3" size="small">
-                    Changes
-                  </Heading>
+                  {!team && (
+                    <Heading as="h3" size="small">
+                      Changes
+                    </Heading>
+                  )}
                   {plans.length > 0 &&
                     pageOf(ids, page).map((id) => {
                       const p = plans.find((p) => p.id === id);
@@ -731,6 +860,10 @@ export function ConfigurationDialog({
                           <Text weight="semibold">{label(id)}</Text>
                           {p?.error ? (
                             <Text color="color.text.danger">{`Blocked: ${p.error}`}</Text>
+                          ) : mode === 'unlink' && p?.value && !removes(p.value) ? (
+                            <Text color="color.text.subtlest">
+                              No setup to remove; this space is left out.
+                            </Text>
                           ) : lines.length ? (
                             lines.map((line, i) => (
                               <Inline key={i} space="space.100" alignBlock="center">
@@ -869,13 +1002,18 @@ export function ConfigurationDialog({
                       </Button>
                     </>
                   )}
+                  {reviewed && !ready && (
+                    <Text>None of the selected spaces has setup to remove.</Text>
+                  )}
                   {ready && (
                     <Text size="small" color="color.text.subtlest">
                       {plans.some((p) => p.value?.old && p.value.old !== p.value.type) &&
                       mode !== 'unlink'
                         ? 'Prompts of the old type stay where they’re already selected but can’t be added again. '
                         : ''}
-                      Nothing else changes: work items, descriptions and workflows stay as they are.
+                      {team
+                        ? `${mode === 'unlink' ? 'Work items keep the prompts already selected on them. ' : ''}Only the app’s own settings change. Nothing in these spaces’ Jira settings changes: fields, layouts, work types and work items stay as they are. `
+                        : 'Nothing else changes: work items, descriptions and workflows stay as they are. '}
                       Spaces are updated one at a time; if something interrupts, you can pick up
                       where it stopped.
                     </Text>
@@ -1048,12 +1186,35 @@ export function ConfigurationDialog({
             isDisabled={busy}
             onClick={() => {
               setPage(0);
-              setStep(step === 3 && mode !== 'unlink' ? 2 : 1);
+              setStep(step === 3 && mode !== 'unlink' && !team ? 2 : 1);
+              // A team-managed space's removal review is not its configuration review.
+              if (team && mode === 'unlink') {
+                setMode('existing');
+                clearReview();
+              }
             }}
           >
             Back
           </Button>
         )}
+        {catalog &&
+          team &&
+          !active &&
+          !uncertain &&
+          !done &&
+          step === 1 &&
+          ids.some((id) => savedPrompt[id]) && (
+            <Button
+              appearance="subtle"
+              isDisabled={busy}
+              onClick={() => {
+                setMode('unlink');
+                goTo(3, 'unlink');
+              }}
+            >
+              Remove setup…
+            </Button>
+          )}
         <Button isDisabled={busy} onClick={() => onClose(attempted)}>
           {done ? 'Done' : active || uncertain ? 'Close' : 'Cancel'}
         </Button>
@@ -1061,21 +1222,54 @@ export function ConfigurationDialog({
           !active &&
           !uncertain &&
           !done &&
-          (step === 1 ? (
+          (team ? (
+            step === 1 && optionsFailed ? (
+              <Button
+                appearance="primary"
+                isDisabled={busy}
+                onClick={() =>
+                  void run(async () => {
+                    await readOptions(ids.filter((id) => !promptOptions[id]));
+                  })
+                }
+              >
+                Read work types again
+              </Button>
+            ) : step === 1 || !plans.length ? (
+              <Button
+                appearance="primary"
+                isDisabled={busy || missingPrompt || ids.some((id) => !promptOptions[id])}
+                onClick={() => goTo(3)}
+              >
+                Review changes
+              </Button>
+            ) : (
+              ready && (
+                <Button
+                  appearance={mode === 'unlink' ? 'danger' : 'primary'}
+                  isDisabled={busy}
+                  onClick={() => void run(apply)}
+                >
+                  {mode === 'unlink' ? 'Remove setup' : 'Save changes'}
+                </Button>
+              )
+            )
+          ) : step === 1 ? (
             <Button
               appearance="primary"
               isDisabled={
                 busy ||
                 !ids.length ||
-                (mode !== 'unlink' && !catalog.typesAvailable) ||
-                (mode === 'existing' ? !type : mode === 'create' ? !name.trim() : false)
+                (mode !== 'unlink' &&
+                  (!catalog.typesAvailable ||
+                    (mode === 'existing' ? !type : mode === 'create' ? !name.trim() : false)))
               }
               onClick={() => goTo(mode === 'unlink' ? 3 : 2)}
             >
               {mode === 'unlink' ? 'Review changes' : 'Next'}
             </Button>
           ) : step === 2 || !plans.length ? (
-            <Button appearance="primary" isDisabled={busy} onClick={() => goTo(3)}>
+            <Button appearance="primary" isDisabled={busy || missingPrompt} onClick={() => goTo(3)}>
               Review changes
             </Button>
           ) : (

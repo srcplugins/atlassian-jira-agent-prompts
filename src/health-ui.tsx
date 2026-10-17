@@ -17,6 +17,10 @@ import {
   ModalTitle,
   Spinner,
   Stack,
+  Tab,
+  TabList,
+  TabPanel,
+  Tabs,
   Text,
   Textfield,
   useProductContext,
@@ -29,6 +33,8 @@ import { Settings, type Health } from './settings-ui';
 import { ConfigurationDialog } from './configuration-dialog';
 import type { InventoryProject, BatchRecord } from './configuration-batch';
 type Result = { id: string; value?: Health; error?: string };
+/** A listed space. A stand-in added before its first check has no known style yet. */
+type Listed = Omit<InventoryProject, 'teamManaged'> & { teamManaged?: boolean };
 function projectStatus(row?: Result) {
   return !row
     ? 'Not checked'
@@ -51,12 +57,25 @@ const selectionLabel = (id: string, text: string) => (
 // Cancellation notification metadata belongs to the response, not stored progress.
 type ProgressResponse = BatchRecord & { cancelledNow?: boolean };
 const priority = ['Needs attention', 'Check failed', 'Not configured', 'Healthy', 'Not checked'];
+type Kind = 'company' | 'team';
+const kindName = { company: 'company-managed', team: 'team-managed' };
+/** The team-managed tab's layout column: the work types whose layout has the field. */
+function layoutCell(value?: Health) {
+  if (!value || !('layouts' in value)) return '—';
+  const on = value.layouts.filter((l) => l.present).map((l) => l.name);
+  return on.length
+    ? on.join(', ')
+    : value.layouts.some((l) => l.present === undefined)
+      ? 'Not known'
+      : 'None';
+}
 export function HealthProjects({ projectId }: { projectId?: string }) {
-  const [projects, setProjects] = useState<InventoryProject[]>([]),
+  const [projects, setProjects] = useState<Listed[]>([]),
     [results, setResults] = useState<Result[]>([]),
     [selected, setSelected] = useState<string[]>([]),
     [query, setQuery] = useState(''),
     [filter, setFilter] = useState('All spaces'),
+    [kind, setKind] = useState<Kind>(),
     [page, setPage] = useState(1),
     [busy, setBusy] = useState(true),
     [error, setError] = useState(''),
@@ -87,6 +106,9 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         {},
       );
       if (!mounted.current) return;
+      // The view opens on the kind of the space it was opened from and stays there until the
+      // administrator picks the other tab, so a check never moves the view under a selection.
+      setKind(inventory.projects.find((p) => p.id === projectId)?.teamManaged ? 'team' : 'company');
       // A partial inventory can miss the space this page was opened from; keep it reachable.
       setProjects(
         projectId && !inventory.projects.some((p) => p.id === projectId)
@@ -136,9 +158,11 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     }
   }
   /** Checks these spaces (at most three reads at a time) and merges each result over any earlier
-   * one for the same space. `counted` drives the "Checking n of m" progress line. */
+   * one for the same space. `counted` drives the "Checking n of m" progress line. A space whose
+   * check shows it is of the other kind than the view shows (a stand-in's kind is not known until
+   * checked) leaves the selection, since one dialog configures one kind; returns those spaces. */
   async function checkHealth(ids: string[], { counted }: { counted: boolean }) {
-    await readSpaces(
+    const read = await readSpaces(
       ids,
       (projectId) => call<Health>('settings-health', { projectId }),
       (updates) => {
@@ -150,7 +174,16 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         ]);
       },
     );
+    const moved = read.flatMap((r) =>
+      r.value && !!r.value.project.teamManaged !== (shown === 'team') ? [r.id] : [],
+    );
+    if (moved.length && mounted.current)
+      setSelected((previous) => previous.filter((id) => !moved.includes(id)));
+    return { read, moved };
   }
+  /** Says that `count` checked spaces of the other kind left the selection. */
+  const leftOut = (count: number) =>
+    `${count === 1 ? '1 space is' : `${count} spaces are`} ${kindName[other]} and ${count === 1 ? 'was' : 'were'} taken out of the selection: ${kindName.company} and ${kindName.team} spaces are configured separately.`;
   async function openDetails(id: string) {
     return latch.run(async () => {
       if (busy) return;
@@ -170,16 +203,16 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
   }
   async function checkSelected() {
     return latch.run(async () => {
-      if (busy || !selected.length) return;
-      const ids = [...selected];
+      if (busy || !chosen.length) return;
+      const ids = [...chosen];
       working(true);
       setChecking(ids);
       setCompleted(0);
       try {
-        await checkHealth(ids, { counted: true });
+        const { moved } = await checkHealth(ids, { counted: true });
         if (mounted.current)
           setChecked(
-            `Last checked ${ids.length} selected ${ids.length === 1 ? 'space' : 'spaces'} at ${new Date().toLocaleTimeString()}`,
+            `Last checked ${ids.length} selected ${ids.length === 1 ? 'space' : 'spaces'} at ${new Date().toLocaleTimeString()}${moved.length ? `. ${leftOut(moved.length)}` : ''}`,
           );
       } finally {
         if (mounted.current) {
@@ -206,10 +239,34 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     return () => clearTimeout(timer);
     // Poll only an explicitly cancelled in-flight operation; never scan space health.
   }, [progress, pollRetry]);
-  const rows = projects.map((p) => ({ ...p, result: results.find((r) => r.id === p.id) }));
-  const filtered = rows.filter(
+  // A check knows the space's style even when the inventory row is a stand-in.
+  const rows = projects.map((p) => {
+    const result = results.find((r) => r.id === p.id);
+    return { ...p, teamManaged: result?.value?.project.teamManaged ?? p.teamManaged, result };
+  });
+  // Company- and team-managed spaces are set up differently, so each kind has its own tab and is
+  // configured on its own. A stand-in whose kind is not known yet is listed as company-managed.
+  const teamCount = rows.filter((p) => p.teamManaged).length;
+  const split = teamCount > 0 && teamCount < rows.length;
+  const shown: Kind = split ? (kind ?? 'company') : teamCount ? 'team' : 'company';
+  const other: Kind = shown === 'team' ? 'company' : 'team';
+  const kindRows = rows.filter((p) => !!p.teamManaged === (shown === 'team'));
+  // Only the shown kind's selected spaces are counted, checked and configured.
+  const chosen = selected.filter((id) => kindRows.some((p) => p.id === id));
+  const matches = (p: { key: string; name: string }) =>
+    `${p.key} ${p.name}`.toLowerCase().includes(query.toLowerCase());
+  const elsewhere = query.trim()
+    ? rows.filter((p) => !!p.teamManaged !== (shown === 'team') && matches(p)).length
+    : 0;
+  const showKind = (next: Kind) => {
+    setKind(next);
+    setSelected([]);
+    setFilter('All spaces');
+    setPage(1);
+  };
+  const filtered = kindRows.filter(
     (p) =>
-      `${p.key} ${p.name}`.toLowerCase().includes(query.toLowerCase()) &&
+      matches(p) &&
       (filter === 'All spaces' ||
         (filter === 'Needs attention' &&
           ['Needs attention', 'Check failed'].includes(projectStatus(p.result))) ||
@@ -237,8 +294,15 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       setChecking(unchecked);
       setCompleted(0);
       try {
-        await checkHealth(unchecked, { counted: true });
-        if (mounted.current) setConfigure(ids);
+        // A space whose kind was unknown can turn out to be the other kind; the check takes it
+        // out of the selection, and the administrator reviews what is left before configuring.
+        const { moved } = await checkHealth(unchecked, { counted: true });
+        if (!mounted.current) return;
+        if (moved.length) {
+          setChecked(`${leftOut(moved.length)} Review the selection, then configure again.`);
+          return;
+        }
+        setConfigure(ids);
       } finally {
         if (mounted.current) {
           setChecking([]);
@@ -247,7 +311,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       }
     });
   }
-  const configureSelected = () => openConfigure([...selected]);
+  const configureSelected = () => openConfigure([...chosen]);
   async function checkAffected(id: string) {
     return latch.run(async () => {
       if (busy) return;
@@ -375,6 +439,36 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           )}
         </SectionMessage>
       ) : null}
+      {split && (
+        <Tabs
+          id="space-kind"
+          selected={shown === 'team' ? 1 : 0}
+          onChange={(index) => {
+            if (!disabled) showKind(index === 1 ? 'team' : 'company');
+          }}
+        >
+          <TabList>
+            <Tab>{`Company-managed (${rows.length - teamCount})`}</Tab>
+            <Tab>{`Team-managed (${teamCount})`}</Tab>
+          </TabList>
+          <TabPanel>
+            <Box paddingBlockStart="space.100">
+              <Text color="color.text.subtle">
+                The app adds the prompt work type and the Agent Prompts field to these spaces’
+                schemes and screens for you.
+              </Text>
+            </Box>
+          </TabPanel>
+          <TabPanel>
+            <Box paddingBlockStart="space.100">
+              <Text color="color.text.subtle">
+                You set these spaces up by hand in Jira. The app only records which of each space’s
+                work types holds prompts.
+              </Text>
+            </Box>
+          </TabPanel>
+        </Tabs>
+      )}
       <Inline space="space.100" shouldWrap>
         {['All spaces', 'Not checked', 'Needs attention', 'Not configured', 'Healthy'].map(
           (label) => (
@@ -390,8 +484,8 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
             >
               {label} (
               {label === 'All spaces'
-                ? projects.length
-                : rows.filter((p) =>
+                ? kindRows.length
+                : kindRows.filter((p) =>
                     label === 'Needs attention'
                       ? ['Needs attention', 'Check failed'].includes(projectStatus(p.result))
                       : projectStatus(p.result) === label,
@@ -413,6 +507,16 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           setPage(1);
         }}
       />
+      {split && elsewhere > 0 && (
+        <Inline space="space.050" alignBlock="center" shouldWrap>
+          <Text color="color.text.subtle">
+            {`${elsewhere} ${elsewhere === 1 ? 'match' : 'matches'} in ${kindName[other]} spaces.`}
+          </Text>
+          <Button appearance="subtle" isDisabled={disabled} onClick={() => showKind(other)}>
+            {`Show ${kindName[other]}`}
+          </Button>
+        </Inline>
+      )}
       <Box role="status">
         <Inline space="space.100" alignBlock="center">
           {busy && !detail && !configure && (
@@ -435,21 +539,21 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         </Text>
       )}
       <Inline space="space.100" shouldWrap>
-        <Text>{selected.length} selected</Text>
+        <Text>{chosen.length} selected</Text>
         <Button
           appearance="primary"
-          isDisabled={disabled || !selected.length}
+          isDisabled={disabled || !chosen.length}
           onClick={() => void checkSelected()}
         >
           Check selected
         </Button>
         <Button
-          isDisabled={disabled || !selected.length || !!error || !!active}
+          isDisabled={disabled || !chosen.length || !!error || !!active}
           onClick={() => void configureSelected()}
         >
           Configure selected
         </Button>
-        <Button isDisabled={disabled || !selected.length} onClick={() => setSelected([])}>
+        <Button isDisabled={disabled || !chosen.length} onClick={() => setSelected([])}>
           Clear selection
         </Button>
       </Inline>
@@ -485,6 +589,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
             { key: 'project', content: 'Space' },
             { key: 'status', content: 'Status' },
             { key: 'type', content: 'Prompt type' },
+            ...(shown === 'team' ? [{ key: 'layouts', content: 'Agent Prompts on layouts' }] : []),
             { key: 'action', content: 'Action' },
           ],
         }}
@@ -516,6 +621,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
                   <Text weight="semibold">{p.name}</Text>
                   <Text>
                     {p.key}
+                    {p.teamManaged && !split ? ' · Team-managed' : ''}
                     {p.id === projectId ? ' · Current space' : ''}
                   </Text>
                 </Stack>
@@ -530,6 +636,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
                 </Text>
               ),
             },
+            ...(shown === 'team' ? [{ content: <Text>{layoutCell(p.result?.value)}</Text> }] : []),
             {
               content: (
                 <Button isDisabled={disabled} onClick={() => void openDetails(p.id)}>
@@ -623,9 +730,17 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       )}
       {configure && (
         <ConfigurationDialog
-          projects={projects.filter((p) => configure.includes(p.id))}
+          projects={rows
+            .filter((p) => configure.includes(p.id))
+            .map((p) => ({ id: p.id, key: p.key, name: p.name, teamManaged: !!p.teamManaged }))}
           inventory={{ projects, incomplete: incomplete || inventoryFailed }}
+          layouts={Object.fromEntries(
+            results.flatMap((r) =>
+              r.value && 'layouts' in r.value ? [[r.id, r.value.layouts]] : [],
+            ),
+          )}
           {...(configure.length === 1 &&
+          !rows.find((p) => p.id === configure[0])?.teamManaged &&
           results.find((r) => r.id === configure[0])?.value?.state.data.type
             ? { initialType: results.find((r) => r.id === configure[0])!.value!.state.data.type! }
             : {})}

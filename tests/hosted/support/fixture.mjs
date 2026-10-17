@@ -10,6 +10,9 @@ import { registerProfile } from '@srcplugins/atlassian-forge-test-framework/jira
 // run journals, including the retained scale journal, keep this name.
 export const agentPromptsFixture = 'native-prompt-links';
 
+/** The named fixture space that is team-managed (prepare-team-managed.mjs). */
+export const teamManagedFixture = 'team-managed';
+
 /** The marker of an empty project created by the setup runner. */
 export const setupRunSpace = (runId, index) =>
   markers.acceptance('setup run', `${runId}/${index}. Empty synthetic space only.`);
@@ -28,6 +31,18 @@ registerProfile('tenant-isolation', {
       throw Error('Explicit owned tenant isolation required');
   },
   missing: 'Marked tenant isolation fixture required; follow second-site acceptance preflight.',
+});
+// The persistent team-managed space on the primary site (prepare-team-managed.mjs).
+registerProfile(teamManagedFixture, {
+  project: () => fixtureProject(teamManagedFixture),
+  marker: () => markers.browserProject(teamManagedFixture),
+  allow: ({ app, host }) => {
+    if (app !== agentPromptsFixture || host !== siteFor('primary'))
+      throw Error('The team-managed fixture is for Agent Prompts on the primary site');
+  },
+  missing:
+    'Marked team-managed space required; run NATIVE_TEAM_MANAGED_PREPARE=1 node tests/hosted/prepare-team-managed.mjs.',
+  style: 'next-gen',
 });
 registerProfile('lifecycle-secondary', {
   project: () => fixtureProject('forge-sandbox'),

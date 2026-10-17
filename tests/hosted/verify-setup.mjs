@@ -70,7 +70,9 @@ assert.equal(
 assert.equal(process.env.NATIVE_SETUP_TESTS, '1', 'Explicit NATIVE_SETUP_TESTS=1 required');
 const directory = `${activeTarget().directory}/native-setup-runs`;
 mkdirSync(directory, { recursive: true });
-const id = mode === 'run' ? randomUUID() : recoveryId;
+// A suite names the run, so it can clean this run up after a failure.
+const id = mode === 'run' ? (process.env.FORGE_TEST_RUN_ID ?? randomUUID()) : recoveryId;
+assert.match(id, /^[0-9a-f-]{36}$/);
 const path = `${directory}/${id}.json`;
 const lock = `${directory}/setup.lock`;
 if (existsSync(lock)) {
@@ -314,12 +316,22 @@ try {
     j.defaultScheme = defaults[0].id;
     j.mappingBaseline = await mappings();
     persist();
+    /** Opens `f`'s space settings page, which lists every space, and checks `f`'s health. */
     async function openConfiguration(f = primary) {
-      await spaceSettings(page, f.key);
-      const search = page.getByRole('textbox', { name: 'Find a space', exact: true });
-      await expect(search).toBeEnabled({ timeout: 60000 });
-      await search.fill(f.key);
-      await page.getByRole('checkbox', { name: `Select ${f.key}`, exact: true }).click();
+      // Jira can fail the space list's read (HTTP 5xx). The page writes nothing on load, so it is
+      // loaded again; after two reloads a failure stands.
+      const select = page.getByRole('checkbox', { name: `Select ${f.key}`, exact: true });
+      const failed = page.getByText(/^Jira request failed \(HTTP 5\d\d\)/);
+      for (let attempt = 0; ; attempt++) {
+        await spaceSettings(page, f.key);
+        const search = page.getByRole('textbox', { name: 'Find a space', exact: true });
+        await expect(search).toBeEnabled({ timeout: 60000 });
+        await search.fill(f.key);
+        await expect(select.or(failed).first()).toBeVisible();
+        if (attempt === 2 || !(await failed.isVisible())) break;
+        await page.waitForTimeout(5000);
+      }
+      await select.click();
       const health = await observeAction(
         page,
         'settings-health',
@@ -1343,6 +1355,11 @@ try {
     error instanceof Error ? error.stack : 'Unknown failure',
     { mode: 0o600 },
   );
+  const pages = browser?.contexts().flatMap((context) => context.pages()) ?? [];
+  for (const [index, page] of pages.entries())
+    await page
+      .screenshot({ path: `${directory}/${id}-failure-${index}.png`, fullPage: true })
+      .catch(() => {});
   j.failedAt = j.stage;
   persist();
   console.error(

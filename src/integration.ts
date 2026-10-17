@@ -18,9 +18,10 @@ import {
   JiraHttpError,
   isDefinitiveRejection,
   projectContext,
-  requireCompanyManagedSoftware,
+  readWithRetries,
   requireEmptyPayload,
   requireProjectKey,
+  requireSoftwareSpace,
   rovoAccountId,
 } from './shared/jira.mjs';
 import {
@@ -104,7 +105,22 @@ async function readState<T>(kvs: Sdk['kvs'], key: string) {
   }
 }
 function requester({ api }: Sdk) {
-  async function request(path: ReturnType<Sdk['route']>, method = 'GET', body?: unknown) {
+  /** A read (GET, or `read` for a read-only POST such as search) is tried up to three times when
+   * Jira is briefly unavailable; a write is sent once. */
+  async function request(
+    path: ReturnType<Sdk['route']>,
+    method = 'GET',
+    body?: unknown,
+    read = method === 'GET',
+  ) {
+    if (!read) return send(path, method, body);
+    return readWithRetries(
+      () => send(path, method, body),
+      (error) =>
+        error instanceof JiraUnavailable || (error instanceof JiraHttpError && error.status >= 500),
+    );
+  }
+  async function send(path: ReturnType<Sdk['route']>, method: string, body?: unknown) {
     let response;
     try {
       response = await api.asUser().requestJira(path, {
@@ -206,12 +222,17 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
             : '';
         let value;
         try {
-          value = await request(route`/rest/api/3/search/jql`, 'POST', {
-            jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)}${clause} ORDER BY created DESC, key DESC`,
-            fields: ['summary', 'project', 'issuetype'],
-            maxResults: input.limit,
-            ...(input.cursor ? { nextPageToken: input.cursor } : {}),
-          });
+          value = await request(
+            route`/rest/api/3/search/jql`,
+            'POST',
+            {
+              jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)}${clause} ORDER BY created DESC, key DESC`,
+              fields: ['summary', 'project', 'issuetype'],
+              maxResults: input.limit,
+              ...(input.cursor ? { nextPageToken: input.cursor } : {}),
+            },
+            true,
+          );
         } catch (error) {
           // Jira answers 400 for an exact key that does not exist or is not visible, and for
           // text it cannot parse. Either way nothing matches; it is not an access failure.
@@ -256,12 +277,17 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
       const seen = new Set<string>();
       let token: string | undefined;
       for (let page = 0; page < 3; page++) {
-        const value = await request(route`/rest/api/3/search/jql`, 'POST', {
-          jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)} ORDER BY key ASC`,
-          fields: ['summary'],
-          maxResults: 100,
-          ...(token ? { nextPageToken: token } : {}),
-        });
+        const value = await request(
+          route`/rest/api/3/search/jql`,
+          'POST',
+          {
+            jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)} ORDER BY key ASC`,
+            fields: ['summary'],
+            maxResults: 100,
+            ...(token ? { nextPageToken: token } : {}),
+          },
+          true,
+        );
         if (!Array.isArray(value?.issues) || typeof value.isLast !== 'boolean')
           throw new UserError('Incomplete Jira search data.');
         for (const issue of value.issues) {
@@ -858,8 +884,8 @@ export function createBatchPorts(
       const projects: InventoryProject[] = [];
       const seen = new Set<string>();
       let start = 0;
-      // Team-managed spaces are fetched and discarded, so stay well inside the resolver's
-      // 25-second limit and report a partial inventory instead of timing out.
+      // Stay well inside the resolver's 25-second limit and report a partial inventory instead
+      // of timing out.
       const deadline = Date.now() + 15_000;
       for (let page = 0; page < 20; page++) {
         if (page && Date.now() > deadline) return { projects, incomplete: true };
@@ -892,7 +918,12 @@ export function createBatchPorts(
               'Space inventory changed or has an unsupported shape. Reload before choosing spaces.',
             );
           seen.add(id);
-          if (item.style === 'classic') projects.push({ id, key: item.key, name: item.name });
+          projects.push({
+            id,
+            key: item.key,
+            name: item.name,
+            teamManaged: item.style === 'next-gen',
+          });
         }
         if (projects.length > 200) return { projects: projects.slice(0, 200), incomplete: true };
         if (value.isLast) return { projects, incomplete: false };
@@ -1046,8 +1077,9 @@ export function registerResolvers(sdk: Sdk) {
                   !record(e) ||
                   typeof e.projectId !== 'string' ||
                   typeof e.fingerprint !== 'string' ||
+                  (e.type !== undefined && typeof e.type !== 'string') ||
                   Object.keys(e).some(
-                    (k) => !['projectId', 'fingerprint', 'screenTypes'].includes(k),
+                    (k) => !['projectId', 'fingerprint', 'screenTypes', 'type'].includes(k),
                   ),
               )
             )
@@ -1061,6 +1093,7 @@ export function registerResolvers(sdk: Sdk) {
                 ...(e.screenTypes !== undefined
                   ? { screenTypes: screenTypesInput(e.screenTypes)! }
                   : {}),
+                ...(typeof e.type === 'string' ? { type: e.type } : {}),
               })),
               Number(payload.revision),
             );
@@ -1228,8 +1261,8 @@ export function registerRovo(sdk: Sdk) {
           if (error instanceof JiraHttpError) throw new UserError('Space is unavailable.');
           throw error;
         }
-        const checked = requireCompanyManagedSoftware(project, projectKey) as { id: unknown };
-        const c = { accountId, projectId: numeric(String(checked.id)) };
+        requireSoftwareSpace(project, projectKey);
+        const c = { accountId, projectId: numeric(String((project as { id: unknown }).id)) };
         if (promptKey) return service.read(c, promptKey);
         const result = await service.search(c, { query: input.query as string }, 20);
         return { prompts: result.prompts, incomplete: result.incomplete };

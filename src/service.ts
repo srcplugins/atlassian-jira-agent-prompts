@@ -11,7 +11,7 @@ import {
   type ManagedBlock,
 } from './description';
 export { hash };
-import { UserError, requireCompanyManagedSoftware } from './shared/jira.mjs';
+import { UserError, requireSoftwareSpace } from './shared/jira.mjs';
 export { UserError };
 /** The request never got an HTTP response from Jira. */
 export class JiraUnavailable extends UserError {}
@@ -135,7 +135,7 @@ export interface Ports {
     key: string;
     projectTypeKey: string;
     style: string;
-    issueTypes: { id: string; name: string; subtask: boolean }[];
+    issueTypes: { id: string; name: string; subtask: boolean; hierarchyLevel?: number }[];
   }>;
   allowed(project: string, permission: 'ADMINISTER' | 'EDIT_ISSUES', issue?: string): Promise<void>;
   search(project: string, type: string, input?: PromptQuery): Promise<PromptPage>;
@@ -352,7 +352,7 @@ export function createService(p: Ports) {
     },
     async setup(c: Context) {
       const project = await p.project(c.projectId);
-      requireCompanyManagedSoftware(project, c.projectId);
+      requireSoftwareSpace(project, c.projectId);
       return { project, type: await p.config(c.projectId) };
     },
     /** Ten results per picker page; Rovo's assistant asks for twenty. */

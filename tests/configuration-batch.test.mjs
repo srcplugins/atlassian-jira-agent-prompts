@@ -871,3 +871,137 @@ test('the reload choice keeps each space’s preference or sets it for every sel
     assert.deepEqual(f.writes, []);
   }
 });
+
+/** Makes `ids` team-managed spaces with their own work types; their schemes are never read. */
+function teamSpaces(f, ids) {
+  for (const id of ids)
+    Object.assign(f.projects.get(id), {
+      style: 'next-gen',
+      issueTypes: [
+        { id: `${id}0`, name: 'Prompt', subtask: false, hierarchyLevel: 0 },
+        { id: `${id}1`, name: 'Task', subtask: false, hierarchyLevel: 0 },
+      ],
+    });
+  const scheme = f.s.scheme;
+  f.s.scheme = async (id) => {
+    assert.ok(!ids.includes(id), 'a team-managed space has no scheme to read');
+    return scheme(id);
+  };
+}
+async function finish(f, r) {
+  while (r.data.status === 'ready') r = await f.api.advance('admin', r.data.id, r.revision);
+  return r;
+}
+test('a run holds one kind of space: mixed entries are refused before any storage write', async () => {
+  const f = fixture(['1', '7']);
+  teamSpaces(f, ['7']);
+  const entries = [
+    {
+      projectId: '1',
+      fingerprint: (await f.api.preview('admin', '1', { name: 'Prompt', reloadAfterSave: 'keep' }))
+        .fingerprint,
+    },
+    {
+      projectId: '7',
+      fingerprint: (await f.api.preview('admin', '7', { type: '70', reloadAfterSave: 'keep' }))
+        .fingerprint,
+      type: '70',
+    },
+  ];
+  for (const input of [{ name: 'Prompt', reloadAfterSave: 'keep' }, { reloadAfterSave: 'keep' }])
+    await assert.rejects(
+      f.api.start('admin', input, entries, 0),
+      /^Error: Configure company-managed and team-managed spaces separately\.$/,
+    );
+  assert.equal(await f.api.status(), null);
+  assert.deepEqual(f.writes, []);
+});
+test('a company-managed space named with its own type stops the run before any Jira write', async () => {
+  // Jira lists a global type on a company-managed space's scheme, so a review of it as the
+  // space's "own" type passes; the run must still never take that space as team-managed.
+  const f = fixture(['1']);
+  f.types.push({ id: '4', name: 'Runbook', subtask: false, hierarchyLevel: 0 });
+  const input = { type: '4', reloadAfterSave: 'keep' };
+  const { fingerprint } = await f.api.preview('admin', '1', input);
+  const r = await f.api.start(
+    'admin',
+    { reloadAfterSave: 'keep' },
+    [{ projectId: '1', fingerprint, type: '4' }],
+    0,
+  );
+  await refused(f, r, /A company-managed space uses the run’s prompt work type/);
+  assert.equal(f.configs.has('1'), false);
+});
+test('an uncertain storage write for a team-managed space says nothing in Jira changed', async () => {
+  const f = fixture(['7']);
+  teamSpaces(f, ['7']);
+  const input = { type: '70', reloadAfterSave: 'keep' };
+  const { fingerprint } = await f.api.preview('admin', '7', input);
+  let r = await f.api.start(
+    'admin',
+    { reloadAfterSave: 'keep' },
+    [{ projectId: '7', fingerprint, type: '70' }],
+    0,
+  );
+  // The storage adapter reports a failed or lost transaction as a plain UserError.
+  const cas = f.s.cas;
+  f.s.cas = async () => {
+    f.s.cas = cas;
+    throw new UserError('Configuration changed or storage is unavailable. Check the space again.');
+  };
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'attention');
+  assert.equal(
+    r.data.message,
+    'This space’s saved setup may not have been updated; nothing in Jira was changed. Configuration changed or storage is unavailable. Check the space again.',
+  );
+  assert.doesNotMatch(r.data.message, /partially/);
+  assert.deepEqual(f.writes, []);
+});
+test('a team-managed-only run names no type of its own and writes only app storage', async () => {
+  const f = fixture(['7', '8']);
+  teamSpaces(f, ['7', '8']);
+  const own = (type) => ({ type, reloadAfterSave: 'on' });
+  const entries = [];
+  for (const [id, type] of [
+    ['7', '70'],
+    ['8', '81'],
+  ])
+    entries.push({
+      projectId: id,
+      fingerprint: (await f.api.preview('admin', id, own(type))).fingerprint,
+      type,
+    });
+  await assert.rejects(
+    f.api.start('admin', { type: '5', reloadAfterSave: 'on' }, entries, 0),
+    /Team-managed spaces use their own work types/,
+  );
+  await assert.rejects(
+    f.api.start('admin', { reloadAfterSave: 'on' }, [{ ...entries[0], screenTypes: ['71'] }], 0),
+    /names only its own prompt work type/,
+  );
+  const r = await finish(f, await f.api.start('admin', { reloadAfterSave: 'on' }, entries, 0));
+  assert.equal(r.data.status, 'complete');
+  assert.equal(r.data.type, undefined);
+  assert.deepEqual(f.configs.get('7').data, {
+    type: '70',
+    previousTypes: [],
+    refreshAfterSave: true,
+  });
+  assert.equal(f.configs.get('8').data.type, '81');
+  assert.deepEqual(f.writes, []);
+});
+test('a team-managed space whose saved entry names another type stops the run unchanged', async () => {
+  const f = fixture(['7']);
+  teamSpaces(f, ['7']);
+  const fingerprint = (await f.api.preview('admin', '7', { type: '70', reloadAfterSave: 'keep' }))
+    .fingerprint;
+  const r = await f.api.start(
+    'admin',
+    { reloadAfterSave: 'keep' },
+    [{ projectId: '7', fingerprint, type: '71' }],
+    0,
+  );
+  await refused(f, r, /changed after review/);
+  assert.equal(f.configs.has('7'), false);
+});

@@ -6,7 +6,8 @@ const trusted = { principal: { accountId: 'trusted' } };
 
 /**
  * Contract every Rovo read action must meet: identity and target validation happen before any
- * Jira request; denied, malformed and transient failures are redacted and never retried.
+ * Jira request; failures are redacted; a refusal or unreadable body is final, while a transport
+ * failure or 5xx is tried again up to twice, since a read changes nothing.
  * @param {(sdk: ReturnType<typeof forgeContract>) => (payload: unknown, context: unknown) => Promise<{ ok: boolean }>} createAction
  * @param {Record<string, string>} input One valid target, such as `{ projectKey: 'TEST' }`.
  */
@@ -28,19 +29,23 @@ export async function assertRovoReadContract(createAction, input) {
     assert.equal(result.ok, false, `${key} ${JSON.stringify(value)} must be rejected`);
     assert.equal(sdk.calls.length, 0);
   }
-  for (const failure of [
-    { status: 403 },
-    { status: 404 },
-    { status: 429 },
-    { status: 500 },
-    { invalidJson: true },
-    new Error('private header secret'),
+  for (const [failure, tries] of [
+    [{ status: 403 }, 1],
+    [{ status: 404 }, 1],
+    [{ status: 429 }, 1],
+    [{ status: 500 }, 3],
+    [{ invalidJson: true }, 1],
+    [new Error('private header secret'), 3],
   ]) {
-    const sdk = forgeContract(failure);
+    const sdk = forgeContract(failure, failure, failure);
     const result = await createAction(sdk)(input, trusted);
     assert.equal(result.ok, false);
     assert.doesNotMatch(JSON.stringify(result), /private/);
-    assert.equal(sdk.calls.length, 1, 'failures must not be retried');
+    assert.equal(
+      sdk.calls.length,
+      tries,
+      tries === 1 ? 'a refusal must not be retried' : 'a transient failure is read three times',
+    );
   }
 }
 
