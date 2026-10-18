@@ -13,6 +13,10 @@ function fixture({
   firstLoadFails,
   failLoads = [],
   saveStatus = { pending: false },
+  prompts = [
+    { id: '1', key: 'TEST-1', name: 'Saved' },
+    { id: '2', key: 'TEST-2', name: 'Draft' },
+  ],
 } = {}) {
   const calls = [];
   let loads = 0;
@@ -49,13 +53,7 @@ function fixture({
     if (firstLoadFails && loads === 1) throw Error(firstLoadFails);
     return {
       ids: committed && loads > 1 ? ['1', '2'] : ['1'],
-      prompts:
-        disappear && loads > 1
-          ? []
-          : [
-              { id: '1', key: 'TEST-1', name: 'Saved' },
-              { id: '2', key: 'TEST-2', name: 'Draft' },
-            ],
+      prompts: disappear && loads > 1 ? [] : prompts,
       revision: loads,
       fingerprint: `v${loads}`,
       incomplete: false,
@@ -123,12 +121,12 @@ test('an empty space and an unmatched search each show one accurate message', as
   const f = fixture();
   await f.mount();
   f.results([]);
-  assert.match(f.text(), /No prompts in this space yet\./);
+  assert.match(f.text(), /No available prompts in this space yet\./);
   assert.doesNotMatch(f.text(), /No matching prompts|Newest prompts/);
   f.nodes('Select')[0].props.onInputChange('review', { action: 'input-change' });
   f.results([]);
   assert.match(f.text(), /No matching prompts/);
-  assert.doesNotMatch(f.text(), /No prompts in this space yet|Newest prompts/);
+  assert.doesNotMatch(f.text(), /No available prompts in this space yet|Newest prompts/);
 });
 test('failed discovery shows retry while preserving selected prompts and explicit removal', async () => {
   const f = fixture({ success: true, searchError: 'Could not load prompt suggestions.' });
@@ -178,9 +176,91 @@ test('recovery keeps unavailable draft choices visible instead of passing undefi
   f.select(['1', '2']);
   await f.click('Save');
   assert.deepEqual(f.selected(), ['1', '2']);
-  assert.ok(
-    f.nodes('Select')[0].props.value.every((v) => v.label.startsWith('Unavailable prompt')),
+  // The reload resolves the saved prompt and no longer finds it; the draft choice was never
+  // read again, so it keeps the label it was picked with.
+  assert.deepEqual(
+    Array.from(f.nodes('Select')[0].props.value, (v) => v.label),
+    ['Unavailable prompt (1)', 'TEST-2 — Draft'],
   );
+});
+test('a failed save keeps the labels of draft choices found by an earlier search', async () => {
+  const f = fixture();
+  await f.mount();
+  f.results([{ id: '3', key: 'TEST-3', name: 'Older result' }]);
+  f.select(['1', '3']);
+  await f.click('Save');
+  assert.deepEqual(f.selected(), ['1', '3']);
+  assert.deepEqual(
+    Array.from(f.nodes('Select')[0].props.value, (v) => v.label),
+    ['TEST-1 — Saved', 'TEST-3 — Older result'],
+  );
+});
+test('a recovery check keeps the labels of draft choices found by an earlier search', async () => {
+  const f = fixture({ loadFails: true });
+  await f.mount();
+  f.results([{ id: '3', key: 'TEST-3', name: 'Older result' }]);
+  f.select(['1', '3']);
+  await f.click('Save');
+  assert.equal(f.nodes('SaveRecovery').length, 1);
+  await f.recover();
+  assert.deepEqual(f.selected(), ['1', '3']);
+  assert.deepEqual(
+    Array.from(f.nodes('Select')[0].props.value, (v) => v.label),
+    ['TEST-1 — Saved', 'TEST-3 — Older result'],
+  );
+});
+test('an unverified save points at Check saved state, not at reopening the field', async () => {
+  const f = fixture({ loadFails: true });
+  await f.mount();
+  f.select(['1', '2']);
+  await f.click('Save');
+  assert.equal(f.nodes('SaveRecovery').length, 1);
+  assert.match(f.text(), /Could not verify the save\. Use Check saved state before saving again\./);
+  assert.doesNotMatch(f.text(), /Reopen this field/);
+});
+test('a menu whose suggestions are all selected says so instead of saying the space has none', async () => {
+  const f = fixture({ prompts: [{ id: '1', key: 'TEST-1', name: 'Saved' }] });
+  await f.mount();
+  // A multi Select hides selected options, so the only suggestion leaves the menu empty.
+  assert.deepEqual(f.selected(), ['1']);
+  assert.equal(
+    f.nodes('Select')[0].props.noOptionsMessage(),
+    'All suggested prompts are selected. Search to find others.',
+  );
+  assert.doesNotMatch(f.text(), /No available prompts/);
+  f.results([]);
+  assert.equal(
+    f.nodes('Select')[0].props.noOptionsMessage(),
+    'No available prompts in this space yet.',
+  );
+});
+test('the search status region is mounted empty before the first load answers', async () => {
+  const f = fixture({ searchError: 'Could not load prompt suggestions.' });
+  const regions = () => f.nodes('p').filter((p) => p.props.role === 'status');
+  const said = (region) => [region.props.children].flat().join('');
+  // First render: the load has not answered yet.
+  assert.deepEqual(regions().map(said), ['', '']);
+  await f.mount();
+  assert.deepEqual(regions().map(said), ['Could not load prompt suggestions.', '']);
+});
+
+test('a retired prompt stays selected with its label and is not offered once a save removes it', async () => {
+  const f = fixture({
+    success: true,
+    prompts: [
+      { id: '1', key: 'TEST-1', name: 'Saved (retired)', selectedOnly: true },
+      { id: '2', key: 'TEST-2', name: 'Draft' },
+    ],
+  });
+  await f.mount();
+  const offered = () => Array.from(f.nodes('Select')[0].props.options, (o) => o.value);
+  assert.deepEqual(f.selected(), ['1']);
+  assert.equal(f.nodes('Select')[0].props.value[0].label, 'TEST-1 — Saved (retired)');
+  assert.deepEqual(offered(), ['1', '2']);
+  f.select([]);
+  await f.click('Save');
+  assert.deepEqual(Array.from(f.calls.find((c) => c.name === 'save').payload.ids), []);
+  assert.deepEqual(offered(), ['2']);
 });
 
 test('Sync sends saved IDs without changing selection; unsaved choices disable it', async () => {
@@ -237,7 +317,10 @@ test('the open menu says why it is empty: failed discovery, no match or no promp
   const f = fixture();
   await f.mount();
   f.results([]);
-  assert.equal(f.nodes('Select')[0].props.noOptionsMessage(), 'No prompts in this space yet.');
+  assert.equal(
+    f.nodes('Select')[0].props.noOptionsMessage(),
+    'No available prompts in this space yet.',
+  );
   f.nodes('Select')[0].props.onInputChange('review', { action: 'input-change' });
   assert.equal(f.nodes('Select')[0].props.noOptionsMessage(), 'No matching prompts');
 });

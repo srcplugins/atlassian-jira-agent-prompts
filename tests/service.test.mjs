@@ -124,6 +124,46 @@ test('concurrent saves claim the target once', async () => {
   assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
   assert.equal(f.calls(), 1);
 });
+test('a Sync that a concurrent reader settled first is reported as a success', async () => {
+  const f = fixture();
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
+  f.source.fields.description = sourceDoc('Updated instructions');
+  // Another viewer opens the field right after the Sync lands in Jira, before the saver settles.
+  const update = f.ports.update;
+  f.ports.update = async (...args) => {
+    f.ports.update = update;
+    await update(...args);
+    await f.service.load({ ...c, accountId: 'viewer' });
+  };
+  const loaded = await f.service.load(c);
+  const synced = await f.service.save(c, { ...loaded, ids: ['20'] });
+  assert.match(JSON.stringify(f.target.fields.description), /Updated instructions/);
+  const stored = await f.ports.get('10');
+  assert.equal(stored.data.pending, undefined);
+  assert.deepEqual(stored.data.ids, ['20']);
+  // The reply carries the record's revision, so the next save is not refused as stale.
+  assert.equal(synced.revision, stored.revision);
+  const next = await f.service.load(c);
+  assert.equal(next.revision, synced.revision);
+  assert.equal(next.fingerprint, synced.fingerprint);
+});
+test('a lost settle race against a different record still fails', async () => {
+  const f = fixture();
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
+  f.source.fields.description = sourceDoc('Updated instructions');
+  // Storage moves on to an unrelated record between the Jira write and the saver's settle.
+  const cas = f.ports.cas;
+  let writes = 0;
+  f.ports.cas = async (id, revision, data) => {
+    if (++writes === 3) {
+      await cas(id, revision, { ids: [], managed: null });
+      throw Error('conflict');
+    }
+    return cas(id, revision, data);
+  };
+  const loaded = await f.service.load(c);
+  await assert.rejects(f.service.save(c, { ...loaded, ids: ['20'] }), /conflict/);
+});
 test('source text is bounded and refuses embedded cards', () => {
   assert.throws(() => sourceContent(doc('x'.repeat(4001))), /4000/);
   assert.throws(
@@ -201,6 +241,39 @@ test('selected current-type prompts outside search results retain their visible 
     assert.deepEqual(value.prompts, [{ id: '20', key: 'TEST-20', name: 'Review' }]);
     assert.equal(value.incomplete, true);
   }
+});
+
+test('a retired selected prompt stays selected with its label, and Sync still copies it', async () => {
+  const f = fixture();
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
+  // Search leaves out prompts in a Done-category status, so load reads the selection by ID.
+  f.ports.search = async () => ({ prompts: [], incomplete: false });
+  for (const key of ['new', 'indeterminate', undefined]) {
+    f.source.fields.status = key ? { statusCategory: { key } } : undefined;
+    assert.deepEqual(
+      (await f.service.load(c)).prompts,
+      [{ id: '20', key: 'TEST-20', name: 'Review' }],
+      String(key),
+    );
+  }
+  f.source.fields.status = { id: '10001', statusCategory: { key: 'done' } };
+  let loaded = await f.service.load(c);
+  assert.deepEqual(loaded.prompts, [
+    { id: '20', key: 'TEST-20', name: 'Review (retired)', selectedOnly: true },
+  ]);
+  f.source.fields.description = sourceDoc('Check errors twice');
+  f.source.fields.updated = '2';
+  const writes = f.calls();
+  await f.service.save(c, loaded);
+  assert.equal(f.calls(), writes + 1);
+  assert.match(JSON.stringify(f.target.fields.description), /Check errors twice/);
+  // A prompt of a previous type is labelled by its type alone, retired or not.
+  f.ports.config = async () => '4';
+  f.ports.retainedTypes = async () => ['3'];
+  loaded = await f.service.load(c);
+  assert.deepEqual(loaded.prompts, [
+    { id: '20', key: 'TEST-20', name: 'Review (previous type)', selectedOnly: true },
+  ]);
 });
 
 test('selected hidden or moved sources remain removable without exposing metadata', async () => {
@@ -495,7 +568,8 @@ test('the Space settings page opens in company-managed and team-managed Software
   ]) {
     f.ports.project = async () => ({ id: '1', key: 'TEST', style, projectTypeKey, issueTypes: [] });
     const service = createService(f.ports);
-    if (ok) assert.equal((await service.setup(c)).type, '3');
+    // The page needs only the space; it reads no prompt type or other setup.
+    if (ok) assert.deepEqual(Object.keys(await service.setup(c)), ['project']);
     else await assert.rejects(service.setup(c), /^Error: Jira software spaces only\.$/);
   }
 });

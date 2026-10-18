@@ -36,9 +36,9 @@ const notAppText = new Map([
     'review change line; the screen name is a template literal',
   ],
   ["'Agent Prompts added'", 'shared screen effect; the field name is computed'],
-  ['/^Blocked: /', 'review result; the reason is a template literal'],
+  ['/^(Blocked|Could not be reviewed): /', 'review result; the reason is a template literal'],
   [
-    '/^Blocked: Jira request failed \\(HTTP 5\\d\\d\\)/',
+    '/^Could not be reviewed: Jira request failed \\(HTTP 5\\d\\d\\)/',
     'review result; JiraError in src/shared/jira.mjs fills in the status',
   ],
   ['/^\\d+ of 20 screen changes made$/', 'computed step progress'],
@@ -95,4 +95,17 @@ test('hosted runners assert with the shared expect timeout', () => {
       ),
     );
   assert.deepEqual(direct, [], 'Import expect from tests/hosted/support/expect.mjs');
+});
+
+// Playwright's toPass() has no time limit unless given one, so a retry that can't succeed hangs a
+// runner instead of failing it. Every toPass in tests/hosted names its own timeout.
+test('hosted retries name their own timeout', () => {
+  const unbounded = files('tests/hosted')
+    .filter((path) => path.endsWith('.mjs'))
+    .flatMap((path) =>
+      [...readFileSync(path, 'utf8').matchAll(/\.toPass\(([^)]*)\)/g)]
+        .filter(([, options]) => !/\btimeout\s*:/.test(options))
+        .map(() => path),
+    );
+  assert.deepEqual(unbounded, [], 'Pass { timeout } to every toPass()');
 });

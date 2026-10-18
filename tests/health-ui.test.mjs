@@ -593,6 +593,19 @@ test('a stand-in that View details shows is team-managed never reaches the compa
     ['2', false],
   ]);
 });
+test('a stand-in that View details shows is team-managed says why it left the selection', async () => {
+  const f = standInFixture();
+  await f.mount();
+  f.check('Select PR1', true);
+  f.check('Select 500', true);
+  assert.match(f.text(), /2 selected/);
+  await f.details('500');
+  assert.match(f.text(), /1 selected/);
+  assert.match(
+    f.text(),
+    /^1 space is team-managed and was taken out of the selection: company-managed and team-managed spaces are configured separately\.$/m,
+  );
+});
 test('select all on the Company-managed tab, then a check that moves the stand-in, configures one kind', async () => {
   const f = standInFixture({ team: ['10', '11'] });
   await f.mount();

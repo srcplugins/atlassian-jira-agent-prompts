@@ -30,7 +30,8 @@ registerProfile('tenant-isolation', {
     )
       throw Error('Explicit owned tenant isolation required');
   },
-  missing: 'Marked tenant isolation fixture required; follow second-site acceptance preflight.',
+  missing:
+    'Marked tenant isolation fixture required: a marked space with the same key on the primary and the isolation site, named tenant-isolation in the forge-test configuration.',
 });
 // The persistent team-managed space on the primary site (prepare-team-managed.mjs).
 registerProfile(teamManagedFixture, {
@@ -44,6 +45,8 @@ registerProfile(teamManagedFixture, {
     'Marked team-managed space required; run NATIVE_TEAM_MANAGED_PREPARE=1 node tests/hosted/prepare-team-managed.mjs.',
   style: 'next-gen',
 });
+// A second disposable fixture space on the isolation site. Its configured name and on-site marker
+// are forge-sandbox, so the name stays.
 registerProfile('lifecycle-secondary', {
   project: () => fixtureProject('forge-sandbox'),
   marker: () => markers.browserProject('forge-sandbox'),

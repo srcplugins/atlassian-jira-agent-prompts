@@ -55,7 +55,7 @@ function fixture() {
       target.fields.updated += '1';
     },
   };
-  return { ports, service: createService(ports), target, writes: () => writes };
+  return { ports, service: createService(ports), target, source, writes: () => writes };
 }
 function failDiscovery(f) {
   f.ports.search = async () => {
@@ -78,6 +78,18 @@ test('failed discovery retains saved selection metadata and permits explicit rem
   assert.equal(f.writes(), 2);
   assert.deepEqual(f.target.fields.customfield_1, []);
   assert.deepEqual(f.target.fields.description, doc('Keep this'));
+});
+
+test('failed discovery still labels a retired selected prompt', async () => {
+  const f = fixture();
+  await f.service.save(context, { ...(await f.service.load(context)), ids: ['20'] });
+  failDiscovery(f);
+  f.source.fields.status = { statusCategory: { key: 'done' } };
+  const current = await f.service.load(context);
+  assert.ok(current.searchError);
+  assert.deepEqual(current.prompts, [
+    { id: '20', key: 'TEST-20', name: 'Review (retired)', selectedOnly: true },
+  ]);
 });
 
 test('failed discovery and inaccessible selected source still permit removal without revealing metadata', async () => {

@@ -39,6 +39,7 @@ import {
   type Stored,
 } from './service';
 import { DescriptionError } from './description';
+import { storageEntity } from './names';
 interface Sdk {
   Resolver: typeof import('@forge/resolver').default;
   api: typeof import('@forge/api').default;
@@ -99,7 +100,7 @@ function context(raw: unknown): Context {
  * so callers can tell an outage from a defect. */
 async function readState<T>(kvs: Sdk['kvs'], key: string) {
   try {
-    return await kvs.entity<T>('native-prompt-state').get(key);
+    return await kvs.entity<T>(storageEntity).get(key);
   } catch {
     throw new StorageUnavailable('App storage is unavailable. Try again shortly.');
   }
@@ -197,124 +198,99 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
       return fieldPromise;
     },
     search: async (project, type, input) => {
-      if (input) {
-        const query = input.query?.trim() ?? '';
-        // Treat input as text, never as executable JQL/Lucene syntax. Exact work item keys
-        // use Jira's key lookup; words use ANDed, escaped prefix terms in Summary.
-        const key = /^[A-Z][A-Z0-9_]*-[1-9]\d*$/i.test(query);
-        const tokens = (query.match(/[\p{L}\p{N}_]+/gu) ?? []).map((word) => word.toLowerCase());
-        if (query && !key && !tokens.length) return { prompts: [], incomplete: false };
-        // Jira does not index stop words and treats operator words specially: alone they match
-        // everything, but inside a multi-word query their clause matches nothing. Drop them; a
-        // query of only such words lists the newest prompts, as Jira's own search does.
-        const words = tokens.filter((word) => !reservedWords.has(word));
-        // One text clause per word, ANDed in JQL. The prefix matches a word as typed; the bare
-        // word matches Jira's stemmed index, where "tests*" misses a stored "test".
-        const clause = key
-          ? ` AND key = ${JSON.stringify(query.toUpperCase())}`
-          : words.length
-            ? ` AND ${words
-                .map(
-                  (word) =>
-                    `(summary ~ ${JSON.stringify(`${word}*`)} OR summary ~ ${JSON.stringify(word)})`,
-                )
-                .join(' AND ')}`
-            : '';
-        let value;
-        try {
-          value = await request(
-            route`/rest/api/3/search/jql`,
-            'POST',
-            {
-              jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)}${clause} ORDER BY created DESC, key DESC`,
-              fields: ['summary', 'project', 'issuetype'],
-              maxResults: input.limit,
-              ...(input.cursor ? { nextPageToken: input.cursor } : {}),
-            },
-            true,
-          );
-        } catch (error) {
-          // Jira answers 400 for an exact key that does not exist or is not visible, and for
-          // text it cannot parse. Either way nothing matches; it is not an access failure.
-          // A follow-up page (expired or invalid cursor) is a failed page, never the end of results.
-          if (query && !input.cursor && error instanceof JiraHttpError && error.status === 400)
-            return { prompts: [], incomplete: false };
-          throw error;
-        }
-        if (
-          !Array.isArray(value?.issues) ||
-          typeof value.isLast !== 'boolean' ||
-          value.issues.length > input.limit
-        )
-          throw new UserError('Incomplete Jira search data. Search again.');
-        const prompts: Prompt[] = value.issues.map((issue: Issue) => {
-          if (
-            typeof issue?.key !== 'string' ||
-            typeof issue.fields?.summary !== 'string' ||
-            issue.fields.project?.id !== project ||
-            issue.fields.issuetype?.id !== type
-          )
-            throw new UserError('Prompt search scope changed. Search again.');
-          return { id: numeric(issue.id), key: issue.key, name: issue.fields.summary };
-        });
-        if (new Set(prompts.map((p) => p.id)).size !== prompts.length)
-          throw new UserError('Jira returned repeated search results. Search again.');
-        if (
-          !value.isLast &&
-          (typeof value.nextPageToken !== 'string' ||
-            !value.nextPageToken ||
-            value.nextPageToken.length > 8192 ||
-            value.nextPageToken === input.cursor)
-        )
-          throw new UserError('Invalid Jira search cursor. Search again.');
-        return {
-          prompts,
-          incomplete: !value.isLast,
-          ...(!value.isLast ? { nextCursor: value.nextPageToken } : {}),
-        };
-      }
-      const prompts: Prompt[] = [];
-      const seen = new Set<string>();
-      let token: string | undefined;
-      for (let page = 0; page < 3; page++) {
-        const value = await request(
+      const query = input.query?.trim() ?? '';
+      // Treat input as text, never as executable JQL/Lucene syntax. A query shaped like a work
+      // item key is first looked up as a key; words use ANDed, escaped prefix terms in Summary.
+      // A key lookup finds at most one prompt, so a later page always continues a word search.
+      const key = !input.cursor && /^[A-Z][A-Z0-9_]*-[1-9]\d*$/i.test(query);
+      // Combining marks (Devanagari vowel signs, decomposed accents) belong to their word.
+      const tokens = (query.match(/[\p{L}\p{M}\p{N}_]+/gu) ?? []).map((word) => word.toLowerCase());
+      if (query && !tokens.length) return { prompts: [], incomplete: false };
+      // Jira does not index stop words and treats operator words specially: alone they match
+      // everything, but inside a multi-word query their clause matches nothing. Drop them; a
+      // query of only such words lists the newest prompts, as Jira's own search does.
+      const words = tokens.filter((word) => !reservedWords.has(word));
+      // One text clause per word, ANDed in JQL. The prefix matches a word as typed; the bare
+      // word matches Jira's stemmed index, where "tests*" misses a stored "test".
+      const wordClause = words.length
+        ? ` AND ${words
+            .map(
+              (word) =>
+                `(summary ~ ${JSON.stringify(`${word}*`)} OR summary ~ ${JSON.stringify(word)})`,
+            )
+            .join(' AND ')}`
+        : '';
+      // A prompt in a Done-category status is retired: search never offers it, and a work
+      // item that already uses it reads it by ID.
+      const find = (clause: string) =>
+        request(
           route`/rest/api/3/search/jql`,
           'POST',
           {
-            jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)} ORDER BY key ASC`,
-            fields: ['summary'],
-            maxResults: 100,
-            ...(token ? { nextPageToken: token } : {}),
+            jql: `project = ${numeric(project)} AND issuetype = ${numeric(type)}${clause} AND statusCategory != Done ORDER BY created DESC, key DESC`,
+            fields: ['summary', 'project', 'issuetype'],
+            maxResults: input.limit,
+            ...(input.cursor ? { nextPageToken: input.cursor } : {}),
           },
           true,
         );
-        if (!Array.isArray(value?.issues) || typeof value.isLast !== 'boolean')
-          throw new UserError('Incomplete Jira search data.');
-        for (const issue of value.issues) {
-          if (!issue || typeof issue.key !== 'string' || typeof issue.fields?.summary !== 'string')
-            throw new UserError('Incomplete prompt metadata.');
-          numeric(issue.id);
-          if (prompts.some((p) => p.id === issue.id))
-            throw new UserError('Jira returned repeated search results. Check the space again.');
-          if (prompts.length === 120) return { prompts, incomplete: true };
-          prompts.push({ id: issue.id, key: issue.key, name: issue.fields.summary });
-        }
-        if (value.isLast) return { prompts, incomplete: false };
-        if (
-          typeof value.nextPageToken !== 'string' ||
-          !value.nextPageToken ||
-          seen.has(value.nextPageToken)
-        )
-          throw new UserError('Invalid Jira search cursor.');
-        token = value.nextPageToken;
-        seen.add(token!);
+      // Jira answers 400 for a key that does not exist or is not visible, and for text it
+      // cannot parse. Either way nothing matches; it is not an access failure.
+      const noMatch = (error: unknown) => error instanceof JiraHttpError && error.status === 400;
+      let value;
+      try {
+        if (key)
+          value = await find(` AND key = ${JSON.stringify(query.toUpperCase())}`).catch(
+            (error: unknown) => {
+              if (noMatch(error)) return undefined;
+              throw error;
+            },
+          );
+        // Words can look like a key ("GPT-4", "UTF-8"): when no prompt has that key, the same
+        // query is searched as words.
+        if (!key || value === undefined || (Array.isArray(value.issues) && !value.issues.length))
+          value = await find(wordClause);
+      } catch (error) {
+        // A follow-up page (expired or invalid cursor) is a failed page, never the end of results.
+        if (query && !input.cursor && noMatch(error)) return { prompts: [], incomplete: false };
+        throw error;
       }
-      return { prompts, incomplete: true };
+      if (
+        !Array.isArray(value?.issues) ||
+        typeof value.isLast !== 'boolean' ||
+        value.issues.length > input.limit
+      )
+        throw new UserError('Incomplete Jira search data. Search again.');
+      const prompts: Prompt[] = value.issues.map((issue: Issue) => {
+        if (
+          typeof issue?.key !== 'string' ||
+          typeof issue.fields?.summary !== 'string' ||
+          issue.fields.project?.id !== project ||
+          issue.fields.issuetype?.id !== type
+        )
+          throw new UserError('Prompt search scope changed. Search again.');
+        return { id: numeric(issue.id), key: issue.key, name: issue.fields.summary };
+      });
+      if (new Set(prompts.map((p) => p.id)).size !== prompts.length)
+        throw new UserError('Jira returned repeated search results. Search again.');
+      if (
+        !value.isLast &&
+        (typeof value.nextPageToken !== 'string' ||
+          !value.nextPageToken ||
+          value.nextPageToken.length > 8192 ||
+          value.nextPageToken === input.cursor)
+      )
+        throw new UserError('Invalid Jira search cursor. Search again.');
+      return {
+        prompts,
+        incomplete: !value.isLast,
+        ...(!value.isLast ? { nextCursor: value.nextPageToken } : {}),
+      };
     },
     issue: async (id, field) => {
       if (!/^(?:[1-9]\d{0,19}|[A-Z][A-Z0-9_]{1,30}-[1-9]\d*)$/.test(id))
         throw new UserError('Invalid work item key.');
-      const fields = `project,issuetype,summary,description,updated${field ? `,${field}` : ''}`;
+      const fields = `project,issuetype,summary,description,updated,status${field ? `,${field}` : ''}`;
       const value = await request(route`/rest/api/3/issue/${id}?fields=${fields}`);
       if (
         !value ||
@@ -353,7 +329,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
             `issue-${id}`,
             { revision: revision + 1, data },
             {
-              entityName: 'native-prompt-state',
+              entityName: storageEntity,
               conditions: new Filter<Stored>().and(
                 'revision',
                 revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
@@ -390,7 +366,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
     get: (project) => readState<SettingsRecord>(kvs, `config-${project}`),
     cas: async (project, revision, data, screen) => {
       const condition = (revision: number) => ({
-        entityName: 'native-prompt-state',
+        entityName: storageEntity,
         conditions: new Filter<SettingsRecord>().and(
           'revision',
           revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
@@ -721,6 +697,12 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
       }
     },
     screenRecord: (screen) => readState<ScreenRecord>(kvs, `screen-${screen}`),
+    configuring: async (project) => {
+      const run = await readState<BatchRecord>(kvs, batchStorageKey);
+      return (
+        run?.data.status === 'running' && run.data.entries[run.data.index]?.projectId === project
+      );
+    },
     timeLeft: () => started + 22_000 - Date.now(),
   };
   /** Where `field` sits: screen ID to tab ID, across every screen that has it. */
@@ -866,7 +848,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
     return { projects, complete: false };
   }
 }
-// Storage key of the unfinished multi-space configuration. Renaming it would orphan a saved run.
+// Storage key of the unfinished multi-space configuration.
 const batchStorageKey = 'configuration-batch';
 /** The batch ports plus the space inventory, which only the health view reads. */
 export function createBatchPorts(
@@ -943,7 +925,7 @@ export function createBatchPorts(
             batchStorageKey,
             { revision: revision + 1, data: JSON.parse(JSON.stringify(data)) },
             {
-              entityName: 'native-prompt-state',
+              entityName: storageEntity,
               conditions: new Filter<BatchRecord>().and(
                 'revision',
                 revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
@@ -1176,7 +1158,7 @@ export function registerResolvers(sdk: Sdk) {
           const fields = [
             'projectId',
             ...(action === 'resolve'
-              ? ['revision']
+              ? ['revision', 'acknowledged']
               : action === 'preferences'
                 ? ['revision', 'refreshAfterSave']
                 : []),
@@ -1188,6 +1170,10 @@ export function registerResolvers(sdk: Sdk) {
             (!Number.isSafeInteger(payload.revision) || Number(payload.revision) < 0)
           )
             throw new UserError('Invalid configuration revision.');
+          if (action === 'resolve' && payload.acknowledged !== true)
+            throw new UserError(
+              'Inspect Jira and acknowledge the earlier operation before resolving it.',
+            );
           if (action === 'preferences' && typeof payload.refreshAfterSave !== 'boolean')
             throw new UserError('Invalid display preference.');
           const raw = request.context as unknown;

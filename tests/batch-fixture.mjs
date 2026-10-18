@@ -58,6 +58,8 @@ export function batchFixture(ids = ['1', '2', '7']) {
       }
     },
     ...screens.ports,
+    configuring: async (id) =>
+      run?.data.status === 'running' && run.data.entries[run.data.index]?.projectId === id,
   };
   const w = {
     admin: async () => {},

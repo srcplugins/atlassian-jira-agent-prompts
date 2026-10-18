@@ -407,6 +407,40 @@ test('bulk options reject invalid combinations and changed preferences invalidat
   assert.equal(f.configs.size, 0);
 });
 
+test('a reload preference saved during a screen-only step is refused, so no added field goes unrecorded', async () => {
+  const f = twoScreenFixture();
+  // Set up without screens first, so the next run changes only screens and takes no claim.
+  let r = await f.start({ name: 'Prompt' }, ['1']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  const settings = createSettings(f.p, f.s);
+  const add = f.s.addScreenField;
+  const saves = [];
+  f.s.addScreenField = async (...args) => {
+    await add(...args);
+    // Another administrator saves the reload preference in View details, with the revision
+    // their details view just read.
+    const { revision } = f.configs.get('1');
+    saves.push(
+      await settings
+        .preferences({ accountId: 'other', projectId: '1' }, { revision, refreshAfterSave: true })
+        .then(
+          () => 'saved',
+          (error) => error.message,
+        ),
+    );
+  };
+  r = await f.start({ type: '5' }, ['1'], { 1: ['3'] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(saves, [
+    'A configuration is changing this space right now. Save the preference after it finishes.',
+    'A configuration is changing this space right now. Save the preference after it finishes.',
+  ]);
+  for (const screen of ['300', '301'])
+    assert.deepEqual(f.screens.records.get(screen).data.projects, ['1']);
+  assert.equal(f.configs.get('1').data.refreshAfterSave, undefined);
+});
 test('cancellation notice describes this visit rather than replaying historical completion', async () => {
   const f = fixture();
   await f.start();
@@ -650,6 +684,37 @@ test('one space leaving a shared screen does not stop another space joining it i
   assert.deepEqual(f.screens.records.get('200').data.projects, ['2', '7']);
   assert.ok(!f.writes.some((w) => w.startsWith('add') || w.startsWith('remove')), f.writes.join());
 });
+test('removing setup from every space sharing an app-added screen stops at the last and says why', async () => {
+  const f = fixture();
+  for (const s of ['1', '2']) f.screens.use(s, '3', '*', '400');
+  let r = await f.start({ name: 'Prompt', allowSharedScreens: true }, ['1', '2'], taskScreens);
+  while (r.data.status === 'ready') r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(f.screens.records.get('400').data.projects, ['1', '2']);
+  f.writes.length = 0;
+  // Each space was reviewed leaving screen 400 to the other one.
+  r = await f.start({ unlink: true, allowSharedScreens: true }, ['1', '2']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  assert.deepEqual(f.screens.records.get('400').data.projects, ['2']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'stopped');
+  const reason =
+    'PR1 stopped using Agent Prompts on the screen Screen 400 earlier in this run, so this space is now the last one relying on it and would remove the field from it. Review this space again to approve that removal.';
+  assert.equal(r.data.entries[1].message, reason);
+  assert.equal(
+    r.data.message,
+    `Nothing was changed for this space: ${reason} Completed spaces remain configured. Review the remaining spaces again.`,
+  );
+  assert.deepEqual(f.writes, []);
+  assert.equal(f.configs.get('2').data.type, '5');
+  // A new review of that space shows and approves the removal.
+  r = await f.start({ unlink: true, allowSharedScreens: true }, ['2']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.deepEqual(f.writes, ['remove 400 customfield_1']);
+  assert.equal(f.screens.records.has('400'), false);
+});
 test('screen selections are per space: validated at start and absent for setup removal', async () => {
   const f = fixture();
   await assert.rejects(
@@ -745,6 +810,46 @@ test('a screen failure after the type was attached says so and keeps the outcome
   assert.match(r.data.message, /work type was added to the space, but screen changes stopped/);
   assert.ok(f.configs.get('1').data.pending);
   assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
+});
+/** Space 1's first step creates and attaches the type, which uses up the request, so both of its
+ * screen changes are left for the next step. */
+async function typeOnlyStep() {
+  const f = twoScreenFixture();
+  const attach = f.s.attach;
+  f.s.attach = async (...args) => {
+    await attach(...args);
+    f.screens.clock.left = 3_500;
+  };
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ['3'] });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  assert.deepEqual(f.writes, ['create', 'attach 91']);
+  assert.equal(r.data.entries[0].applied, 0);
+  assert.equal(r.data.entries[0].remaining.length, 2);
+  f.screens.clock.left = 22_000;
+  return { f, r };
+}
+test('a space whose type was created by an earlier step is never reported as unchanged', async () => {
+  let { f, r } = await typeOnlyStep();
+  f.screens.screens.get('301').tabs[0].fields.push('customfield_1');
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'stopped');
+  assert.equal(
+    r.data.message,
+    'No further change was made for this space: This space changed after review. Its earlier changes and completed spaces remain configured. Review the remaining spaces again.',
+  );
+  assert.deepEqual(f.writes, ['create', 'attach 91']);
+  // The same holds when Jira refuses the next step's first screen change.
+  ({ f, r } = await typeOnlyStep());
+  f.s.addScreenField = async () => {
+    throw new JiraRejected(400, 'Jira rejected the screen change (HTTP 400).');
+  };
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'stopped');
+  assert.equal(
+    r.data.message,
+    'Jira rejected the screen change (HTTP 400). Nothing was changed. This space’s earlier changes and completed spaces remain configured. Review the remaining spaces again.',
+  );
 });
 /** Space 1 selects seven more work types, each with its own edit and view screen: 14 changes. */
 function manyScreensFixture() {

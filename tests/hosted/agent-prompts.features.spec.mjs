@@ -74,6 +74,12 @@ for (const blank of [false, true]) {
     await snapshotJourney({ page, owned, blank, testInfo });
   });
 }
+test('NPL-13 retired prompt: hidden from search, kept selection still syncs', async ({
+  page,
+  owned,
+}, testInfo) => {
+  await snapshotJourney({ page, owned, blank: false, retire: true, testInfo });
+});
 
 /** Opens the space or global page, checks the owned space and returns its health. */
 async function configuration(page, owned, global = false) {
@@ -689,7 +695,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
     sources.push(await owned.propertyIssue(`${term} prompt ${i}`, `Instructions ${i}`, setup.type));
   const target = await owned.issue('Prompt search destination');
   const before = await owned.api(`/issue/${target.id}?fields=description`);
-  const jql = `project = ${owned.project.id} AND issuetype = ${setup.type} AND summary ~ "${term}*" ORDER BY created DESC, key DESC`;
+  const jql = `project = ${owned.project.id} AND issuetype = ${setup.type} AND summary ~ "${term}*" AND statusCategory != Done ORDER BY created DESC, key DESC`;
   let expected;
   await expect(async () => {
     const result = await owned.api('/search/jql', 'POST', {
@@ -815,8 +821,8 @@ test.describe('team-managed space', () => {
     expect(health.state.data.type).toBe(prompt);
     expect(health.checks.every((c) => c.ok)).toBe(true);
 
-    // Picking, Save and Sync work as in a company-managed space.
-    await snapshotJourney({ page, owned, blank: false, testInfo });
+    // Picking, Save, retiring the prompt and Sync work as in a company-managed space.
+    await snapshotJourney({ page, owned, blank: false, retire: true, testInfo });
 
     await configuration(page, owned, true);
     await removeSetup(page, t, key);

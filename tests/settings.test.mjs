@@ -513,6 +513,23 @@ test('reload preference does not interfere with unfinished setup', async () => {
   );
   assert.deepEqual(f.writes, []);
 });
+test('reload preference waits while a configuration step is changing the space', async () => {
+  const f = fixture();
+  const asked = [];
+  f.s.configuring = async (project) => {
+    asked.push(project);
+    return true;
+  };
+  await assert.rejects(
+    f.settings.preferences(c, { revision: 1, refreshAfterSave: true }),
+    /^Error: A configuration is changing this space right now\. Save the preference after it finishes\.$/,
+  );
+  assert.deepEqual(asked, ['1']);
+  assert.deepEqual(f.writes, []);
+  f.s.configuring = async () => false;
+  await f.settings.preferences(c, { revision: 1, refreshAfterSave: true });
+  assert.deepEqual(f.state().data, { type: '3', refreshAfterSave: true });
+});
 
 test('direct shared scheme apply requires acknowledgment bound to unchanged reviewed membership', async () => {
   const f = fixture();
@@ -553,6 +570,26 @@ test('removing setup clears the type and preferences, preserves Jira and lets re
   const review = await f.settings.preview(c, { type: '3' });
   await f.settings.apply(c, { type: '3', fingerprint: review.fingerprint });
   assert.deepEqual(f.state().data, { type: '3', previousTypes: ['4'] });
+});
+test('removing setup keeps at most twenty previous types, so a new type can be set up later', async () => {
+  const f = fixture();
+  const previous = Array.from({ length: 20 }, (_, i) => String(100 + i));
+  f.set({ revision: 1, data: { type: '3', previousTypes: previous } });
+  await removeSetup(f);
+  // The removed type is kept and the oldest previous type gives way to it.
+  const kept = [...previous.slice(1), '3'];
+  assert.deepEqual(f.state().data, { previousTypes: kept });
+  const review = await f.settings.preview(c, { type: '4' });
+  await f.settings.apply(c, { type: '4', fingerprint: review.fingerprint });
+  assert.deepEqual(f.state().data, { type: '4', previousTypes: kept });
+  // Replacing that type with one not kept would keep a 21st, which stays refused.
+  const runbook = { id: '6', name: 'Runbook', subtask: false, hierarchyLevel: 0 };
+  f.types.push(runbook);
+  f.project.issueTypes.push(runbook);
+  await assert.rejects(
+    f.settings.preview(c, { type: '6' }),
+    /twenty previous prompt types, the most the app keeps\. Keep the current type\.$/,
+  );
 });
 
 test('removing setup rejects pending and stale requests and admits only one concurrent change', async () => {

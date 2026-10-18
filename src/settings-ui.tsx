@@ -216,6 +216,7 @@ export function Settings({
                             await call('settings-resolve', {
                               ...target,
                               revision: health.state.revision,
+                              acknowledged: ack,
                             });
                             await refresh(
                               'Resolution acknowledged. Select the existing type and work types for screens, then review the change.',
@@ -297,7 +298,9 @@ export function Settings({
               ) : (
                 <>
                   <Text color="color.text.subtle">
-                    Work type scheme: {health.scheme?.name ?? 'Could not be checked'}
+                    Work type scheme:{' '}
+                    {('scheme' in health ? health.scheme?.name : undefined) ??
+                      'Could not be checked'}
                   </Text>
                   <Inline space="space.200" shouldWrap>
                     <Link

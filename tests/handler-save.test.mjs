@@ -84,7 +84,7 @@ const get = (path, body) => ({ expect: { method: 'GET', path }, body });
 const fieldList = get('/rest/api/3/field', [{ id: FIELD, schema: { custom: 'exact-field' } }]);
 const target = (description, keys) =>
   get(
-    `/rest/api/3/issue/10?fields=project%2Cissuetype%2Csummary%2Cdescription%2Cupdated%2C${FIELD}`,
+    `/rest/api/3/issue/10?fields=project%2Cissuetype%2Csummary%2Cdescription%2Cupdated%2Cstatus%2C${FIELD}`,
     issueBody(description, keys),
   );
 
@@ -110,7 +110,10 @@ const saveReads = (description = original, keys = []) => [
   get('/rest/api/3/mypermissions?projectId=1&issueId=10&permissions=EDIT_ISSUES', {
     permissions: { EDIT_ISSUES: { havePermission: true } },
   }),
-  get('/rest/api/3/issue/20?fields=project%2Cissuetype%2Csummary%2Cdescription%2Cupdated', source),
+  get(
+    '/rest/api/3/issue/20?fields=project%2Cissuetype%2Csummary%2Cdescription%2Cupdated%2Cstatus',
+    source,
+  ),
   target(description, keys),
 ];
 

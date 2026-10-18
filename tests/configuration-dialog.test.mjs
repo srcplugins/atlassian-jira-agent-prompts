@@ -63,6 +63,7 @@ function ui(
     '@forge/react': {
       useProductContext: () => f.context ?? { accountId: f.actor ?? 'admin' },
       ...standIns(
+        'Box',
         'Modal',
         'ModalBody',
         'ModalFooter',
@@ -174,7 +175,9 @@ test('configuration dialog exposes per-space blockers and disables confirmation 
   await v.click('Next');
   await v.click('Review changes');
   assert.equal(v.hasButton('Apply changes'), false);
-  assert.match(v.text(), /Blocked:.*default/);
+  // The review refuses the space with its reason rather than returning a plan.
+  assert.match(v.text(), /Could not be reviewed: This space uses Jira’s default work type scheme/);
+  assert.equal(v.hasButton('Exclude unreviewed spaces'), true);
   assert.deepEqual(f.writes, []);
 });
 test('configuration dialog can reopen durable progress even when initial confirmation response was lost', async () => {
@@ -878,6 +881,48 @@ test('a run stopped between steps shows the screen changes already made', async 
   assert.match(v.text(), /4 of 14 screen changes made/);
   assert.match(v.text(), /No further change was made for this space/);
 });
+/** The type writes of space 1's first step use up its request, so that step makes no screen
+ * change; every later step has time for four again. `during` runs right after the type writes. */
+function typeOnlyFirstStep(f, during = () => {}) {
+  const attach = f.s.attach;
+  f.s.attach = async (...a) => {
+    await attach(...a);
+    f.screens.clock.left = 3_500;
+    during();
+  };
+  const advance = f.api.advance;
+  f.api.advance = async (...a) => {
+    try {
+      return await advance(...a);
+    } finally {
+      f.screens.clock.left = 9_000;
+    }
+  };
+}
+test('a step that made only the type change keeps advancing to the screen changes', async () => {
+  const f = batchFixture();
+  const v = await applyMany(f);
+  typeOnlyFirstStep(f);
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'complete', f.state().data.message);
+  // One step for the type, then 4, 4, 4 and 2 screen changes.
+  assert.equal(v.calls.filter((name) => name === 'configuration-advance').length, 5);
+  assert.equal(f.writes.filter((w) => w.startsWith('add')).length, 14);
+  assert.match(v.text(), /1 of 1 spaces configured/);
+});
+test('a run stopped after a type-only step shows the space as started, not unconfigured', async () => {
+  const f = batchFixture();
+  const v = await applyMany(f);
+  // Someone adds the field to one of the reviewed screens in Jira during that step.
+  typeOnlyFirstStep(f, () => f.screens.screens.get('310').tabs[0].fields.push('customfield_1'));
+  await v.click('Apply changes');
+  assert.equal(f.state().data.status, 'stopped');
+  assert.deepEqual(f.writes, ['create', 'attach 91']);
+  const table = v.nodes('DynamicTable').find((t) => t.props.label === 'Configuration results');
+  const cell = [table.props.rows[0].cells[1].content.props.children].flat().join('');
+  assert.equal(cell, '0 of 14 screen changes made');
+  assert.match(v.text(), /No further change was made for this space/);
+});
 
 const reloadPicker = (v) =>
   v.nodes('Select').find((n) => n.props.inputId === 'configuration-reload');
@@ -1260,4 +1305,145 @@ test('a team-managed space with no saved setup offers no removal', async () => {
   await v.mount();
   assert.equal(v.hasButton('Remove setup…'), false);
   assert.equal(v.disabled('Review changes'), true);
+});
+/** Opens the Review step for a new type named Prompt. */
+async function reviewNew(v) {
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  await v.click('Review changes');
+}
+test('a review that failed is not shown as blocked and can be retried on the Review step', async () => {
+  const f = batchFixture();
+  const preview = f.api.preview;
+  const reviews = [];
+  let failures = 1;
+  f.api.preview = async (actor, projectId, input) => {
+    reviews.push(projectId);
+    if (projectId === '2' && failures-- > 0)
+      throw Error(
+        'The spaces using the screen Default could not all be read in time. Review this space again.',
+      );
+    return preview(actor, projectId, input);
+  };
+  const v = ui(f);
+  await reviewNew(v);
+  assert.match(
+    v.text(),
+    /^Could not be reviewed: The spaces using the screen Default could not all be read in time\. Review this space again\.$/m,
+  );
+  assert.doesNotMatch(v.text(), /Blocked/);
+  assert.match(v.text(), /Review changes tries the spaces that could not be reviewed again/);
+  assert.equal(v.hasButton('Apply changes'), false);
+  // Review changes on the Review step reviews only the space that failed.
+  reviews.length = 0;
+  await v.click('Review changes');
+  assert.deepEqual(reviews, ['2']);
+  assert.doesNotMatch(v.text(), /Could not be reviewed/);
+  assert.equal(v.disabled('Apply changes'), false);
+  assert.deepEqual(f.writes, []);
+});
+test('excluding is not offered when it would leave no space to configure', async () => {
+  const f = batchFixture(['1']);
+  f.schemes.get('1').isDefault = true;
+  const v = ui(f);
+  await reviewNew(v);
+  assert.match(v.text(), /Could not be reviewed: .*default work type scheme/);
+  assert.equal(v.hasButton('Exclude unreviewed spaces'), false);
+  assert.doesNotMatch(v.text(), /exclude/i);
+  assert.equal(v.hasButton('Apply changes'), false);
+  assert.match(v.text('ModalTitle'), /^Configure 1 space$/);
+});
+test('Check saved progress reads only and does not say it is applying changes', async () => {
+  const f = batchFixture();
+  f.statusFailure = true;
+  const v = ui(f);
+  await v.mount();
+  f.statusFailure = false;
+  const status = f.api.status;
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  f.api.status = async (...args) => {
+    await pending;
+    return status(...args);
+  };
+  v.button('Check saved progress').props.onClick();
+  v.render();
+  assert.equal(v.nodes('Spinner').length, 1);
+  const during = v.text();
+  release();
+  await v.settle();
+  assert.match(during, /Checking configuration…/);
+  assert.doesNotMatch(during, /Applying reviewed configuration/);
+  assert.equal(v.nodes('SectionMessage').length, 0);
+});
+test('after a lost step response the space in flight needs inspection, not configuration', async () => {
+  const f = batchFixture();
+  const v = ui(f, [f.projects.get('1'), f.projects.get('2')]);
+  await reviewNew(v);
+  const advance = f.api.advance;
+  let lost = true;
+  f.api.advance = async (...args) => {
+    const value = await advance(...args);
+    if (lost) {
+      lost = false;
+      throw Error('Response lost');
+    }
+    return value;
+  };
+  await v.click('Apply changes');
+  assert.match(v.text(), /Response lost/);
+  // Jira and storage have the first space configured; the dialog's last record does not.
+  assert.equal(f.state().data.entries[0].status, 'done');
+  const table = v.nodes('DynamicTable').find((t) => t.props.label === 'Configuration results');
+  const cells = table.props.rows.map((row) =>
+    [row.cells[1].content.props.children].flat().join(''),
+  );
+  assert.deepEqual(cells, ['Outcome needs inspection', 'Not yet configured']);
+});
+test('dialog outcome messages are announced in a status region mounted before them', async () => {
+  const f = batchFixture();
+  f.dropStart = true;
+  const v = ui(f);
+  await v.mount();
+  const text = (node) =>
+    Array.isArray(node)
+      ? node.map(text).join('')
+      : node && typeof node === 'object'
+        ? text(node.props?.children)
+        : typeof node === 'string'
+          ? node
+          : '';
+  const status = () => {
+    const regions = v.nodes('Box').filter((box) => box.props.role === 'status');
+    assert.equal(regions.length, 1);
+    return text(regions[0]);
+  };
+  assert.equal(status(), '');
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  await v.click('Review changes');
+  await v.click('Apply changes');
+  assert.match(status(), /Response lost/);
+});
+test('a team-managed space still needing a type on another page is named', async () => {
+  const ids = ['1', '2', '3', '4', '5', '6'];
+  const f = batchFixture(ids);
+  const selected = teamManaged(f, ids);
+  for (const id of ids.slice(0, 5)) f.configs.set(id, { revision: 1, data: { type: `${id}0` } });
+  const v = ui(f, selected);
+  await v.mount();
+  assert.equal(v.disabled('Review changes'), true);
+  // Spaces 1 to 5 are on the first page, all with a type; space 6 is on the second.
+  assert.match(v.text(), /^A prompt work type is still needed for PR6 — Project 6\.$/m);
+  await v.click('Next spaces');
+  assert.doesNotMatch(v.text(), /still needed/);
+  v.change('Select', 'prompt-type-6', { value: '60', label: 'Prompt' });
+  await v.click('Previous spaces');
+  assert.doesNotMatch(v.text(), /still needed/);
+  assert.equal(v.disabled('Review changes'), false);
 });

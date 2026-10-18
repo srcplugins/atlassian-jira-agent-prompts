@@ -35,16 +35,30 @@
     },
     {
       "id": "NPL-12",
-      "behavior": "Team-managed space: field placement shown, the space's own prompt type set through Configure, Save and Sync, and setup removal",
+      "behavior": "Team-managed space: field placement shown, the space's own prompt type set through Configure, Save, retiring the prompt, Sync, and setup removal",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "The persistent marked team-managed space (prepare-team-managed.mjs: Prompt work type, the field on the Task layout only); disposable marked Prompt and Task work items",
-      "assertion": "The space is listed on the Team-managed tab and its row lists Task under Agent Prompts on layouts; health shows the field on Task only; the one-screen dialog's confirmation names the space's own Prompt type and no Jira change; the snapshot journey's description checks; after removal the type is cleared and kept as previous; the space's work types and every type's create metadata unchanged",
+      "assertion": "The space is listed on the Team-managed tab and its row lists Task under Agent Prompts on layouts; health shows the field on Task only; the one-screen dialog's confirmation names the space's own Prompt type and no Jira change; the snapshot journey's description checks, with the prompt retired through its own Done-category status; after removal the type is cleared and kept as previous; the space's work types and every type's create metadata unchanged",
       "cleanup": "journal-verified",
       "lowerLevelTests": [
         "tests/settings.test.mjs",
         "tests/configuration-batch.test.mjs",
         "tests/handler-configuration.test.mjs",
         "tests/configuration-dialog.test.mjs"
+      ]
+    },
+    {
+      "id": "NPL-13",
+      "behavior": "Retired prompt: a prompt moved to a Done-category status is no longer offered, while a work item that uses it keeps it and Sync still copies its text",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Disposable marked Prompt and Task in the owned Agent Prompts fixture space; the prompt's status change is journaled before it is made",
+      "assertion": "Load returns the kept prompt labelled (retired) and selected only; exact-key search returns no prompts before and after its removal; Sync copies the retired prompt's edited text; exact ADF and custom field readback",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": [
+        "tests/service.test.mjs",
+        "tests/boundary.test.mjs",
+        "tests/field-ui.test.mjs",
+        "tests/field-load.test.mjs"
       ]
     },
     {
@@ -233,6 +247,19 @@
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
     },
     {
+      "id": "NPL-WORKFLOW-FIXTURE",
+      "method": "fixture-runner",
+      "unattended": false,
+      "script": "tests/hosted/prepare-prompt-workflow.mjs",
+      "optIn": "NATIVE_PROMPT_WORKFLOW_PREPARE",
+      "command": "NATIVE_PROMPT_WORKFLOW_PREPARE=1 JIRA_SITE=<primary site> node tests/hosted/prepare-prompt-workflow.mjs",
+      "fixture": "The persistent marked company-managed fixture space's Prompt workflow, which NPL-13 and the other prompt journeys use; journaled before its one write",
+      "assertion": "The space's marker and style, a workflow scheme mapping only the Prompt work type, and the scheme and workflow used by this space alone are checked before any write; Jira's validation passes first; afterwards the workflow has exactly Prompt available (To Do) and Prompt retired (Done) with Create, Retire and Make available and no transition screen, other work types' statuses are unchanged, and neither status is in a column of the space's boards",
+      "cleanup": "Persistent prepared workflow, never reverted; an unresolved update journal stops a rerun until inspected",
+      "version": "Run when the space's Prompt workflow is missing the retired status; not part of any suite",
+      "lowerLevelTests": ["tests/hosted-coverage.test.mjs"]
+    },
+    {
       "id": "NPL-TEAM-FIXTURE",
       "method": "fixture-runner",
       "unattended": false,
@@ -240,7 +267,7 @@
       "optIn": "NATIVE_TEAM_MANAGED_PREPARE",
       "command": "NATIVE_TEAM_MANAGED_PREPARE=1 JIRA_SITE=<primary site> node tests/hosted/prepare-team-managed.mjs",
       "fixture": "Creates once, or verifies, the persistent marked team-managed space on the primary site that NPL-12 and the team-managed Rovo run use; journaled before creation",
-      "assertion": "The space's marker, key, team-managed style and software type are checked before any step; each space administrator step (the Agent Prompts field added and placed on the Task layout only, the Prompt work type, its workflow starting in Prompt available, that status hidden on the board) is checked in Jira first and runs only when missing",
+      "assertion": "The space's marker, key, team-managed style and software type are checked before any step; each space administrator step (the Agent Prompts field added and placed on the Task layout only, the Prompt work type, its workflow with exactly Prompt available and Prompt retired, the latter its Done-category status, both hidden on the board) is checked in Jira first and runs only when missing",
       "cleanup": "Persistent prepared space, never deleted; an unresolved creation journal stops a rerun until inspected",
       "version": "Run when the space is missing or its manual setup changed; not part of any suite",
       "lowerLevelTests": ["tests/hosted-coverage.test.mjs"]

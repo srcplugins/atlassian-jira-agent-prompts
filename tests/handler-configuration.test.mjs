@@ -616,6 +616,82 @@ test('a missing or unknown reload choice is refused before any Jira request', as
   assert.deepEqual(h.site.reads, []);
 });
 
+test('resolving an earlier setup operation needs the acknowledgement on the server', async () => {
+  const h = harness();
+  const claimed = {
+    revision: 4,
+    data: { type: '10', pending: { name: 'Prompt', scheme: '5', started: Date.now() - 180_000 } },
+  };
+  h.kv.records.set('config-1', structuredClone(claimed));
+  for (const acknowledged of [undefined, false, 'true', 1]) {
+    const payload = {
+      projectId: '1',
+      revision: 4,
+      ...(acknowledged === undefined ? {} : { acknowledged }),
+    };
+    const result = await h.resolvers['settings-resolve']({ context, payload });
+    assert.deepEqual(result, {
+      ok: false,
+      error: 'Inspect Jira and acknowledge the earlier operation before resolving it.',
+    });
+  }
+  assert.deepEqual(h.site.reads, []);
+  assert.deepEqual(h.kv.records.get('config-1'), claimed);
+  assert.deepEqual(
+    await h.call('settings-resolve', { projectId: '1', revision: 4, acknowledged: true }),
+    { saved: true },
+  );
+  assert.deepEqual(h.kv.records.get('config-1'), { revision: 5, data: { type: '10' } });
+  assert.deepEqual(h.site.writes, []);
+});
+
+test('the reload preference is refused while a configuration step is changing that space', async () => {
+  const h = harness();
+  h.kv.records.set('config-1', { revision: 1, data: { type: '10' } });
+  const run = (status, projectId) => ({
+    revision: 3,
+    data: {
+      id: 'run',
+      actor: 'admin',
+      input: { type: '10', reloadAfterSave: 'keep' },
+      entries: [{ projectId, fingerprint: 'f'.repeat(64), status: 'waiting' }],
+      index: 0,
+      status,
+      started: Date.now(),
+    },
+  });
+  const save = (refreshAfterSave) =>
+    h.resolvers['settings-preferences']({
+      context,
+      payload: { projectId: '1', revision: 1, refreshAfterSave },
+    });
+  h.kv.records.set('configuration-batch', run('running', '1'));
+  assert.deepEqual(await save(true), {
+    ok: false,
+    error:
+      'A configuration is changing this space right now. Save the preference after it finishes.',
+  });
+  assert.deepEqual(h.kv.records.get('config-1'), { revision: 1, data: { type: '10' } });
+  // A run that is between steps, or running on another space, does not hold the preference.
+  for (const [status, projectId] of [
+    ['ready', '1'],
+    ['running', '2'],
+  ]) {
+    h.kv.records.set('configuration-batch', run(status, projectId));
+    const before = h.kv.records.get('config-1');
+    assert.deepEqual(
+      await h.call('settings-preferences', {
+        projectId: '1',
+        revision: before.revision,
+        refreshAfterSave: !before.data.refreshAfterSave,
+      }),
+      { saved: true },
+    );
+    assert.equal(h.kv.records.get('config-1').revision, before.revision + 1);
+  }
+  assert.deepEqual(h.site.writes, []);
+});
+
 test('a configuration run saved with the retired reload option stops without a change', async () => {
   const h = harness();
   h.kv.records.set('config-1', { revision: 1, data: { type: '10', refreshAfterSave: true } });

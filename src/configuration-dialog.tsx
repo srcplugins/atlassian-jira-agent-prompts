@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Box,
   Button,
   Checkbox,
   DynamicTable,
@@ -38,7 +39,9 @@ type Plan = Awaited<ReturnType<ReturnType<typeof createSettings>['preview']>>;
 type Options = Awaited<ReturnType<ReturnType<typeof createSettings>['options']>>;
 type ScreenOptions = Extract<Options, { teamManaged?: undefined }>;
 type OwnOptions = Extract<Options, { teamManaged: true }>;
-type Reviewed = { id: string; value?: Plan; error?: string };
+/** One space's review: its plan, the reason the app can't change it (`blocked`), or why the review
+ * itself failed (`error`), which another review may not repeat. */
+type Reviewed = { id: string; value?: Plan; blocked?: string; error?: string };
 type ScreenChange = Plan['screens']['changes'][number];
 const fieldName = (field: string) =>
   field === 'summary' ? 'Summary' : field === 'description' ? 'Description' : 'Agent Prompts';
@@ -134,6 +137,8 @@ export function ConfigurationDialog({
   const [record, setRecord] = useState<BatchRecord | null>(null);
   const [busy, setBusy] = useState(false);
   const [uncertain, setUncertain] = useState(false);
+  // Check saved progress only reads, so it never says changes are being applied.
+  const [checking, setChecking] = useState(false);
   const [message, setMessage] = useState('');
   const [sharedAck, setSharedAck] = useState(false);
   const [screenAck, setScreenAck] = useState(false);
@@ -185,6 +190,10 @@ export function ConfigurationDialog({
       ? { ...(promptChoice[id] ? { type: promptChoice[id] } : {}), reloadAfterSave }
       : inputOf(m);
   const missingPrompt = mode !== 'unlink' && team && ids.some((id) => !promptChoice[id]);
+  // Spaces without a chosen type outside the page of five shown.
+  const typeElsewhere = missingPrompt
+    ? ids.filter((id, i) => !promptChoice[id] && Math.floor(i / PAGE) !== page)
+    : [];
   const modeOptions = [
     { value: 'existing', label: 'Use an existing type', isDisabled: !catalog?.typesAvailable },
     { value: 'create', label: 'Create a new type', isDisabled: !catalog?.typesAvailable },
@@ -340,7 +349,7 @@ export function ConfigurationDialog({
       ...ps.filter((p) => !spaces.includes(p.id)),
       ...reviewed.map((p) =>
         p.value && 'blocked' in p.value && p.value.blocked
-          ? { id: p.id, error: p.value.blocked }
+          ? { id: p.id, blocked: p.value.blocked }
           : p,
       ),
     ]);
@@ -394,13 +403,13 @@ export function ConfigurationDialog({
   /**
    * Moves to `next`. The Work types step needs only each space's work types, read once per
    * dialog; the Review step reviews the spaces whose review a change dropped (all of them at
-   * first) or that couldn't be reviewed, and keeps the rest.
+   * first), that were blocked or that couldn't be reviewed, and keeps the rest.
    */
   const goTo = (next: number, m = mode) => {
     void run(async () => {
       // A mode changed in the same click has not dropped the earlier review yet.
       const unreviewed =
-        m === mode ? ids.filter((id) => !plans.some((p) => p.id === id && !p.error)) : ids;
+        m === mode ? ids.filter((id) => !plans.some((p) => p.id === id && p.value)) : ids;
       const ok =
         next === 2
           ? await readOptions(ids.filter((id) => !screenOptions[id] && !promptOptions[id]))
@@ -434,8 +443,12 @@ export function ConfigurationDialog({
       setProgress({ done: next.data.index, total });
       // A step that applied nothing (a brief outage before its claim) leaves the batch ready at
       // the same space. Stop instead of retrying it automatically: Continue reviewed changes
-      // is the explicit way on. A step that made part of a space's screen changes moves on.
-      const at = (r: BatchRecord) => r.data.entries[r.data.index]?.applied ?? 0;
+      // is the explicit way on. A step that made the type change or part of a space's screen
+      // changes moves on: it leaves the remaining changes, even with none made yet.
+      const at = (r: BatchRecord) => {
+        const e = r.data.entries[r.data.index];
+        return `${e?.applied ?? 0}:${e?.remaining?.length ?? '-'}`;
+      };
       if (
         next.data.status === 'ready' &&
         next.data.index === current.data.index &&
@@ -474,10 +487,15 @@ export function ConfigurationDialog({
     setUncertain(false);
   }
   const done = attempted && !!record && finished(record.data.status);
+  const applying = (active || uncertain) && !checking;
   const steps =
     mode === 'unlink' ? ['Prompt type', 'Review'] : ['Prompt type', 'Work types', 'Review'];
   const stepIndex = step === 3 ? steps.length - 1 : step - 1;
   const reviewed = plans.length === ids.length && plans.length > 0 && !plans.some((p) => !p.value);
+  const blocked = plans.some((p) => p.blocked);
+  const failed = plans.some((p) => p.error);
+  // The spaces left after excluding the blocked and unreviewed ones.
+  const kept = plans.filter((p) => p.value).map((p) => p.id);
   const ready = reviewed && (mode !== 'unlink' || plans.some((p) => removes(p.value!)));
   // Apply to all offers every work type of the selected spaces except the prompt type.
   const bulkOptions = [
@@ -606,6 +624,10 @@ export function ConfigurationDialog({
                     );
                   })}
                   {pager}
+                  {/* Review changes waits for every space's type, so name those on other pages. */}
+                  {typeElsewhere.length > 0 && (
+                    <Text>{`A prompt work type is still needed for ${typeElsewhere.map(label).join(', ')}.`}</Text>
+                  )}
                   {reloadPicker}
                 </>
               )}
@@ -858,8 +880,10 @@ export function ConfigurationDialog({
                       return (
                         <Stack key={id} space="space.075">
                           <Text weight="semibold">{label(id)}</Text>
-                          {p?.error ? (
-                            <Text color="color.text.danger">{`Blocked: ${p.error}`}</Text>
+                          {p?.blocked ? (
+                            <Text color="color.text.danger">{`Blocked: ${p.blocked}`}</Text>
+                          ) : p?.error ? (
+                            <Text color="color.text.danger">{`Could not be reviewed: ${p.error}`}</Text>
                           ) : mode === 'unlink' && p?.value && !removes(p.value) ? (
                             <Text color="color.text.subtlest">
                               No setup to remove; this space is left out.
@@ -979,27 +1003,32 @@ export function ConfigurationDialog({
                       />
                     </>
                   )}
-                  {plans.some((p) => p.error) && (
+                  {(blocked || failed) && (
                     <>
                       <Text>
-                        Resolve or exclude blocked spaces before applying. No changes have been
-                        made.
+                        {`${blocked ? `Resolve ${kept.length ? 'or exclude ' : ''}blocked spaces before applying. ` : ''}${failed ? `Review changes tries the spaces that could not be reviewed again${kept.length ? ', or exclude them' : ''}. ` : ''}No changes have been made.`}
                       </Text>
-                      <Button
-                        isDisabled={busy}
-                        onClick={() => {
-                          const kept = plans.filter((p) => p.value).map((p) => p.id);
-                          setIds(kept);
-                          setPage(0);
-                          // The kept spaces are reviewed again against the smaller selection.
-                          clearReview();
-                          void run(async () => {
-                            await review(kept);
-                          });
-                        }}
-                      >
-                        Exclude blocked spaces
-                      </Button>
+                      {/* Excluding every space would leave nothing to configure. */}
+                      {kept.length > 0 && (
+                        <Button
+                          isDisabled={busy}
+                          onClick={() => {
+                            setIds(kept);
+                            setPage(0);
+                            // The kept spaces are reviewed again against the smaller selection.
+                            clearReview();
+                            void run(async () => {
+                              await review(kept);
+                            });
+                          }}
+                        >
+                          {blocked && failed
+                            ? 'Exclude blocked and unreviewed spaces'
+                            : blocked
+                              ? 'Exclude blocked spaces'
+                              : 'Exclude unreviewed spaces'}
+                        </Button>
+                      )}
                     </>
                   )}
                   {reviewed && !ready && (
@@ -1065,11 +1094,14 @@ export function ConfigurationDialog({
                                   ? 'Setup removed'
                                   : 'Configured'
                                 : e.projectId === record.data.inspectProject ||
+                                    // After a lost response the last record read may predate
+                                    // the space's step.
                                     (i === record.data.index &&
-                                      ['running', 'attention'].includes(record.data.status))
+                                      (['running', 'attention'].includes(record.data.status) ||
+                                        (uncertain && !busy)))
                                   ? 'Outcome needs inspection'
-                                  : e.applied
-                                    ? `${e.applied} of ${e.applied + (e.remaining?.length ?? 0)} screen changes made`
+                                  : e.remaining
+                                    ? `${e.applied ?? 0} of ${(e.applied ?? 0) + e.remaining.length} screen changes made`
                                     : 'Not yet configured'}
                             </Text>
                           ),
@@ -1081,7 +1113,19 @@ export function ConfigurationDialog({
                 </>
               )}
               {!done && (
-                <Button isDisabled={busy} onClick={() => void run(observe)}>
+                <Button
+                  isDisabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      setChecking(true);
+                      try {
+                        await observe();
+                      } finally {
+                        setChecking(false);
+                      }
+                    })
+                  }
+                >
                   Check saved progress
                 </Button>
               )}
@@ -1153,7 +1197,7 @@ export function ConfigurationDialog({
                 <Text>
                   {!catalog
                     ? 'Loading configuration…'
-                    : active || uncertain
+                    : applying
                       ? 'Applying reviewed configuration…'
                       : 'Checking configuration…'}
                   {progress && progress.total > 1
@@ -1167,7 +1211,7 @@ export function ConfigurationDialog({
                   ariaLabel={`${progress.done} of ${progress.total} spaces`}
                 />
               )}
-              {(active || uncertain) && (
+              {applying && (
                 <SectionMessage appearance="warning">
                   <Text>
                     Keep this page open until the changes finish. Reloading or leaving cancels the
@@ -1177,7 +1221,8 @@ export function ConfigurationDialog({
               )}
             </Stack>
           )}
-          {message && <Text>{message}</Text>}
+          {/* Mounted empty, so outcomes such as a lost response are announced. */}
+          <Box role="status">{message && <Text>{message}</Text>}</Box>
         </Stack>
       </ModalBody>
       <ModalFooter>
@@ -1235,7 +1280,7 @@ export function ConfigurationDialog({
               >
                 Read work types again
               </Button>
-            ) : step === 1 || !plans.length ? (
+            ) : step === 1 || !reviewed ? (
               <Button
                 appearance="primary"
                 isDisabled={busy || missingPrompt || ids.some((id) => !promptOptions[id])}
@@ -1268,7 +1313,8 @@ export function ConfigurationDialog({
             >
               {mode === 'unlink' ? 'Review changes' : 'Next'}
             </Button>
-          ) : step === 2 || !plans.length ? (
+          ) : step === 2 || !reviewed ? (
+            // On the Review step it reviews again the spaces that were blocked or not reviewed.
             <Button appearance="primary" isDisabled={busy || missingPrompt} onClick={() => goTo(3)}>
               Review changes
             </Button>

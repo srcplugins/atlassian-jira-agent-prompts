@@ -121,6 +121,34 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
   }
 });
 
+test('Acknowledge resolution sends the acknowledgement the server requires', async () => {
+  const health = {
+    project: { id: '1', key: 'TEST' },
+    state: { revision: 2, data: { type: '3', pending: { type: '4', started: 1 } } },
+    checks: [],
+    types: [],
+    canConfigure: false,
+  };
+  const calls = [];
+  const ui = fixture(
+    async (name, payload) => {
+      calls.push([name, JSON.parse(JSON.stringify(payload))]);
+      return { ok: true, value: name === 'settings-resolve' ? { saved: true } : health };
+    },
+    { initialHealth: health },
+  );
+  await ui.mount();
+  ui.nodes('Checkbox')
+    .find((n) => n.props.label.startsWith('I inspected'))
+    .props.onChange({ target: { checked: true } });
+  ui.render();
+  await ui.click('Acknowledge resolution');
+  assert.deepEqual(calls[0], [
+    'settings-resolve',
+    { projectId: '1', revision: 2, acknowledged: true },
+  ]);
+});
+
 test('space details open with the scan check without another read', async () => {
   const health = {
     project: { id: '1', key: 'TEST' },
@@ -164,6 +192,11 @@ test('Jira configuration is always visible with absolute new-tab links and no te
   );
   await ui.mount();
   assert.equal(ui.nodes('Textfield').length, 0);
+  assert.ok(
+    ui
+      .nodes('Text')
+      .some((n) => n.props.children.flat(Infinity).join('') === 'Work type scheme: Shared scheme'),
+  );
   const links = ui.nodes('Link');
   assert.equal(links.length, 2);
   assert.ok(links.every((n) => n.props.openNewTab));

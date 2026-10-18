@@ -12,6 +12,7 @@ import {
 } from './description';
 export { hash };
 import { UserError, requireSoftwareSpace } from './shared/jira.mjs';
+import { sectionLocalId } from './names';
 export { UserError };
 /** The request never got an HTTP response from Jira. */
 export class JiraUnavailable extends UserError {}
@@ -63,6 +64,7 @@ export interface Issue {
     summary: string;
     description: unknown;
     updated: string;
+    status?: { statusCategory?: { key?: unknown } };
     [key: string]: unknown;
   };
 }
@@ -138,7 +140,7 @@ export interface Ports {
     issueTypes: { id: string; name: string; subtask: boolean; hierarchyLevel?: number }[];
   }>;
   allowed(project: string, permission: 'ADMINISTER' | 'EDIT_ISSUES', issue?: string): Promise<void>;
-  search(project: string, type: string, input?: PromptQuery): Promise<PromptPage>;
+  search(project: string, type: string, input: PromptQuery): Promise<PromptPage>;
   issue(id: string, field?: string): Promise<Issue>;
   field(): Promise<string>;
   update(id: string, fields: Record<string, unknown>): Promise<void>;
@@ -168,13 +170,13 @@ function adoptable(issue: Issue, field: string, pending: Pending) {
   )
     return false;
   if (hash(issue.fields[field] ?? []) !== hash(pending.keys)) return false;
-  const localId = pending.managed?.localId ?? `npl-${issue.id}`;
+  const localId = pending.managed?.localId ?? sectionLocalId(issue.id);
   try {
     // The block is still exactly the pre-save one: the save never landed (a Sync that changed
     // only attributes, such as a link, has the same skeleton), so it is released, not accepted.
     if (
       pending.afterBlock !== pending.beforeBlock &&
-      trackedBlock(issue.fields.description, `npl-${issue.id}`) === pending.beforeBlock
+      trackedBlock(issue.fields.description, sectionLocalId(issue.id)) === pending.beforeBlock
     )
       return false;
     return matchesShape(issue.fields.description, localId, pending.shape);
@@ -196,7 +198,7 @@ function untouched(issue: Issue, field: string, pending: Receipt) {
   try {
     return (
       fieldHash(issue, field) === pending.beforeField &&
-      trackedBlock(issue.fields.description, `npl-${issue.id}`) === pending.beforeBlock
+      trackedBlock(issue.fields.description, sectionLocalId(issue.id)) === pending.beforeBlock
     );
   } catch {
     return false;
@@ -353,7 +355,7 @@ export function createService(p: Ports) {
     async setup(c: Context) {
       const project = await p.project(c.projectId);
       requireSoftwareSpace(project, c.projectId);
-      return { project, type: await p.config(c.projectId) };
+      return { project };
     },
     /** Ten results per picker page; Rovo's assistant asks for twenty. */
     async search(
@@ -415,18 +417,23 @@ export function createService(p: Ports) {
       )) {
         try {
           const source = await p.issue(id);
+          const current = source.fields.issuetype.id === type;
+          // Search leaves out prompts in a Done-category status: they are retired, and a work
+          // item that already uses one keeps it until a save removes it.
+          const retired = current && source.fields.status?.statusCategory?.key === 'done';
           if (
             source.fields.project.id === c.projectId &&
-            (source.fields.issuetype.id === type || retained.includes(source.fields.issuetype.id))
+            (current || retained.includes(source.fields.issuetype.id))
           )
             library.prompts.push({
               id,
               key: source.key,
-              name:
-                source.fields.issuetype.id === type
-                  ? source.fields.summary
-                  : `${source.fields.summary} (previous type)`,
-              ...(source.fields.issuetype.id === type ? {} : { selectedOnly: true }),
+              name: !current
+                ? `${source.fields.summary} (previous type)`
+                : retired
+                  ? `${source.fields.summary} (retired)`
+                  : source.fields.summary,
+              ...(current && !retired ? {} : { selectedOnly: true }),
             });
         } catch {
           /* Inaccessible sources remain removable without exposing their content. */
@@ -512,7 +519,7 @@ export function createService(p: Ports) {
         issue.fields.description,
         prompts,
         stored.data.managed,
-        `npl-${issue.id}`,
+        sectionLocalId(issue.id),
       );
       const keys = sources.map((s) => s.key);
       const fresh = await target(c, field);
@@ -539,8 +546,8 @@ export function createService(p: Ports) {
             keys,
             shape: next.shape,
             beforeField: fieldHash(issue, field),
-            beforeBlock: trackedBlock(issue.fields.description, `npl-${issue.id}`),
-            afterBlock: trackedBlock(next.description, `npl-${issue.id}`),
+            beforeBlock: trackedBlock(issue.fields.description, sectionLocalId(issue.id)),
+            afterBlock: trackedBlock(next.description, sectionLocalId(issue.id)),
           };
       // An unchanged write cannot be distinguished from an in-flight write by
       // recovery. Never publish such a claim or send a redundant Jira update.
@@ -599,12 +606,17 @@ export function createService(p: Ports) {
             ? observedManaged(observed.fields.description, pending.managed)
             : null;
       }
-      await p.cas(issue.id, stored.revision + 2, { ids: input.ids, managed });
-      return {
-        revision: stored.revision + 3,
-        fingerprint: targetHash(observed, field),
-        ids: input.ids,
-      };
+      const settled = { ids: input.ids, managed };
+      let revision = stored.revision + 3;
+      try {
+        await p.cas(issue.id, stored.revision + 2, settled);
+      } catch (error) {
+        // A reader that saw the landed save may have settled it first with this same record.
+        const current = await p.get(issue.id).catch(() => undefined);
+        if (!current || current.data.pending || hash(current.data) !== hash(settled)) throw error;
+        revision = current.revision;
+      }
+      return { revision, fingerprint: targetHash(observed, field), ids: input.ids };
     },
   };
 }

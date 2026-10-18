@@ -5,7 +5,6 @@ import type { Prompt, PromptPage } from './service';
 export function usePromptSearch() {
   const [items, setItems] = useState<Prompt[]>([]);
   const [query, setQuery] = useState('');
-  const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [nextCursor, setNextCursor] = useState<string>();
@@ -34,7 +33,6 @@ export function usePromptSearch() {
       busy: false,
     };
     setQuery('');
-    setLoaded(false);
     setItems(page.prompts);
     setNextCursor(page.nextCursor);
     setBusy(false);
@@ -57,7 +55,6 @@ export function usePromptSearch() {
       current.items = [...merged.values()];
       current.cursor = page.nextCursor;
       setItems(current.items);
-      setLoaded(true);
       setNextCursor(current.cursor);
     } catch (e) {
       if (state.current.generation === generation)
@@ -74,7 +71,6 @@ export function usePromptSearch() {
     const generation = state.current.generation + 1;
     state.current = { generation, query: value, items: [], cursor: undefined, busy: false };
     setQuery(value);
-    setLoaded(false);
     setItems([]);
     setNextCursor(undefined);
     setError('');
@@ -84,7 +80,6 @@ export function usePromptSearch() {
   }
   return {
     items,
-    loaded,
     query,
     busy,
     error,

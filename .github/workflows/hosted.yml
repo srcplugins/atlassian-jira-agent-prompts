@@ -3,7 +3,7 @@ name: Hosted
 
 # Hosted suites (forge-test.mjs): deploy this commit to the Forge development environment,
 # upgrade the owned site's installation, then the suite's unattended journeys and runners. A push
-# to a feature branch runs the features suite; a "Hosted: <choice>" line in its commit message
+# to `dev` (any branch but main) runs the features suite; a "Hosted: <choice>" line in its commit message
 # picks another: full, none, or comma-separated step names (the full suite's prerequisites and the
 # steps whose names contain them, for example "Hosted: bulk, rovo"). Marking a pull request ready
 # for review runs the full suite, and Publish runs the release suite. Site, accounts and evidence

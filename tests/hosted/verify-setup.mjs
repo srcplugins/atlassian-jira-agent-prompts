@@ -967,9 +967,9 @@ try {
       for (const x of s.types) await choose(primary, x.name);
       const reviewed = Date.now();
       await review();
-      // A blocked review names its reason only on the page, so the journal keeps it.
+      // A blocked or failed review names its reason only on the page, so the journal keeps it.
       s.reviewMs = Date.now() - reviewed;
-      s.blocked = await modal.getByText(/^Blocked: /).allTextContents();
+      s.blocked = await modal.getByText(/^(Blocked|Could not be reviewed): /).allTextContents();
       persist();
       assert.deepEqual(s.blocked, []);
       await expect(line(/^Agent Prompts to /)).toHaveCount(names.length);
@@ -1004,7 +1004,7 @@ try {
       await dialog(primary.key);
       await chooseMode('Remove setup from selected spaces');
       await review();
-      await expect(modal.getByText(/^Blocked: /)).toHaveCount(0);
+      await expect(modal.getByText(/^(Blocked|Could not be reviewed): /)).toHaveCount(0);
       await expect(line(/^Agent Prompts from /)).toHaveCount(names.length);
       await expect(outside.first()).toContainText('Agent Prompts removed');
       await acknowledgeScreens(true);

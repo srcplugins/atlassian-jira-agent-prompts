@@ -98,7 +98,7 @@ const valid = {
   'settings-projects': {},
   'settings-health': { projectId: '1' },
   'settings-recover': { projectId: '1' },
-  'settings-resolve': { projectId: '1', revision: 0 },
+  'settings-resolve': { projectId: '1', revision: 0, acknowledged: true },
   'settings-preferences': { projectId: '1', revision: 0, refreshAfterSave: true },
   'configuration-catalog': {},
   'configuration-status': {},

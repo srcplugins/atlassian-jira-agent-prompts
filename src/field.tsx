@@ -34,6 +34,12 @@ export function Field() {
   const [loadError, setLoadError] = useState('');
   const [saving, setSaving] = useState(false);
   const resetSearch = search.reset;
+  // A load resolves the saved selection, so a saved prompt it leaves out is unavailable now. A
+  // draft choice it never read keeps the label it was picked with.
+  const remember = useCallback((value: Loaded) => {
+    for (const id of value.ids) retained.current.delete(id);
+    for (const p of value.prompts) retained.current.set(p.id, p);
+  }, []);
   const load = useCallback(async () => {
     setBusy(true);
     setLoadError('');
@@ -41,7 +47,7 @@ export function Field() {
       const value = await call<Loaded>('load');
       setData(value);
       resetSearch(value);
-      retained.current = new Map(value.prompts.map((p) => [p.id, p]));
+      remember(value);
       setIds(value.ids);
       setMessage('');
       setRecovery(false);
@@ -58,7 +64,7 @@ export function Field() {
     } finally {
       setBusy(false);
     }
-  }, [resetSearch]);
+  }, [resetSearch, remember]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -68,7 +74,7 @@ export function Field() {
       const value = await call<Loaded>('load');
       setData(value);
       resetSearch(value);
-      retained.current = new Map(value.prompts.map((p) => [p.id, p]));
+      remember(value);
       // A recovery check must not silently discard an existing draft; without one, show what is
       // saved now (another tab or user may have changed it).
       if (!data || JSON.stringify(ids) === JSON.stringify(data.ids)) setIds(value.ids);
@@ -114,7 +120,7 @@ export function Field() {
       try {
         const current = await call<Loaded>('load');
         setData(current);
-        retained.current = new Map(current.prompts.map((p) => [p.id, p]));
+        remember(current);
         // Keep a real draft. Without one (every Sync), show the saved selection: keeping the old
         // list would turn it into a draft whose Save reverts someone else's newer save.
         if (!dirty) setIds(current.ids);
@@ -135,7 +141,7 @@ export function Field() {
         // Recovery starts from a fresh check, never from an earlier save's status.
         setRecoveryStatus(undefined);
         setRecovery(true);
-        setMessage('Could not verify the save. Reopen this field to check again.');
+        setMessage('Could not verify the save. Use Check saved state before saving again.');
       }
     } finally {
       setBusy(false);
@@ -174,7 +180,12 @@ export function Field() {
               search.busy
                 ? 'Searching…'
                 : search.error ||
-                  (search.query.trim() ? 'No matching prompts' : 'No prompts in this space yet.')
+                  (search.query.trim()
+                    ? 'No matching prompts'
+                    : // The menu hides selected options, so suggestions can all be hidden.
+                      search.items.length
+                      ? 'All suggested prompts are selected. Search to find others.'
+                      : 'No available prompts in this space yet.')
             }
             isSearchable={!data.cleanupOnly}
             inputValue={search.query}
@@ -202,17 +213,23 @@ export function Field() {
             }}
             placeholder="Search by name or key…"
           />
+        </>
+      )}
+      {/* A live region from the first render, so a failed or empty search is announced. */}
+      <p role="status">
+        {data && !data.cleanupOnly
+          ? search.error ||
+            (empty
+              ? search.query.trim()
+                ? 'No matching prompts'
+                : 'No available prompts in this space yet.'
+              : '')
+          : ''}
+      </p>
+      {data && (
+        <>
           {!data.cleanupOnly && (
             <>
-              {/* A live region from the first render, so a failed or empty search is announced. */}
-              <p role="status">
-                {search.error ||
-                  (empty
-                    ? search.query.trim()
-                      ? 'No matching prompts'
-                      : 'No prompts in this space yet.'
-                    : '')}
-              </p>
               {search.error && (
                 <Button
                   onMouseDown={retainSearchFocus}

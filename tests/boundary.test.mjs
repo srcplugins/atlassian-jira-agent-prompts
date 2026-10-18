@@ -120,27 +120,6 @@ test('work item recovery binds trusted target and refuses malformed or denied ad
   assert.equal(denied.calls[0].actor, 'asUser');
   assert.match(denied.calls[0].path, /permissions=ADMINISTER/);
 });
-test('actual search adapter requests metadata only and follows a bounded cursor', async () => {
-  const s = sdk(
-    {
-      body: {
-        issues: [{ id: '2', key: 'TEST-2', fields: { summary: 'Prompt' } }],
-        isLast: false,
-        nextPageToken: 'next',
-      },
-    },
-    { body: { issues: [], isLast: true } },
-  );
-  const result = await createPorts(s).search('1', '3');
-  assert.equal(result.prompts[0].key, 'TEST-2');
-  assert.equal(result.incomplete, false);
-  assert.deepEqual(JSON.parse(s.calls[0].body), {
-    jql: 'project = 1 AND issuetype = 3 ORDER BY key ASC',
-    fields: ['summary'],
-    maxResults: 100,
-  });
-  assert.equal(JSON.parse(s.calls[1].body).nextPageToken, 'next');
-});
 test('denial and malformed responses fail at once; a network failure is read three times', async () => {
   for (const response of [
     { status: 403 },
@@ -310,24 +289,6 @@ test('Rovo trusts the hosted principal, ignores payload identity and returns bou
   assert.equal(result.ok, true);
   assert.deepEqual(result.value.prompts, [{ id: '2', key: 'TEST-2', name: 'Check errors' }]);
   assert.ok(s.calls.every((c) => c.actor === 'asUser'));
-});
-
-test('configuration impact scan remains bounded at 120 without loading source bodies', async () => {
-  const issues = (start, count) =>
-    Array.from({ length: count }, (_, n) => ({
-      id: String(start + n),
-      key: `TEST-${start + n}`,
-      fields: { summary: `Prompt ${n}` },
-    }));
-  const s = sdk(
-    { body: { issues: issues(1, 100), isLast: false, nextPageToken: 'next' } },
-    { body: { issues: issues(101, 21), isLast: true } },
-  );
-  const value = await createPorts(s).search('1', '3');
-  assert.equal(value.prompts.length, 120);
-  assert.equal(value.incomplete, true);
-  assert.equal(s.calls.length, 2);
-  assert.ok(s.calls.every((c) => JSON.parse(c.body).fields.join(',') === 'summary'));
 });
 
 test('storage claims are per-work-item, conditional and non-expiring', async () => {
@@ -527,7 +488,9 @@ test('health space inventory is admin-only and independent of type diagnostics o
 test('preference and resolution resolvers reject extra authority fields, bad revisions and non-administrators', async () => {
   for (const action of ['settings-preferences', 'settings-resolve']) {
     const payload =
-      action === 'settings-preferences' ? { revision: 0, refreshAfterSave: true } : { revision: 0 };
+      action === 'settings-preferences'
+        ? { revision: 0, refreshAfterSave: true }
+        : { revision: 0, acknowledged: true };
     for (const forged of [
       { ...payload, accountId: 'admin' },
       { ...payload, revision: true },
@@ -595,18 +558,98 @@ test('discovery requests one newest-first page, scoped metadata, exact keys and 
   const s = sdk(
     { body: { issues: [issue], isLast: false, nextPageToken: 'page-2' } },
     { body: { issues: [], isLast: true } },
+    { body: { issues: [issue], isLast: true } },
   );
   const first = await createPorts(s).search('1', '3', { query: 'Review code', limit: 10 });
   assert.equal(first.nextCursor, 'page-2');
   assert.deepEqual(JSON.parse(s.calls[0].body), {
-    jql: 'project = 1 AND issuetype = 3 AND (summary ~ "review*" OR summary ~ "review") AND (summary ~ "code*" OR summary ~ "code") ORDER BY created DESC, key DESC',
+    jql: 'project = 1 AND issuetype = 3 AND (summary ~ "review*" OR summary ~ "review") AND (summary ~ "code*" OR summary ~ "code") AND statusCategory != Done ORDER BY created DESC, key DESC',
     fields: ['summary', 'project', 'issuetype'],
     maxResults: 10,
   });
-  await createPorts(s).search('1', '3', { query: 'test-200', limit: 10, cursor: first.nextCursor });
+  await createPorts(s).search('1', '3', {
+    query: 'Review code',
+    limit: 10,
+    cursor: first.nextCursor,
+  });
   assert.equal(JSON.parse(s.calls[1].body).nextPageToken, 'page-2');
-  assert.match(JSON.parse(s.calls[1].body).jql, /AND key = "TEST-200"/);
+  // An exact key is one lookup, and it never finds a retired prompt either.
+  const exact = await createPorts(s).search('1', '3', { query: 'test-200', limit: 10 });
+  assert.deepEqual(
+    exact.prompts.map((p) => p.key),
+    ['TEST-200'],
+  );
+  assert.equal(s.calls.length, 3);
+  assert.equal(
+    JSON.parse(s.calls[2].body).jql,
+    'project = 1 AND issuetype = 3 AND key = "TEST-200" AND statusCategory != Done ORDER BY created DESC, key DESC',
+  );
   assert.ok(s.calls.every((c) => c.actor === 'asUser'));
+});
+test('a query shaped like a key that no prompt has is searched as words', async () => {
+  const found = (query) => ({
+    body: {
+      issues: [
+        {
+          id: '200',
+          key: 'TEST-200',
+          fields: {
+            summary: `${query} review rules`,
+            project: { id: '1' },
+            issuetype: { id: '3' },
+          },
+        },
+      ],
+      isLast: false,
+      nextPageToken: 'page-2',
+    },
+  });
+  for (const query of ['GPT-4', 'sha-256', 'UTF-8', 'PEP-8']) {
+    const [word, number] = query.toLowerCase().split('-');
+    const words = `(summary ~ "${word}*" OR summary ~ "${word}") AND (summary ~ "${number}*" OR summary ~ "${number}")`;
+    // Jira refuses a key that does not exist with 400; a key in another space finds nothing.
+    for (const miss of [
+      { status: 400, body: { errorMessages: [`An issue with key '${query}' does not exist.`] } },
+      { body: { issues: [], isLast: true } },
+    ]) {
+      const s = sdk(miss, found(query), { body: { issues: [], isLast: true } });
+      const page = await createPorts(s).search('1', '3', { query, limit: 10 });
+      assert.deepEqual(
+        page.prompts.map((p) => p.id),
+        ['200'],
+      );
+      assert.deepEqual(
+        s.calls.map((c) => JSON.parse(c.body).jql),
+        [
+          `project = 1 AND issuetype = 3 AND key = "${query.toUpperCase()}" AND statusCategory != Done ORDER BY created DESC, key DESC`,
+          `project = 1 AND issuetype = 3 AND ${words} AND statusCategory != Done ORDER BY created DESC, key DESC`,
+        ],
+      );
+      // Load more continues the word search, never the key lookup.
+      await createPorts(s).search('1', '3', { query, limit: 10, cursor: page.nextCursor });
+      assert.deepEqual(JSON.parse(s.calls[2].body), {
+        jql: `project = 1 AND issuetype = 3 AND ${words} AND statusCategory != Done ORDER BY created DESC, key DESC`,
+        fields: ['summary', 'project', 'issuetype'],
+        maxResults: 10,
+        nextPageToken: 'page-2',
+      });
+    }
+  }
+});
+test('combining marks stay inside the word they belong to', async () => {
+  const s = sdk({ body: { issues: [], isLast: true } }, { body: { issues: [], isLast: true } });
+  await createPorts(s).search('1', '3', { query: 'हिन्दी', limit: 10 });
+  assert.equal(
+    JSON.parse(s.calls[0].body).jql,
+    'project = 1 AND issuetype = 3 AND (summary ~ "हिन्दी*" OR summary ~ "हिन्दी") AND statusCategory != Done ORDER BY created DESC, key DESC',
+  );
+  // "café" with a decomposed accent: e followed by U+0301.
+  const decomposed = 'café menu';
+  await createPorts(s).search('1', '3', { query: decomposed, limit: 10 });
+  assert.equal(
+    JSON.parse(s.calls[1].body).jql,
+    `project = 1 AND issuetype = 3 AND (summary ~ "café*" OR summary ~ "café") AND (summary ~ "menu*" OR summary ~ "menu") AND statusCategory != Done ORDER BY created DESC, key DESC`,
+  );
 });
 test('search drops operator and stop words and treats Jira 400 as no match', async () => {
   // Observed on Jira Cloud: inside a multi-word query a stop-word clause matches nothing.
@@ -614,25 +657,30 @@ test('search drops operator and stop words and treats Jira 400 as no match', asy
   await createPorts(s).search('1', '3', { query: 'NOT the coding', limit: 10 });
   assert.equal(
     JSON.parse(s.calls[0].body).jql,
-    'project = 1 AND issuetype = 3 AND (summary ~ "coding*" OR summary ~ "coding") ORDER BY created DESC, key DESC',
+    'project = 1 AND issuetype = 3 AND (summary ~ "coding*" OR summary ~ "coding") AND statusCategory != Done ORDER BY created DESC, key DESC',
   );
   // Only stop words: no text clause, as Jira's own search treats them.
   await createPorts(s).search('1', '3', { query: 'the and', limit: 10 });
   assert.equal(
     JSON.parse(s.calls[1].body).jql,
-    'project = 1 AND issuetype = 3 ORDER BY created DESC, key DESC',
+    'project = 1 AND issuetype = 3 AND statusCategory != Done ORDER BY created DESC, key DESC',
   );
   // Jira answers 400 for an exact key that is missing or hidden, and for text it cannot parse.
-  for (const query of ['TEST-9999', 'prompt']) {
-    const missing = sdk({
+  // A missing key is then searched as words, which here Jira cannot parse either.
+  for (const [query, requests] of [
+    ['TEST-9999', 2],
+    ['prompt', 1],
+  ]) {
+    const refused = {
       status: 400,
       body: { errorMessages: ['Issue does not exist or you do not have permission to see it.'] },
-    });
+    };
+    const missing = sdk(...Array(requests).fill(refused));
     assert.deepEqual(await createPorts(missing).search('1', '3', { query, limit: 10 }), {
       prompts: [],
       incomplete: false,
     });
-    assert.equal(missing.calls.length, 1);
+    assert.equal(missing.calls.length, requests);
   }
   // Without a query, a 400 is still an error (the configured scope itself was refused).
   const scope = sdk({ status: 400 });
@@ -668,7 +716,7 @@ test('search text cannot inject JQL and invalid handler payloads never access Ji
   const jql = JSON.parse(s.calls[0].body).jql;
   assert.equal(
     jql,
-    'project = 1 AND issuetype = 3 AND (summary ~ "project*" OR summary ~ "project") AND (summary ~ "2*" OR summary ~ "2") AND (summary ~ "order*" OR summary ~ "order") AND (summary ~ "key*" OR summary ~ "key") ORDER BY created DESC, key DESC',
+    'project = 1 AND issuetype = 3 AND (summary ~ "project*" OR summary ~ "project") AND (summary ~ "2*" OR summary ~ "2") AND (summary ~ "order*" OR summary ~ "order") AND (summary ~ "key*" OR summary ~ "key") AND statusCategory != Done ORDER BY created DESC, key DESC',
   );
   // Boundaries: 200 characters and an 8,192-character cursor are accepted.
   const accepted = sdk(
@@ -695,7 +743,7 @@ test('search text cannot inject JQL and invalid handler payloads never access Ji
   }
 });
 
-test('discovery can continue beyond 120 without increasing any request size', async () => {
+test('discovery follows cursors through every page without increasing any request size', async () => {
   const pages = Array.from({ length: 7 }, (_, page) => ({
     body: {
       issues: Array.from({ length: 20 }, (_, i) => ({
@@ -908,8 +956,46 @@ test('Rovo searches a team-managed space by its own configured work type', async
     result.value.prompts.map((p) => p.key),
     ['TEST-100'],
   );
-  assert.match(JSON.parse(s.calls[1].body).jql, /project = 1 AND issuetype = 10430/);
+  assert.match(
+    JSON.parse(s.calls[1].body).jql,
+    /^project = 1 AND issuetype = 10430 AND statusCategory != Done ORDER BY/,
+  );
   assert.equal(s.calls.length, 2);
+});
+
+test('Rovo still reads a retired prompt by its exact key', async () => {
+  const { registerRovo } = await import('../src/integration.ts');
+  const s = sdk(
+    { body: project },
+    {
+      expect: { path: /^\/rest\/api\/3\/issue\/TEST-2\?fields=.*%2Cstatus$/ },
+      body: {
+        id: '2',
+        key: 'TEST-2',
+        fields: {
+          project: { id: '1' },
+          issuetype: { id: '3' },
+          summary: 'Old checklist',
+          updated: '1',
+          status: { id: '10001', statusCategory: { key: 'done' } },
+          description: {
+            type: 'doc',
+            version: 1,
+            content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Check errors.' }] }],
+          },
+        },
+      },
+    },
+  );
+  s.kvs.entity = () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) });
+  const read = await registerRovo(s)(
+    { projectKey: 'TEST', query: '', promptKey: 'TEST-2' },
+    { principal: { accountId: 'actor' } },
+  );
+  assert.equal(read.ok, true, read.error);
+  assert.equal(read.value.name, 'Old checklist');
+  assert.match(read.value.content, /Check errors\./);
+  s.assertDrained();
 });
 
 test('one request reads a space settings record once, and a storage failure is an outage', async () => {

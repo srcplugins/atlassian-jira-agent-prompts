@@ -8,6 +8,17 @@ import {
 import { activeTarget, markers } from '@srcplugins/atlassian-forge-test-framework/core';
 import { expect } from './expect.mjs';
 import { spaceSettings } from './space-settings.mjs';
+/** Searches for a retired prompt's exact key: the resolver must return no prompts. */
+async function searchHides(page, combo, key, id) {
+  const found = await observeAction(
+    page,
+    'search',
+    () => combo.fill(key),
+    installation('agent-prompts'),
+  );
+  expect(found.prompts.map((p) => p.id)).not.toContain(id);
+  expect(found.prompts).toEqual([]);
+}
 export function editor(page) {
   const t = installation('agent-prompts');
   return page.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
@@ -97,7 +108,19 @@ function watchAppEgress(page) {
   return seen;
 }
 
-export async function snapshotJourney({ page, owned, blank, testInfo, retainSaved = false }) {
+/**
+ * Saves a prompt to a work item, Syncs an edit to it and removes it. With `retire`, the prompt is
+ * moved to its work type's Done-category status after the first save: search must stop offering
+ * it, while the work item keeps it, labelled, and Sync still copies its text.
+ */
+export async function snapshotJourney({
+  page,
+  owned,
+  blank,
+  testInfo,
+  retainSaved = false,
+  retire = false,
+}) {
   const egress = watchAppEgress(page);
   await dismissOnboarding(page);
   const setup = await observeAction(
@@ -269,6 +292,29 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   // Only the test explicitly reloads, after asserting the editor remained mounted.
   await page.reload();
   await expandPrompts(page, sentinel);
+  if (retire) {
+    const { transitions } = await owned.api(`/issue/${source.id}/transitions`);
+    const retiring = transitions.find((t) => t.to?.statusCategory?.key === 'done');
+    if (!retiring)
+      throw Error(
+        'Fixture lacks a Done-category transition; run NATIVE_PROMPT_WORKFLOW_PREPARE=1 node tests/hosted/prepare-prompt-workflow.mjs.',
+      );
+    const { status } = (await owned.api(`/issue/${source.id}?fields=status`)).fields;
+    source.expected.statusIds = [...new Set([status.id, retiring.to.id])];
+    owned.run.persist();
+    await owned.api(`/issue/${source.id}/transitions`, 'POST', {
+      transition: { id: retiring.id },
+    });
+    // Search reads Jira's index, which lags the transition.
+    await expect(async () => {
+      const ids = async (jql) =>
+        (
+          await owned.api('/search/jql', 'POST', { jql, maxResults: 1, fields: ['summary'] })
+        ).issues.map((i) => i.id);
+      expect(await ids(`key = ${sourceIssue.key} AND statusCategory != Done`)).toEqual([]);
+      expect(await ids(`key = ${sourceIssue.key} AND statusCategory = Done`)).toEqual([source.id]);
+    }).toPass({ timeout: 60000, intervals: [1000, 3000] });
+  }
   // Ordinary API edits are now sufficient: no synced-block publishing.
   const updated = adf(`${sentinel}-UPDATED`);
   source.expected.descriptionVariants = [...source.expected.descriptionVariants, updated];
@@ -277,7 +323,28 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   expect((await owned.api(`/issue/${target.id}?fields=description`)).fields.description).toEqual(
     linked.description,
   );
-  await openField(page, readView);
+  if (retire) {
+    const reopened = await observeAction(
+      page,
+      'load',
+      () => openField(page, readView),
+      installation('agent-prompts'),
+    );
+    expect(reopened.ids).toEqual([source.id]);
+    expect(reopened.prompts.find((p) => p.id === source.id)).toEqual({
+      id: source.id,
+      key: sourceIssue.key,
+      name: `${source.expected.summary} (retired)`,
+      selectedOnly: true,
+    });
+    await expect(
+      editor(page).getByText(`${sourceIssue.key} — ${source.expected.summary} (retired)`, {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await searchHides(page, combo, sourceIssue.key, source.id);
+    await observeAction(page, 'search', () => combo.fill(''), installation('agent-prompts'));
+  } else await openField(page, readView);
   await expect(combo).toBeEnabled();
   const expectedRefresh = structuredClone(expectedLinked);
   expectedRefresh.content.at(-1).content.splice(1, Infinity, ...updated.content);
@@ -306,6 +373,14 @@ export async function snapshotJourney({ page, owned, blank, testInfo, retainSave
   expect(cleared[field.id] ?? []).toEqual([]);
   target.expected.customField = { id: field.id, value: cleared[field.id] };
   owned.run.persist();
+  if (retire) {
+    await searchHides(page, combo, sourceIssue.key, source.id);
+    await expect(
+      editor(page).getByText(`${sourceIssue.key} — ${source.expected.summary} (retired)`, {
+        exact: true,
+      }),
+    ).toHaveCount(0);
+  }
   if (blank) {
     await page.reload();
     await openField(page, readView);

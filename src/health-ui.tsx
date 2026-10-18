@@ -192,7 +192,8 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       working(true);
       setChecking([id]);
       try {
-        await checkHealth([id], { counted: false });
+        const { moved } = await checkHealth([id], { counted: false });
+        if (moved.length && mounted.current) setChecked(leftOut(moved.length));
       } finally {
         if (mounted.current) {
           setChecking([]);

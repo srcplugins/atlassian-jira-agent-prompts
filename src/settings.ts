@@ -161,6 +161,8 @@ export interface SettingsPorts {
   addScreenField(screen: string, tab: string, field: string): Promise<void>;
   removeScreenField(screen: string, tab: string, field: string): Promise<void>;
   screenRecord(screen: string): Promise<ScreenRecord | undefined>;
+  /** Whether a step of the stored configuration run is changing this space right now. */
+  configuring(project: string): Promise<boolean>;
   /** Milliseconds this request can still spend before it must have finished its writes. */
   timeLeft(): number;
 }
@@ -220,6 +222,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
     const previousTypes = Array.from(
       new Set([...(data.previousTypes ?? []), ...(changing ? [old!] : [])]),
     ).filter((id) => id !== type);
+    // Only a change from a current type can pass twenty: removing setup keeps at most twenty.
     if (previousTypes.length > 20)
       throw new UserError(
         'This space already has twenty previous prompt types, the most the app keeps. Keep the current type.',
@@ -492,8 +495,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
           .join(' '),
       });
     }
-    const scheme: Scheme | undefined = undefined;
-    return { project, state, types, selected, scheme, layouts, canConfigure: true, checks };
+    return { project, state, types, selected, layouts, canConfigure: true, checks };
   }
   async function plan(c: Context, input: SettingsInput) {
     if (input.reloadAfterSave !== undefined) reloadInput(input.reloadAfterSave);
@@ -666,6 +668,12 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       const current = (await s.get(c.projectId)) ?? { revision: 0, data: {} };
       if (current.revision !== input.revision || current.data.pending)
         throw new UserError('Configuration changed or is unfinished. Reload Space configuration.');
+      // A running step that changes only screens takes no claim, but it commits each screen change
+      // with the setup revision it read, so a save now would leave that change unrecorded.
+      if (await s.configuring(c.projectId))
+        throw new UserError(
+          'A configuration is changing this space right now. Save the preference after it finishes.',
+        );
       await s.cas(c.projectId, current.revision, {
         ...current.data,
         refreshAfterSave: input.refreshAfterSave,
@@ -995,13 +1003,14 @@ export function createSettings(p: Ports, s: SettingsPorts) {
           // Setup stays until its last screen change, so a later step can finish the removal.
           if (outcome.remaining.length) return outcome;
           // Keep previous type IDs so prompts already selected on work items stay removable if
-          // the space is set up again. Never modify Jira work items or shared schemes.
+          // the space is set up again, at most twenty like setup: the oldest gives way to the
+          // type just removed. Never modify Jira work items or shared schemes.
           const previousTypes = Array.from(
             new Set([
               ...(current.data.previousTypes ?? []),
               ...(current.data.type ? [current.data.type] : []),
             ]),
-          );
+          ).slice(-20);
           stored = true;
           await s.cas(c.projectId, revision, {
             previousTypes,

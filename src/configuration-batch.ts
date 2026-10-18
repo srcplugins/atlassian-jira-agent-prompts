@@ -263,6 +263,10 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
           'Saved configuration progress is incomplete. Inspect it before continuing.',
         );
       const c = { accountId: actor, projectId: entry.projectId };
+      // An earlier step of this run already changed this space. A step leaves screen changes for
+      // later only after making one or after its type writes, so remaining changes with none
+      // applied still mean the type was created or attached.
+      const progressed = !!entry.applied || !!entry.remaining?.length;
       // For later spaces, compare the newly created type against the original
       // name-based review. Only the known type identity changes; impact and scheme
       // facts must still match. No new spaces are discovered during execution.
@@ -353,8 +357,23 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
               : facts;
           if (hash([actor, reviewed]) !== entry.fingerprint && effect)
             reviewed = { ...reviewed, attach: true };
-          if (hash([actor, reviewed]) !== entry.fingerprint)
+          if (hash([actor, reviewed]) !== entry.fingerprint) {
+            // An earlier space of this run that stopped relying on a shared screen the app added
+            // the field to can leave this space as the last one, so its reviewed leave is now a
+            // removal. Name that cause rather than blaming an outside change.
+            const removal = fresh.screens.changes.find(
+              (ch) => ch.action === 'remove' && effects.some((e) => same(e, ch) && !screenWrite(e)),
+            );
+            if (removal) {
+              const earlier = (fresh.screenProjects[removal.screen.id] ?? [])
+                .filter((p) => d.entries.slice(0, d.index).some((e) => e.projectId === p.id))
+                .map((p) => p.key ?? `Space ID ${p.id}`);
+              throw new UserError(
+                `${earlier.length ? earlier.join(', ') : 'An earlier space in this run'} stopped using Agent Prompts on the screen ${removal.screen.name} earlier in this run, so this space is now the last one relying on it and would remove the field from it. Review this space again to approve that removal.`,
+              );
+            }
             throw new UserError('This space changed after review.');
+          }
         }
         if (fresh.attach && fresh.scheme.projectIds.length > 1 && !d.input.allowShared)
           throw new UserError('Confirm the shared scheme’s affected spaces before applying.');
@@ -366,7 +385,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
           ...d,
           entries: d.entries.map((e, i) => (i === d.index ? { ...e, message: error.message } : e)),
           status: 'stopped',
-          message: entry.applied
+          message: progressed
             ? `No further change was made for this space: ${error.message} Its earlier changes and completed spaces remain configured. Review the remaining spaces again.`
             : `Nothing was changed for this space: ${error.message} Completed spaces remain configured. Review the remaining spaces again.`,
         };
@@ -434,7 +453,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
                   ...running,
                   entries,
                   status: 'stopped',
-                  message: `${error.message} ${entry.applied ? 'This space’s earlier changes and completed' : 'Completed'} spaces remain configured. Review the remaining spaces again.`,
+                  message: `${error.message} ${progressed ? 'This space’s earlier changes and completed' : 'Completed'} spaces remain configured. Review the remaining spaces again.`,
                 },
           );
         }
