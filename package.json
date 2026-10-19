@@ -1,6 +1,6 @@
 {
   "name": "@srcplugins/atlassian-jira-agent-prompts",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Agent Prompts for Jira: reusable coding-agent prompts as Jira work items, copied into the work items that use them.",
   "license": "SEE LICENSE IN LICENSE.md",

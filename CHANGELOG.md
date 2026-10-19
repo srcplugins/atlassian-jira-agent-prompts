@@ -2,7 +2,7 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
-## 1.0.0 (unreleased)
+## 1.0.0
 
 First release.
 
