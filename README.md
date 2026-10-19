@@ -48,7 +48,7 @@ Everything runs as the current user, so Jira's normal visibility rules apply. Sa
 
 ## Data
 
-Prompts and their copied instructions stay in Jira. Atlassian Forge stores the app's configuration, save-recovery data, each work item's selected prompt IDs and content fingerprints, a record of the latest space configuration (including the administrator who ran it) and which screens the app added the Agent Prompts field to; removing setup removes the field only from those screens. The app does not send data outside Atlassian or log prompt content. After uninstalling, work items and copies remain; Forge keeps app data for 28 days, and reinstalling doesn't restore it automatically.
+Prompts and their copied instructions stay in Jira. Atlassian Forge stores the app's configuration, save-recovery data, each work item's selected prompt IDs and content fingerprints, a record of the latest space configuration (without any account) and which screens the app added the Agent Prompts field to; removing setup removes the field only from those screens. The app does not send data outside Atlassian or log prompt content. After uninstalling, work items and copies remain; Forge keeps app data for 28 days, and reinstalling doesn't restore it automatically.
 
 **Note:** Copied instructions follow the destination work item's permissions, even if the original prompt is later restricted or deleted. Rovo features are subject to [Atlassian's Rovo data policies](https://support.atlassian.com/rovo/docs/rovo-data-privacy-and-usage-guidelines/), which may include third-party models.
 

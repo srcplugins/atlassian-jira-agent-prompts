@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "features": [
     {
-      "id": "NPL-01",
+      "id": "AP-01",
       "behavior": "Lazy field, server-side search, ordinary source snapshots, explicit Sync and precise removal",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Disposable prompt and Task in the owned Agent Prompts fixture space",
@@ -16,7 +16,7 @@
       ]
     },
     {
-      "id": "NPL-02",
+      "id": "AP-02",
       "behavior": "Explicit space health, simplified details and cancelled modal review",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Disposable marked work item in the owned Agent Prompts fixture space",
@@ -25,7 +25,7 @@
       "lowerLevelTests": ["tests/settings.test.mjs", "tests/boundary.test.mjs"]
     },
     {
-      "id": "NPL-11",
+      "id": "AP-11",
       "behavior": "Details modal focus, contrast and layout in dark theme and at narrow width",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Disposable marked work item in the owned Agent Prompts fixture space; owner theme journaled and restored",
@@ -34,7 +34,7 @@
       "lowerLevelTests": ["tests/settings.test.mjs", "tests/boundary.test.mjs"]
     },
     {
-      "id": "NPL-12",
+      "id": "AP-12",
       "behavior": "Team-managed space: field placement shown, the space's own prompt type set through Configure, Save, retiring the prompt, Sync, and setup removal",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "The persistent marked team-managed space (prepare-team-managed.mjs: Prompt work type, the field on the Task layout only); disposable marked Prompt and Task work items",
@@ -48,7 +48,7 @@
       ]
     },
     {
-      "id": "NPL-13",
+      "id": "AP-13",
       "behavior": "Retired prompt: a prompt moved to a Done-category status is no longer offered, while a work item that uses it keeps it and Sync still copies its text",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Disposable marked Prompt and Task in the owned Agent Prompts fixture space; the prompt's status change is journaled before it is made",
@@ -62,7 +62,7 @@
       ]
     },
     {
-      "id": "NPL-03",
+      "id": "AP-03",
       "behavior": "Initially null Description add/remove and recovery after reopening",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Disposable marked Prompt and null-Description Task in the Agent Prompts fixture space",
@@ -71,7 +71,7 @@
       "lowerLevelTests": ["tests/service.test.mjs"]
     },
     {
-      "id": "NPL-04",
+      "id": "AP-04",
       "behavior": "Opt-in real non-admin setup denial",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Existing saved member/restricted sessions; read-only Agent Prompts fixture space; NATIVE_IDENTITY_TESTS=1",
@@ -80,7 +80,7 @@
       "lowerLevelTests": ["tests/settings.test.mjs", "tests/settings-ui.test.mjs"]
     },
     {
-      "id": "NPL-05",
+      "id": "AP-05",
       "behavior": "Unified global configuration with explicit selected health checks and all-page selection",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Owned Agent Prompts fixture space with normal space lock; read-only global configure page",
@@ -89,7 +89,7 @@
       "lowerLevelTests": ["tests/health-ui.test.mjs", "tests/configuration-dialog.test.mjs"]
     },
     {
-      "id": "NPL-06",
+      "id": "AP-06",
       "behavior": "Failed plain-text source save and read-only recovery preserve an unsaved selection",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Owned synthetic plain-text Prompt and target work items in the Agent Prompts fixture space",
@@ -103,7 +103,7 @@
       ]
     },
     {
-      "id": "NPL-08",
+      "id": "AP-08",
       "behavior": "Opt-in reload after a confirmed save",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Owned Agent Prompts fixture space lock; journaled source/target and saved reload preference baseline",
@@ -112,7 +112,7 @@
       "lowerLevelTests": ["tests/field-ui.test.mjs", "tests/settings.test.mjs"]
     },
     {
-      "id": "NPL-09",
+      "id": "AP-09",
       "behavior": "Single searchable dropdown, newest suggestions, cursor pages, stable selections and Jira themes",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "21 journaled prompts and one Task in the owned Agent Prompts fixture space",
@@ -125,7 +125,7 @@
       ]
     },
     {
-      "id": "NPL-10",
+      "id": "AP-10",
       "behavior": "An Agent Prompts section deleted in Jira refuses Sync with guidance and is forgotten by a field-only save",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Owned synthetic Prompt and target work items in the Agent Prompts fixture space; the section is deleted through REST",
@@ -137,7 +137,7 @@
   "manualJourneys": [],
   "scriptedJourneys": [
     {
-      "id": "NPL-SETUP",
+      "id": "AP-SETUP",
       "method": "runner",
       "unattended": true,
       "script": "tests/hosted/verify-setup.mjs",
@@ -156,7 +156,7 @@
       ]
     },
     {
-      "id": "ROVO-NPL-01",
+      "id": "ROVO-AP-01",
       "method": "runner",
       "unattended": true,
       "script": "tests/hosted/verify-rovo.mjs",
@@ -169,7 +169,7 @@
       "lowerLevelTests": ["tests/hosted-rovo.test.mjs", "tests/boundary.test.mjs"]
     },
     {
-      "id": "NPL-ACCESS",
+      "id": "AP-ACCESS",
       "method": "runner",
       "unattended": true,
       "script": "tests/hosted/verify-access.mjs",
@@ -182,7 +182,7 @@
       "lowerLevelTests": ["tests/service.test.mjs", "tests/boundary.test.mjs"]
     },
     {
-      "id": "NPL-SCALE",
+      "id": "AP-SCALE",
       "method": "supervised-script",
       "unattended": false,
       "script": "tests/hosted/verify-scale.mjs",
@@ -195,20 +195,20 @@
       "lowerLevelTests": ["tests/service.test.mjs", "tests/prompt-search.test.mjs"]
     },
     {
-      "id": "NPL-LIFECYCLE-PRODUCTION",
+      "id": "AP-LIFECYCLE-PRODUCTION",
       "method": "supervised-script",
       "unattended": false,
       "script": "tests/hosted/verify-lifecycle.mjs",
       "optIn": "NATIVE_LIFECYCLE_TESTS",
       "command": "NATIVE_LIFECYCLE_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> PLUGIN_TEST_ENVIRONMENT=production node tests/hosted/verify-lifecycle.mjs production",
       "fixture": "Marked company-managed Agent Prompts fixture space; exact owner, nc-admin and nc-user sessions; existing Story type only",
-      "assertion": "nc-admin configures without Jira scheme changes; nc-user ADMINISTER=false and space settings refused; existing NPL-01 and NPL-03 snapshot, Sync and removal assertions with independent Jira readbacks",
+      "assertion": "nc-admin configures without Jira scheme changes; nc-user ADMINISTER=false and space settings refused; existing AP-01 and AP-03 snapshot, Sync and removal assertions with independent Jira readbacks",
       "cleanup": "Site-specific durable fixture journal and space lock; explicit cleanup <run-uuid>; verified work item absence and setup removal. Interrupted runs require inspection.",
       "version": "Current installed production",
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
     },
     {
-      "id": "NPL-LIFECYCLE-REINSTALL",
+      "id": "AP-LIFECYCLE-REINSTALL",
       "method": "supervised-script",
       "unattended": false,
       "script": "tests/hosted/verify-lifecycle.mjs",
@@ -221,7 +221,7 @@
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
     },
     {
-      "id": "NPL-LIFECYCLE-UPGRADE",
+      "id": "AP-LIFECYCLE-UPGRADE",
       "method": "supervised-script",
       "unattended": false,
       "script": "tests/hosted/verify-lifecycle.mjs",
@@ -234,7 +234,7 @@
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
     },
     {
-      "id": "NPL-LIFECYCLE-ISOLATION",
+      "id": "AP-LIFECYCLE-ISOLATION",
       "method": "supervised-script",
       "unattended": false,
       "script": "tests/hosted/verify-lifecycle.mjs",
@@ -247,26 +247,26 @@
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
     },
     {
-      "id": "NPL-WORKFLOW-FIXTURE",
+      "id": "AP-WORKFLOW-FIXTURE",
       "method": "fixture-runner",
       "unattended": false,
       "script": "tests/hosted/prepare-prompt-workflow.mjs",
       "optIn": "NATIVE_PROMPT_WORKFLOW_PREPARE",
       "command": "NATIVE_PROMPT_WORKFLOW_PREPARE=1 JIRA_SITE=<primary site> node tests/hosted/prepare-prompt-workflow.mjs",
-      "fixture": "The persistent marked company-managed fixture space's Prompt workflow, which NPL-13 and the other prompt journeys use; journaled before its one write",
+      "fixture": "The persistent marked company-managed fixture space's Prompt workflow, which AP-13 and the other prompt journeys use; journaled before its one write",
       "assertion": "The space's marker and style, a workflow scheme mapping only the Prompt work type, and the scheme and workflow used by this space alone are checked before any write; Jira's validation passes first; afterwards the workflow has exactly Prompt available (To Do) and Prompt retired (Done) with Create, Retire and Make available and no transition screen, other work types' statuses are unchanged, and neither status is in a column of the space's boards",
       "cleanup": "Persistent prepared workflow, never reverted; an unresolved update journal stops a rerun until inspected",
       "version": "Run when the space's Prompt workflow is missing the retired status; not part of any suite",
       "lowerLevelTests": ["tests/hosted-coverage.test.mjs"]
     },
     {
-      "id": "NPL-TEAM-FIXTURE",
+      "id": "AP-TEAM-FIXTURE",
       "method": "fixture-runner",
       "unattended": false,
       "script": "tests/hosted/prepare-team-managed.mjs",
       "optIn": "NATIVE_TEAM_MANAGED_PREPARE",
       "command": "NATIVE_TEAM_MANAGED_PREPARE=1 JIRA_SITE=<primary site> node tests/hosted/prepare-team-managed.mjs",
-      "fixture": "Creates once, or verifies, the persistent marked team-managed space on the primary site that NPL-12 and the team-managed Rovo run use; journaled before creation",
+      "fixture": "Creates once, or verifies, the persistent marked team-managed space on the primary site that AP-12 and the team-managed Rovo run use; journaled before creation",
       "assertion": "The space's marker, key, team-managed style and software type are checked before any step; each space administrator step (the Agent Prompts field added and placed on the Task layout only, the Prompt work type, its workflow with exactly Prompt available and Prompt retired, the latter its Done-category status, both hidden on the board) is checked in Jira first and runs only when missing",
       "cleanup": "Persistent prepared space, never deleted; an unresolved creation journal stops a rerun until inspected",
       "version": "Run when the space is missing or its manual setup changed; not part of any suite",

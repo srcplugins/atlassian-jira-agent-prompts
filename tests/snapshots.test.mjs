@@ -23,20 +23,26 @@ test('save, ordered Sync and removal preserve unrelated rich ADF and input objec
     { type: 'extension', attrs: { custom: 'untouched' } },
   );
   const baseline = structuredClone(original);
-  const added = synchronizeDescription(original, [p], null, 'npl-10');
+  const added = synchronizeDescription(original, [p], null, 'agent-prompts-10');
   assert.deepEqual(original, baseline);
   assert.deepEqual(added.description.content.slice(0, 3), original.content);
   const second = { id: '21', name: 'Second', content: [paragraph('Different instructions')] };
-  const refreshed = synchronizeDescription(added.description, [second, p], added.managed, 'npl-10');
+  const refreshed = synchronizeDescription(
+    added.description,
+    [second, p],
+    added.managed,
+    'agent-prompts-10',
+  );
   assert.equal(refreshed.description.content[3].content[0].content[0].text, 'Second');
   assert.equal(refreshed.description.content[3].content[2].content[0].text, p.name);
   assert.deepEqual(
-    synchronizeDescription(refreshed.description, [], refreshed.managed, 'npl-10').description,
+    synchronizeDescription(refreshed.description, [], refreshed.managed, 'agent-prompts-10')
+      .description,
     original,
   );
 });
 test('changed, missing, duplicate, nested and untracked expanders stop writes', () => {
-  const added = synchronizeDescription(doc(), [p], null, 'npl-10');
+  const added = synchronizeDescription(doc(), [p], null, 'agent-prompts-10');
   for (const mode of ['changed', 'missing', 'duplicate', 'nested', 'untracked']) {
     const d = structuredClone(added.description);
     const n = d.content[0];
@@ -45,7 +51,12 @@ test('changed, missing, duplicate, nested and untracked expanders stop writes', 
     if (mode === 'duplicate') d.content.push(structuredClone(n));
     if (mode === 'nested') d.content = [{ type: 'expand', content: [n] }];
     assert.throws(() =>
-      synchronizeDescription(d, [p], mode === 'untracked' ? null : added.managed, 'npl-10'),
+      synchronizeDescription(
+        d,
+        [p],
+        mode === 'untracked' ? null : added.managed,
+        'agent-prompts-10',
+      ),
     );
   }
 });
@@ -124,34 +135,34 @@ test('prompt text is bounded at 4,000 characters inclusive', () => {
 });
 
 test('a deleted tracked block is forgotten only for an empty selection', () => {
-  const saved = synchronizeDescription(doc(paragraph('Intro')), [p], null, 'npl-10');
+  const saved = synchronizeDescription(doc(paragraph('Intro')), [p], null, 'agent-prompts-10');
   const removed = doc(paragraph('Intro'));
-  assert.deepEqual(synchronizeDescription(removed, [], saved.managed, 'npl-10'), {
+  assert.deepEqual(synchronizeDescription(removed, [], saved.managed, 'agent-prompts-10'), {
     description: removed,
     managed: null,
     shape: null,
     forgotten: true,
   });
   assert.throws(
-    () => synchronizeDescription(removed, [p], saved.managed, 'npl-10'),
+    () => synchronizeDescription(removed, [p], saved.managed, 'agent-prompts-10'),
     /section was removed in Jira/,
   );
   // An untracked container with our identifier still blocks, even when forgetting.
   const lookalike = doc({
     type: 'expand',
-    attrs: { localId: 'npl-10', title: 'Agent Prompts' },
+    attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' },
     content: [paragraph('Mine')],
   });
   const moved = doc(paragraph('Intro'), { type: 'blockquote', content: [lookalike.content[0]] });
   assert.throws(
-    () => synchronizeDescription(moved, [], saved.managed, 'npl-10'),
+    () => synchronizeDescription(moved, [], saved.managed, 'agent-prompts-10'),
     /changed, moved or duplicated|untracked/,
   );
   // A changed block is not "deleted": empty selection still refuses.
   const changed = structuredClone(saved.description);
   changed.content[1].content[1].content[0].text = 'Edited';
   assert.throws(
-    () => synchronizeDescription(changed, [], saved.managed, 'npl-10'),
+    () => synchronizeDescription(changed, [], saved.managed, 'agent-prompts-10'),
     /changed, moved or duplicated/,
   );
 });

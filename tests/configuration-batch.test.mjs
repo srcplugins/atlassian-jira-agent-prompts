@@ -97,10 +97,10 @@ test('default schemes remain manual and shared membership changes invalidate the
   await refused(f, r, /changed after review/);
   assert.deepEqual(f.writes, []);
 });
-test('duplicate advance calls cannot create two types; stale and foreign-actor calls do not write', async () => {
+test('duplicate advance calls cannot create two types; stale calls and other pages do not write', async () => {
   const f = fixture();
   const r = await f.start();
-  await assert.rejects(f.api.advance('other', r.data.id, r.revision), /administrator/);
+  await assert.rejects(f.api.advance('other', r.data.id, r.revision), /page that started/);
   const results = await Promise.allSettled([
     f.api.advance('admin', r.data.id, r.revision),
     f.api.advance('admin', r.data.id, r.revision),
@@ -226,56 +226,24 @@ test('a failed global claim performs no Jira writes; acknowledged stop retains c
   assert.ok(f.configs.get('2').data.pending);
 });
 
-test('new configuration visit cancels own interrupted ready run, retaining completed changes', async () => {
+test('a reloaded page releases its abandoned ready run with acknowledgement, retaining completed changes', async () => {
   const f = fixture();
   let r = await f.start();
   r = await f.api.advance('admin', r.data.id, r.revision);
   const before = structuredClone(f.configs.get('1'));
   const writes = [...f.writes];
-  const stopped = await f.api.cancelInterrupted('admin');
+  // A reloaded page holds no key, so it releases the run like any other page.
+  await assert.rejects(f.api.stop('reloaded', r.data.id, r.revision, false), /Acknowledge/);
+  const stopped = await f.api.stop('reloaded', r.data.id, r.revision, true);
   assert.equal(stopped.data.status, 'stopped');
   assert.equal(stopped.data.index, 1);
   assert.deepEqual(f.configs.get('1'), before);
   assert.deepEqual(f.writes, writes);
   await assert.rejects(f.api.advance('admin', r.data.id, r.revision), /changed/);
-  assert.equal((await f.api.cancelInterrupted('admin')).revision, stopped.revision);
   assert.equal((await f.start({ type: '5' }, ['2'])).data.status, 'ready');
 });
 
-test('cancellation waits for in-flight space commit, then prevents the next space', async () => {
-  const f = fixture();
-  let release;
-  let entered;
-  const started = new Promise((resolve) => {
-    entered = resolve;
-  });
-  const wait = new Promise((resolve) => {
-    release = resolve;
-  });
-  const create = f.s.create;
-  f.s.create = async (name) => {
-    entered();
-    await wait;
-    return create(name);
-  };
-  const r = await f.start();
-  const advancing = f.api.advance('admin', r.data.id, r.revision);
-  await started;
-  const cancelling = await f.api.cancelInterrupted('admin');
-  assert.equal(cancelling.data.status, 'running');
-  assert.equal(cancelling.data.cancelRequested, true);
-  assert.equal((await f.api.cancelInterrupted('admin')).revision, cancelling.revision);
-  release();
-  const stopped = await advancing;
-  assert.equal(stopped.data.status, 'stopped');
-  assert.equal(stopped.data.index, 1);
-  assert.equal(stopped.data.inspectProject, undefined);
-  assert.equal(f.configs.get('1').data.type, '5');
-  assert.equal(f.configs.has('2'), false);
-  await assert.rejects(f.api.advance('admin', stopped.data.id, stopped.revision), /interrupted/);
-});
-
-test('expired running and uncertain attempts cancel without clearing space safety claims or retrying writes', async () => {
+test('expired running and uncertain attempts release without clearing space safety claims or retrying writes', async () => {
   for (const status of ['running', 'attention']) {
     const f = fixture();
     f.s.create = async () => {
@@ -287,7 +255,7 @@ test('expired running and uncertain attempts cancel without clearing space safet
     const pending = structuredClone(f.configs.get('1'));
     f.state().data.status = status;
     f.state().data.started = Date.now() - 121000;
-    const stopped = await f.api.cancelInterrupted('admin');
+    const stopped = await f.api.stop('other', r.data.id, f.state().revision, true);
     assert.equal(stopped.data.status, 'stopped');
     assert.equal(stopped.data.inspectProject, '1');
     assert.deepEqual(f.configs.get('1'), pending);
@@ -300,18 +268,17 @@ test('expired running and uncertain attempts cancel without clearing space safet
   }
 });
 
-test('opening another administrator’s page cannot cancel their run; denied admins cannot cancel', async () => {
+test('denied administrators cannot release a run, even with acknowledgement', async () => {
   const f = fixture();
   const r = await f.start();
-  assert.equal((await f.api.cancelInterrupted('other')).revision, r.revision);
-  assert.equal(f.state().data.status, 'ready');
   f.w.admin = async () => {
     throw new UserError('Denied');
   };
-  await assert.rejects(f.api.cancelInterrupted('admin'), /Denied/);
+  await assert.rejects(f.api.stop('other', r.data.id, r.revision, true), /Denied/);
+  assert.equal(f.state().data.status, 'ready');
 });
 
-test('a late callback cannot overwrite an expired cancelled run or a new run', async () => {
+test('a late callback cannot overwrite an expired released run or a new run', async () => {
   const f = fixture();
   let release;
   let entered;
@@ -330,7 +297,7 @@ test('a late callback cannot overwrite an expired cancelled run or a new run', a
   const advancing = f.api.advance('admin', r.data.id, r.revision);
   await started;
   f.state().data.started = Date.now() - 121000;
-  await f.api.cancelInterrupted('admin');
+  await f.api.stop('other', r.data.id, f.state().revision, true);
   const newer = await f.start({ type: '3' }, ['2']);
   release();
   await assert.rejects(advancing, /progress changed/);
@@ -338,43 +305,13 @@ test('a late callback cannot overwrite an expired cancelled run or a new run', a
   assert.equal(f.state().data.status, 'ready');
   assert.ok(f.configs.get('1').data.pending);
 });
-test('interrupted cancellation reconciles a lost metadata response without repeating writes', async () => {
-  const f = fixture();
-  await f.start();
-  const cas = f.w.cas;
-  let calls = 0;
-  f.w.cas = async (...args) => {
-    calls++;
-    await cas(...args);
-    throw Error('Response lost');
-  };
-  const cancelled = await f.api.cancelInterrupted('admin');
-  assert.equal(cancelled.data.status, 'stopped');
-  assert.equal(calls, 1);
-  assert.deepEqual(f.writes, []);
-});
-test('interrupted cancellation never cancels a replacement run after a conflict', async () => {
-  const f = fixture();
-  await f.start();
-  f.w.cas = async () => {
-    f.state().revision++;
-    f.state().data.id = 'replacement';
-    throw Error('Conflict');
-  };
-  const current = await f.api.cancelInterrupted('admin');
-  assert.equal(current.data.id, 'replacement');
-  assert.equal(current.data.status, 'ready');
-  assert.equal(current.data.cancelRequested, undefined);
-  assert.deepEqual(f.writes, []);
-});
-
 test('interrupted bulk setup removal retains completed removals and leaves remaining spaces configured', async () => {
   const f = fixture();
   for (const id of ['1', '2'])
     f.configs.set(id, { revision: 1, data: { type: '3', refreshAfterSave: true } });
   const start = await f.start({ unlink: true });
   await f.api.advance('admin', start.data.id, start.revision);
-  await f.api.cancelInterrupted('admin');
+  await f.api.stop('other', start.data.id, f.state().revision, true);
   assert.deepEqual(f.configs.get('1').data, { previousTypes: ['3'] });
   assert.equal(f.configs.get('2').data.type, '3');
   assert.equal(f.state().data.status, 'stopped');
@@ -441,15 +378,6 @@ test('a reload preference saved during a screen-only step is refused, so no adde
     assert.deepEqual(f.screens.records.get(screen).data.projects, ['1']);
   assert.equal(f.configs.get('1').data.refreshAfterSave, undefined);
 });
-test('cancellation notice describes this visit rather than replaying historical completion', async () => {
-  const f = fixture();
-  await f.start();
-  const fresh = await f.api.cancelInterrupted('admin');
-  assert.equal(fresh.cancelledNow, true);
-  assert.equal(f.state().cancelledNow, undefined);
-  assert.equal((await f.api.cancelInterrupted('admin')).cancelledNow, false);
-});
-
 test('catalog reports a work type discovery failure without hiding saved state or blocking setup removal', async () => {
   const f = fixture();
   const r = await f.start({ type: '3' }, ['1']);
@@ -525,20 +453,6 @@ test('a rejected creation stops the run without an outcome check and never creat
   await f.start({ name: 'Other' }, ['1']);
 });
 
-test('a not-applied outcome during cancellation keeps its reason and needs no outcome check', async () => {
-  const f = fixture();
-  let r = await f.start();
-  f.s.create = async () => {
-    // The owner opens Project configuration in another tab while the step runs.
-    await f.api.cancelInterrupted('admin');
-    throw new JiraRejected(403, 'Jira rejected creating the type (HTTP 403).');
-  };
-  r = await f.api.advance('admin', r.data.id, r.revision);
-  assert.equal(r.data.status, 'stopped');
-  assert.equal(r.data.inspectProject, undefined);
-  assert.match(r.data.message, /HTTP 403/);
-});
-
 test('a later space proceeds when Jira stores the created type under a normalized name', async () => {
   const f = fixture();
   let r = await f.start({ name: 'Prompt' }, ['1', '2']);
@@ -554,7 +468,7 @@ test('a later space proceeds when Jira stores the created type under a normalize
   assert.equal(f.writes.filter((w) => w === 'create').length, 1);
 });
 
-test('releasing another administrator’s ready run needs acknowledgement; the owner’s does not', async () => {
+test('releasing a run started on another page needs acknowledgement; the starting page’s does not', async () => {
   const f = fixture();
   let r = await f.start();
   await assert.rejects(f.api.stop('other-admin', r.data.id, r.revision, false), /Acknowledge/);
@@ -611,18 +525,6 @@ test('a storage outage before any write keeps the run ready; a defect stops it h
   assert.deepEqual(f.writes, []);
 });
 
-test('a polling view that names an older run never cancels a newer one', async () => {
-  const f = fixture();
-  const old = await f.start();
-  const stopped = await f.api.cancelInterrupted('admin');
-  assert.equal(stopped.data.status, 'stopped');
-  const next = await f.start({ type: '3' }, ['2']);
-  const polled = await f.api.cancelInterrupted('admin', old.data.id);
-  assert.equal(polled.data.id, next.data.id);
-  assert.equal(polled.data.status, 'ready');
-  assert.equal(polled.cancelledNow, false);
-  assert.equal(f.state().revision, next.revision);
-});
 // Screens: each reviewed space carries its own work type selection.
 function sharedScreenFixture() {
   const f = fixture();
@@ -1157,30 +1059,4 @@ test('a team-managed space whose saved entry names another type stops the run un
   );
   await refused(f, r, /changed after review/);
   assert.equal(f.configs.has('7'), false);
-});
-test('a cancel landing during the final record of a configured space keeps it done and stops the run', async () => {
-  const f = fixture();
-  let r = await f.start({ name: 'Prompt' }, ['1', '2']);
-  const id = r.data.id;
-  // The administrator's other view cancels just before the step records its confirmed outcome.
-  const cas = f.w.cas;
-  let cancelled = false;
-  f.w.cas = async (revision, data) => {
-    if (!cancelled && f.state()?.data.status === 'running' && data.status !== 'running') {
-      cancelled = true;
-      await f.api.cancelInterrupted('admin', id);
-    }
-    return cas(revision, data);
-  };
-  r = await f.api.advance('admin', id, r.revision);
-  assert.ok(cancelled);
-  assert.deepEqual(f.writes, ['create', 'attach 91']);
-  assert.equal(f.configs.get('1').data.type, '5');
-  assert.equal(r.data.status, 'stopped');
-  assert.equal(r.data.cancelRequested, true);
-  assert.equal(r.data.entries[0].status, 'done');
-  assert.equal(r.data.entries[1].status, 'waiting');
-  assert.equal(r.data.inspectProject, undefined);
-  assert.equal(r.data.type, '5');
-  assert.match(r.data.message, /Interrupted configuration cancelled/);
 });

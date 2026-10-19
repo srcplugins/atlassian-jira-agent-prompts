@@ -31,7 +31,7 @@ function normalize(description) {
   return copy;
 }
 const block = (description) =>
-  (description?.content ?? []).filter((node) => node.attrs?.localId === 'npl-10');
+  (description?.content ?? []).filter((node) => node.attrs?.localId === 'agent-prompts-10');
 
 function world(seed, features) {
   const random = rng(seed);

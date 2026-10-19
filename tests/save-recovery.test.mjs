@@ -264,7 +264,7 @@ test('release is refused when Jira no longer holds the pre-save state, even with
   // A changed section is still present; with no section at all, release is allowed.
   f.target.fields.description.content.push({
     type: 'expand',
-    attrs: { localId: 'npl-10', title: 'Agent Prompts' },
+    attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' },
     content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Edited copy' }] }],
   });
   await f.p.cas('10', 0, {

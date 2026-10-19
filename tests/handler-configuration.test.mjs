@@ -208,7 +208,7 @@ function store() {
     FilterConditions: { notExists: () => 'missing', equalTo: (value) => ['equal', value] },
     kvs: {
       entity: (name) => {
-        assert.equal(name, 'native-prompt-state');
+        assert.equal(name, 'agent-prompt-state');
         return { get: async (key) => structuredClone(records.get(key)) };
       },
       transact: () => {
@@ -222,7 +222,7 @@ function store() {
           check: (key, options) => (checks.push([key, options]), transaction),
           execute: async () => {
             for (const [key, options] of checks) {
-              assert.equal(options.entityName, 'native-prompt-state');
+              assert.equal(options.entityName, 'agent-prompt-state');
               const [attribute, condition] = options.conditions.condition;
               assert.equal(attribute, 'revision');
               conditions.push([key, condition]);
@@ -230,7 +230,7 @@ function store() {
                 throw Error('conditional check failed');
             }
             for (const [key, , options] of operations) {
-              assert.equal(options.entityName, 'native-prompt-state');
+              assert.equal(options.entityName, 'agent-prompt-state');
               const [attribute, condition] = options.conditions.condition;
               assert.equal(attribute, 'revision');
               conditions.push([key, condition]);
@@ -279,10 +279,18 @@ function harness(site = jira()) {
     ...kv,
     fieldType: () => 'exact-field',
   });
+  // Like the page that started a run, `call` keeps each run's one-time key and sends it with
+  // that run's later requests.
+  const keys = new Map();
   const call = async (name, payload) => {
+    if (keys.has(payload.id)) payload = { key: keys.get(payload.id), ...payload };
     const result = await resolvers[name]({ context, payload });
     assert.equal(result.ok, true, `${name}: ${result.error}`);
-    return result.value;
+    if (name !== 'configuration-start') return result.value;
+    const { key, ...value } = result.value;
+    assert.equal(typeof key, 'string');
+    keys.set(value.data.id, key);
+    return value;
   };
   return { site, kv, call, resolvers };
 }
@@ -319,7 +327,7 @@ test('configure, review, apply and finish through the resolvers creates one type
     revision: 0,
   });
   assert.equal(started.data.status, 'ready');
-  assert.equal(started.data.actor, 'admin');
+  assert.equal(JSON.stringify(started).includes('admin'), false, 'no account is stored');
   assert.deepEqual(started.data.input, { name: 'Prompt', reloadAfterSave: 'on' });
   assert.deepEqual(h.site.writes, [], 'starting the batch never writes Jira');
 
@@ -404,7 +412,7 @@ test('a reviewed configuration that is stopped before it advances writes nothing
   // A stale revision is refused rather than overwriting the stopped batch.
   const stale = await h.resolvers['configuration-advance']({
     context,
-    payload: { id: started.data.id, revision: started.revision },
+    payload: { id: started.data.id, revision: started.revision, key: 'any' },
   });
   assert.equal(stale.ok, false);
   assert.deepEqual(h.site.writes, []);
@@ -663,7 +671,6 @@ test('the reload preference is refused while a configuration step is changing th
     revision: 3,
     data: {
       id: 'run',
-      actor: 'admin',
       input: { type: '10', reloadAfterSave: 'keep' },
       entries: [{ projectId, fingerprint: 'f'.repeat(64), status: 'waiting' }],
       index: 0,
@@ -788,20 +795,18 @@ test('a configuration run saved with the retired reload option stops without a c
     type: '10',
     reloadAfterSave: 'off',
   });
-  // A run saved by an earlier version, which stored the reload option as a boolean.
-  h.kv.records.set('configuration-batch', {
-    revision: 1,
-    data: {
-      id: 'earlier',
-      actor: 'admin',
-      input: { type: '10', refreshAfterSave: false },
-      entries: [{ projectId: '1', fingerprint: preview.fingerprint, status: 'waiting' }],
-      index: 0,
-      status: 'ready',
-      started: Date.now(),
-    },
+  const started = await h.call('configuration-start', {
+    type: '10',
+    reloadAfterSave: 'off',
+    entries: [{ projectId: '1', fingerprint: preview.fingerprint }],
+    revision: 0,
   });
-  const run = await h.call('configuration-advance', { id: 'earlier', revision: 1 });
+  // The saved run stores the reload option in the retired boolean form.
+  h.kv.records.get('configuration-batch').data.input = { type: '10', refreshAfterSave: false };
+  const run = await h.call('configuration-advance', {
+    id: started.data.id,
+    revision: started.revision,
+  });
   assert.equal(run.data.status, 'stopped');
   assert.match(
     run.data.message,

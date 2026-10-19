@@ -233,19 +233,6 @@ test('creation checks names against ineligible type categories too', async () =>
   }
 });
 
-test('another administrator must review their own setup change', async () => {
-  const f = fixture();
-  const plan = await f.settings.preview(c, { type: '4' });
-  await assert.rejects(
-    f.settings.apply(
-      { ...c, accountId: 'other-admin' },
-      { type: '4', fingerprint: plan.fingerprint },
-    ),
-    /Review/,
-  );
-  assert.deepEqual(f.writes, []);
-});
-
 test('all setup endpoints enforce administrator permission and the requested space before writes', async () => {
   for (const action of ['health', 'preview', 'apply', 'recover', 'resolve', 'preferences']) {
     const denied = fixture();

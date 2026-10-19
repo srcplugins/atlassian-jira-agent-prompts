@@ -25,7 +25,7 @@ import {
   removeSetup,
 } from './support/team-managed.mjs';
 test.use({ fixtureApp: agentPromptsFixture });
-test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
+test('AP-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
   test.skip(
     process.env.NATIVE_IDENTITY_TESTS !== '1',
     'Explicit identity mode and saved consenting actors required',
@@ -67,14 +67,14 @@ test('NPL-04 real non-admin sessions cannot administer setup', async ({ browser,
   }
 });
 for (const blank of [false, true]) {
-  test(`${blank ? 'NPL-03 blank Description round-trip' : 'NPL-01 prompt snapshots, explicit Sync and precise removal'}`, async ({
+  test(`${blank ? 'AP-03 blank Description round-trip' : 'AP-01 prompt snapshots, explicit Sync and precise removal'}`, async ({
     page,
     owned,
   }, testInfo) => {
     await snapshotJourney({ page, owned, blank, testInfo });
   });
 }
-test('NPL-13 retired prompt: hidden from search, kept selection still syncs', async ({
+test('AP-13 retired prompt: hidden from search, kept selection still syncs', async ({
   page,
   owned,
 }, testInfo) => {
@@ -89,7 +89,7 @@ async function configuration(page, owned, global = false) {
   return checkSpace(page, t, owned.project.key, owned.project.id);
 }
 
-test('NPL-02 selected space health and cancelled modal preserve Jira', async ({ page, owned }) => {
+test('AP-02 selected space health and cancelled modal preserve Jira', async ({ page, owned }) => {
   const t = installation('agent-prompts');
   const issue = await owned.issue('Setup read-only baseline');
   const before = await owned.api(`/issue/${issue.id}?fields=description,issuetype`);
@@ -122,7 +122,7 @@ test('NPL-02 selected space health and cancelled modal preserve Jira', async ({ 
   );
 });
 
-test('NPL-11 details modal keeps focus, contrast and layout in dark theme and narrow width', async ({
+test('AP-11 details modal keeps focus, contrast and layout in dark theme and narrow width', async ({
   page,
   owned,
   theme,
@@ -200,7 +200,7 @@ test('NPL-11 details modal keeps focus, contrast and layout in dark theme and na
   );
 });
 
-test('NPL-05 unified global configuration checks selected spaces and selects across pages', async ({
+test('AP-05 unified global configuration checks selected spaces and selects across pages', async ({
   page,
   owned,
 }, testInfo) => {
@@ -270,7 +270,6 @@ test('NPL-05 unified global configuration checks selected spaces and selects acr
         'settings-projects',
         'settings-health',
         'configuration-status',
-        'configuration-cancel-interrupted',
         'configuration-catalog',
       ].includes(c),
     ),
@@ -280,7 +279,7 @@ test('NPL-05 unified global configuration checks selected spaces and selects acr
   expect(after.description).toEqual(before.description);
 });
 
-test('NPL-06 empty prompt save preserves unsaved selection during read-only recovery', async ({
+test('AP-06 empty prompt save preserves unsaved selection during read-only recovery', async ({
   page,
   owned,
 }, testInfo) => {
@@ -374,7 +373,7 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
   );
 });
 
-test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-only save', async ({
+test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-only save', async ({
   page,
   owned,
 }) => {
@@ -434,15 +433,17 @@ test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-on
   await save();
   const linked = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
   expect(linked[field.id]).toEqual([sourceIssue.key]);
-  expect(linked.description.content.some((n) => n.attrs?.localId === `npl-${target.id}`)).toBe(
-    true,
-  );
+  expect(
+    linked.description.content.some((n) => n.attrs?.localId === `agent-prompts-${target.id}`),
+  ).toBe(true);
   // An editor deletes the whole Agent Prompts section in Jira and adds their own text.
   const deletedDescription = {
     type: 'doc',
     version: 1,
     content: [
-      ...linked.description.content.filter((n) => n.attrs?.localId !== `npl-${target.id}`),
+      ...linked.description.content.filter(
+        (n) => n.attrs?.localId !== `agent-prompts-${target.id}`,
+      ),
       { type: 'paragraph', content: [{ type: 'text', text: 'Edited after deleting the block.' }] },
     ],
   };
@@ -486,7 +487,7 @@ test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-on
   owned.run.persist();
 });
 
-test('NPL-08 opt-in work item reload follows a confirmed save and restores the space preference', async ({
+test('AP-08 opt-in work item reload follows a confirmed save and restores the space preference', async ({
   page,
   owned,
 }, testInfo) => {
@@ -539,7 +540,7 @@ test('NPL-08 opt-in work item reload follows a confirmed save and restores the s
         ...target.expected.description.content,
         {
           type: 'expand',
-          attrs: { localId: `npl-${target.id}`, title: 'Agent Prompts' },
+          attrs: { localId: `agent-prompts-${target.id}`, title: 'Agent Prompts' },
           content: [
             {
               type: 'heading',
@@ -674,7 +675,7 @@ test('NPL-08 opt-in work item reload follows a confirmed save and restores the s
   }
 });
 
-test('NPL-09 newest prompts, server search and cursor pages preserve draft selections', async ({
+test('AP-09 newest prompts, server search and cursor pages preserve draft selections', async ({
   page,
   owned,
   theme,
@@ -769,7 +770,7 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
 
 test.describe('team-managed space', () => {
   test.use({ fixtureProfile: teamManagedFixture });
-  test('NPL-12 team-managed space: field placement, own prompt type, Save and Sync, setup removal', async ({
+  test('AP-12 team-managed space: field placement, own prompt type, Save and Sync, setup removal', async ({
     page,
     owned,
   }, testInfo) => {

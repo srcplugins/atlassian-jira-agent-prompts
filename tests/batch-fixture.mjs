@@ -74,7 +74,22 @@ export function batchFixture(ids = ['1', '2', '7']) {
       run = { revision: revision + 1, data: structuredClone(data) };
     },
   };
-  const api = createConfigurationBatch(p, s, w);
+  const batch = createConfigurationBatch(p, s, w);
+  // A run's one-time key is held by the page that started it. Here the first argument names the
+  // page: 'admin' started the run and holds its key; any other name is another page without it.
+  const keys = new Map();
+  const keyOf = (page, id) => (page === 'admin' ? keys.get(id) : undefined);
+  const api = {
+    ...batch,
+    async start(page, input, entries, revision) {
+      const { key, ...r } = await batch.start(input, entries, revision);
+      if (page === 'admin') keys.set(r.data.id, key);
+      return r;
+    },
+    advance: (page, id, revision) => batch.advance(page, keyOf(page, id), id, revision),
+    stop: (page, id, revision, acknowledged) =>
+      batch.stop(keyOf(page, id), id, revision, acknowledged),
+  };
   /** `screenTypes` maps a space to the work types reviewed for its screens. Like Configure, a
    * configuration names a reload choice; keep unless the test chooses one. */
   async function start(options = { name: 'Prompt' }, ids = ['1', '2'], screenTypes = {}) {
@@ -97,6 +112,8 @@ export function batchFixture(ids = ['1', '2', '7']) {
   }
   return {
     api,
+    batch,
+    keys,
     p,
     s,
     w,

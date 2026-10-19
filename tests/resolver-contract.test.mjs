@@ -42,7 +42,6 @@ test('the resolver set is exactly the supported surface', () => {
   assert.deepEqual(resolvers.sort(), [
     'accept-save',
     'configuration-advance',
-    'configuration-cancel-interrupted',
     'configuration-catalog',
     'configuration-options',
     'configuration-preview',
@@ -102,7 +101,6 @@ const valid = {
   'settings-preferences': { projectId: '1', revision: 0, refreshAfterSave: true },
   'configuration-catalog': {},
   'configuration-status': {},
-  'configuration-cancel-interrupted': {},
   'configuration-options': { projectId: '1' },
   'configuration-preview': {
     projectId: '1',
@@ -117,8 +115,8 @@ const valid = {
     entries: [{ projectId: '1', fingerprint: 'x', screenTypes: ['4'] }],
     revision: 0,
   },
-  'configuration-advance': { id: 'x', revision: 0 },
-  'configuration-stop': { id: 'x', revision: 0 },
+  'configuration-advance': { id: 'x', revision: 0, key: 'k' },
+  'configuration-stop': { id: 'x', revision: 0, key: 'k' },
 };
 
 test('an unexpected error in any resolver returns the generic message and logs one fixed line', async (t) => {

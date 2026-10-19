@@ -22,7 +22,8 @@ export interface InventoryProject {
 }
 export interface BatchData {
   id: string;
-  actor: string;
+  /** Hash of the one-time key held only by the page that started the run; no account is stored. */
+  owner: string;
   input: SettingsInput;
   entries: {
     projectId: string;
@@ -46,7 +47,6 @@ export interface BatchData {
   status: 'ready' | 'running' | 'attention' | 'complete' | 'stopped';
   started: number;
   message?: string;
-  cancelRequested?: boolean;
   inspectProject?: string;
 }
 export interface BatchRecord {
@@ -102,6 +102,8 @@ function batchInput(input: SettingsInput, own = false): SettingsInput {
     throw new UserError('Choose a work type name of 1–60 characters.');
   return { name, ...shared, ...preference };
 }
+/** The stored form of a run's one-time key; anything but a non-empty string owns nothing. */
+const ownerOf = (key: unknown) => (typeof key === 'string' && key ? hash(['run', key]) : '');
 export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPorts) {
   const settings = createSettings(p, s);
   const active = (r?: BatchRecord) => !!r && !finished(r.data.status);
@@ -133,66 +135,22 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
       await w.admin();
       return (await w.get()) ?? null;
     },
-    /** `only`: a polling view names the batch it is waiting for, so a later batch is never
-     * cancelled by an older view's timer. */
-    async cancelInterrupted(actor: string, only?: string) {
+    async options(accountId: string, projectId: string) {
       await w.admin();
-      let r = await w.get();
-      if (only !== undefined && r?.data.id !== only)
-        return r ? { ...r, cancelledNow: false } : null;
-      const id = r?.data.id;
-      const cancelling = !!active(r) && r?.data.actor === actor;
-      const response = (value?: BatchRecord) =>
-        value
-          ? {
-              ...value,
-              cancelledNow:
-                cancelling && value.data.id === id && value.data.cancelRequested === true,
-            }
-          : null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (!r || r.data.id !== id || !active(r) || r.data.actor !== actor) return response(r);
-        // Keep the lock while the current resolver can still be completing its space.
-        const waiting = r.data.status === 'running' && Date.now() - r.data.started < 120_000;
-        if (waiting && r.data.cancelRequested) return response(r);
-        const uncertain = ['running', 'attention'].includes(r.data.status);
-        const project = uncertain ? r.data.entries[r.data.index]?.projectId : undefined;
-        const data: BatchData = {
-          ...r.data,
-          cancelRequested: true,
-          status: waiting ? 'running' : 'stopped',
-          ...(project ? { inspectProject: project } : {}),
-          message: waiting
-            ? 'Cancelling the previous configuration. Waiting for the current space to finish.'
-            : 'Interrupted configuration cancelled. Completed changes were kept. You can configure spaces again.',
-        };
-        try {
-          await w.cas(r.revision, data);
-          return response({ revision: r.revision + 1, data });
-        } catch (e) {
-          if (attempt === 2) throw e;
-          // Reconcile a concurrent completion or lost metadata response. No Jira write
-          // is repeated, and a replacement run must never be cancelled by this request.
-          r = await w.get();
-        }
-      }
-      return response(r);
+      return settings.options({ accountId, projectId: numeric(projectId) });
     },
-    async options(actor: string, projectId: string) {
-      await w.admin();
-      return settings.options({ accountId: actor, projectId: numeric(projectId) });
-    },
-    async preview(actor: string, projectId: string, input: SettingsInput) {
+    async preview(accountId: string, projectId: string, input: SettingsInput) {
       await w.admin();
       const { screenTypes, ...rest } = input;
       const types = screenTypesInput(screenTypes);
       return settings.preview(
-        { accountId: actor, projectId: numeric(projectId) },
+        { accountId, projectId: numeric(projectId) },
         { ...batchInput(rest), ...(types ? { screenTypes: types } : {}) },
       );
     },
+    /** Returns the run's one-time key, which only the starting page keeps: continuing needs it,
+     * and releasing without it needs the abandoned acknowledgement. */
     async start(
-      actor: string,
       input: SettingsInput,
       entries: { projectId: string; fingerprint: string; screenTypes?: string[]; type?: string }[],
       revision: number,
@@ -220,9 +178,10 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
       const typed = entries.filter((e) => e.type !== undefined).length;
       if (typed && typed !== entries.length)
         throw new UserError('Configure company-managed and team-managed spaces separately.');
+      const key = randomUUID();
       const data: BatchData = {
         id: randomUUID(),
-        actor,
+        owner: ownerOf(key),
         input: batchInput(input, typed > 0),
         entries: entries.map((e) => {
           const screenTypes = screenTypesInput(e.screenTypes);
@@ -244,14 +203,14 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         started: Date.now(),
       };
       await w.cas(revision, data);
-      return { revision: revision + 1, data };
+      return { revision: revision + 1, data, key };
     },
-    async advance(actor: string, id: string, revision: number) {
+    async advance(accountId: string, key: unknown, id: string, revision: number) {
       const record = await current(id, revision);
       const d = record.data;
-      if (d.actor !== actor)
+      if (ownerOf(key) !== d.owner)
         throw new UserError(
-          'Only the administrator who reviewed this configuration can continue it.',
+          'Only the page that started this configuration can continue it. Release it in Space configuration, then configure again.',
         );
       if (d.status !== 'ready')
         throw new UserError(
@@ -262,7 +221,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         throw new UserError(
           'Saved configuration progress is incomplete. Inspect it before continuing.',
         );
-      const c = { accountId: actor, projectId: entry.projectId };
+      const c = { accountId, projectId: entry.projectId };
       // An earlier step of this run already changed this space. A step leaves screen changes for
       // later only after making one or after its type writes, so remaining changes with none
       // applied still mean the type was created or attached.
@@ -355,9 +314,9 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
             d.input.name && d.type
               ? { ...facts, type: undefined, name: d.input.name, typeName: d.input.name }
               : facts;
-          if (hash([actor, reviewed]) !== entry.fingerprint && effect)
+          if (hash(reviewed) !== entry.fingerprint && effect)
             reviewed = { ...reviewed, attach: true };
-          if (hash([actor, reviewed]) !== entry.fingerprint) {
+          if (hash(reviewed) !== entry.fingerprint) {
             // An earlier space of this run that stopped relying on a shared screen the app added
             // the field to can leave this space as the last one, so its reviewed leave is now a
             // removal. Name that cause rather than blaming an outside change.
@@ -411,24 +370,11 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
           latest.data.id !== id ||
           latest.data.index !== d.index ||
           latest.data.status !== 'running' ||
-          (latest.revision !== revision + 1 &&
-            !(latest.revision === revision + 2 && latest.data.cancelRequested))
+          latest.revision !== revision + 1
         )
           throw new UserError('Configuration progress changed. No further spaces were configured.');
-        const next: BatchData = latest.data.cancelRequested
-          ? {
-              ...data,
-              cancelRequested: true,
-              status: 'stopped',
-              ...(data.status === 'attention' ? { inspectProject: entry!.projectId } : {}),
-              message:
-                data.status === 'stopped' && data.message
-                  ? data.message
-                  : 'Interrupted configuration cancelled. Completed changes were kept. You can configure spaces again.',
-            }
-          : data;
-        await w.cas(latest.revision, next);
-        return { revision: latest.revision + 1, data: next };
+        await w.cas(latest.revision, data);
+        return { revision: latest.revision + 1, data };
       }
       let outcome: Awaited<ReturnType<typeof settings.apply>>;
       try {
@@ -536,12 +482,12 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         return finish(next);
       }
     },
-    async stop(actor: string, id: string, revision: number, acknowledged: boolean) {
+    async stop(key: unknown, id: string, revision: number, acknowledged: boolean) {
       const r = await current(id, revision);
       if (!active(r)) return r;
-      // Releasing another administrator's batch always needs an explicit acknowledgement;
+      // Releasing a run started from another page always needs an explicit acknowledgement;
       // an in-flight or uncertain step also needs the two-minute wait.
-      if (r.data.actor !== actor && !acknowledged)
+      if (r.data.owner !== ownerOf(key) && !acknowledged)
         throw new UserError(
           'Acknowledge that this configuration is abandoned before releasing it.',
         );
@@ -558,7 +504,6 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
       const data: BatchData = {
         ...r.data,
         status: 'stopped',
-        cancelRequested: true,
         ...(inspectProject ? { inspectProject } : {}),
         message:
           'Configuration released. Completed spaces remain configured. Review unfinished spaces in a new configuration; reuse any type already created.',

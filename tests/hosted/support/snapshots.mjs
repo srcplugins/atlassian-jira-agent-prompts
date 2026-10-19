@@ -247,7 +247,7 @@ export async function snapshotJourney({
       ...(target.expected.description?.content ?? []),
       {
         type: 'expand',
-        attrs: { localId: `npl-${target.id}`, title: 'Agent Prompts' },
+        attrs: { localId: `agent-prompts-${target.id}`, title: 'Agent Prompts' },
         content: [
           {
             type: 'heading',
@@ -269,7 +269,7 @@ export async function snapshotJourney({
   );
   const ref = linked.description.content.at(-1);
   expect(ref.type).toBe('expand');
-  expect(ref.attrs).toEqual({ localId: `npl-${target.id}`, title: 'Agent Prompts' });
+  expect(ref.attrs).toEqual({ localId: `agent-prompts-${target.id}`, title: 'Agent Prompts' });
   expect(ref.content.slice(1)).toEqual(source.expected.description.content);
   expect(JSON.stringify(linked.description)).toContain(sentinel);
   expect(linked[field.id]).toEqual([sourceIssue.key]);

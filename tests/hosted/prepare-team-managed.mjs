@@ -68,7 +68,7 @@ try {
   save({ ...old, key, id: project.id, status: 'verified' });
 
   const field = (await api('/field')).find((f) =>
-    String(f.schema?.custom ?? '').endsWith('/native-prompts-field'),
+    String(f.schema?.custom ?? '').endsWith('/agent-prompts-field'),
   )?.id;
   assert.ok(field, 'The Agent Prompts field is missing; install the app first');
   const types = async () =>

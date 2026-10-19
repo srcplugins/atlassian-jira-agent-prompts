@@ -1,4 +1,4 @@
-// The team-managed space's steps shared by NPL-12 and the Rovo runner.
+// The team-managed space's steps shared by AP-12 and the Rovo runner.
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { observeAction } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { expect } from './expect.mjs';

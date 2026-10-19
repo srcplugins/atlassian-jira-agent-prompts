@@ -35,16 +35,14 @@ function ui(
       if (name === 'configuration-options') {
         // `optionsFailure` fails each listed space's next read once.
         if (f.optionsFailure?.delete(p.projectId)) throw Error('Work types unavailable');
-        value = await f.api.options(f.actor ?? 'admin', p.projectId);
+        value = await f.api.options('admin', p.projectId);
       }
-      if (name === 'configuration-preview')
-        value = await f.api.preview(f.actor ?? 'admin', p.projectId, p);
-      if (name === 'configuration-start')
-        value = await f.api.start(f.actor ?? 'admin', p, p.entries, p.revision);
+      if (name === 'configuration-preview') value = await f.api.preview('admin', p.projectId, p);
+      if (name === 'configuration-start') value = await f.batch.start(p, p.entries, p.revision);
       if (name === 'configuration-advance')
-        value = await f.api.advance(f.actor ?? 'admin', p.id, p.revision);
+        value = await f.batch.advance('admin', p.key, p.id, p.revision);
       if (name === 'configuration-stop')
-        value = await f.api.stop(f.actor ?? 'admin', p.id, p.revision, p.acknowledged);
+        value = await f.batch.stop(p.key, p.id, p.revision, p.acknowledged);
       if (f.dropStart && name === 'configuration-start') {
         f.dropStart = false;
         throw Error('Response lost');
@@ -54,14 +52,22 @@ function ui(
       return { ok: false, error: e.message };
     }
   };
+  // The page holding run keys: by default the one whose runs `f.start()` started; `f.page`
+  // names another page, which holds only the keys of runs it starts itself.
+  const page = f.page ?? 'admin';
+  f.pages ??= new Map([['admin', f.keys]]);
+  if (!f.pages.has(page)) f.pages.set(page, new Map());
+  const keys = f.pages.get(page);
   const hooks = hookHost();
   const { ConfigurationDialog } = load('configuration-dialog.tsx', {
     react: hooks.react,
+    './run-keys': {
+      runKeys: { set: (id, key) => void keys.set(id, key), get: (id) => id && keys.get(id) },
+    },
     './space-reads': { readSpaces },
     './batch-status': { finished },
     './client': bridgeClient(invoke),
     '@forge/react': {
-      useProductContext: () => f.context ?? { accountId: f.actor ?? 'admin' },
       ...standIns(
         'Box',
         'Modal',
@@ -194,7 +200,7 @@ test('configuration dialog can reopen durable progress even when initial confirm
   assert.equal(f.writes.filter((x) => x === 'create').length, 1);
 });
 
-test('confirmation response loss exposes read-only recovery without a duplicate create', async () => {
+test('confirmation response loss exposes read-only recovery and release without any Jira write', async () => {
   const f = batchFixture();
   f.dropStart = true;
   const v = ui(f);
@@ -206,10 +212,17 @@ test('confirmation response loss exposes read-only recovery without a duplicate 
   await v.click('Apply changes');
   assert.equal(v.hasButton('Check saved progress'), true);
   assert.deepEqual(f.writes, []);
+  // The lost response carried the run's key, so this page cannot continue it, only release it.
   await v.click('Check saved progress');
-  await v.click('Continue reviewed changes');
-  assert.equal(f.state().data.status, 'complete');
-  assert.equal(f.writes.filter((x) => x === 'create').length, 1);
+  assert.equal(v.hasButton('Continue reviewed changes'), false);
+  v.change(
+    'Checkbox',
+    'I confirmed this configuration is abandoned and inspected its affected Jira changes.',
+    { target: { checked: true } },
+  );
+  await v.click('Release abandoned configuration');
+  assert.equal(f.state().data.status, 'stopped');
+  assert.deepEqual(f.writes, []);
 });
 
 test('a completed prior run does not prevent opening a fresh review', async () => {
@@ -497,27 +510,11 @@ test('the space pager is disabled while a review or an apply is in flight', asyn
   assert.equal(f.state().data.status, 'complete');
 });
 
-test('Continue reviewed changes waits for the product context to name the viewer', async () => {
-  const f = batchFixture();
-  await f.start();
-  // Before the context resolves, the saved run cannot be known to be the viewer's own.
-  f.context = {};
-  const unknown = ui(f);
-  await unknown.mount();
-  assert.equal(unknown.hasButton('Continue reviewed changes'), false);
-  assert.equal(unknown.hasButton('Check saved progress'), true);
-  f.context = undefined;
-  const known = ui(f);
-  await known.mount();
-  assert.equal(known.hasButton('Continue reviewed changes'), true);
-  assert.deepEqual(f.writes, []);
-});
-
-test('another administrator can release an abandoned configuration without continuing its writes', async () => {
+test('another page can release an abandoned configuration without continuing its writes', async () => {
   const f = batchFixture();
   const r = await f.start();
   await f.api.advance('admin', r.data.id, r.revision);
-  f.actor = 'replacement-admin';
+  f.page = 'other';
   const before = structuredClone(f.configs.get('1'));
   const v = ui(f);
   await v.mount();
@@ -541,11 +538,10 @@ test('another administrator can release an abandoned configuration without conti
   await next.click('Review changes');
   await next.click('Apply changes');
   assert.equal(f.state().data.status, 'complete');
-  assert.equal(f.state().data.actor, 'replacement-admin');
   assert.deepEqual(f.writes, ['create', 'attach 91', 'attach 92']);
 });
 
-test('foreign-admin release retains uncertain space claims and enforces the wait and fresh acknowledgement', async () => {
+test('releasing from another page retains uncertain space claims and enforces the wait and fresh acknowledgement', async () => {
   const f = batchFixture();
   f.s.attach = async () => {
     throw Error('Association outcome unknown');
@@ -553,7 +549,7 @@ test('foreign-admin release retains uncertain space claims and enforces the wait
   const r = await f.start();
   await f.api.advance('admin', r.data.id, r.revision);
   const pending = structuredClone(f.configs.get('1'));
-  f.actor = 'replacement-admin';
+  f.page = 'other';
   const v = ui(f);
   await v.mount();
   const acknowledgement =
@@ -569,13 +565,12 @@ test('foreign-admin release retains uncertain space claims and enforces the wait
   await v.click('Release abandoned configuration');
   assert.equal(f.state().data.status, 'stopped');
   assert.equal(f.state().data.inspectProject, '1');
-  assert.equal(f.state().data.cancelRequested, true);
   assert.match(v.text(), /Outcome needs inspection/);
   assert.deepEqual(f.configs.get('1'), pending);
   assert.deepEqual(f.writes, ['create']);
 });
 
-test('own runs retain automatic cancellation without an abandoned-run control', async () => {
+test('the starting page continues its run without an abandoned-run control', async () => {
   const f = batchFixture();
   await f.start();
   const v = ui(f);
@@ -621,7 +616,7 @@ test('setup removal remains reviewable when type discovery, inventory or the cat
 test('saved progress remains observable and recoverable when catalog discovery fails', async () => {
   const f = batchFixture();
   await f.start();
-  f.actor = 'replacement-admin';
+  f.page = 'other';
   f.catalogFailure = true;
   const v = ui(f);
   await v.mount();
@@ -647,7 +642,7 @@ test('saved progress names a space outside the loaded inventory by its ID, never
 test('failed initial progress read blocks new mutations until an explicit successful status check', async () => {
   const f = batchFixture();
   await f.start();
-  f.actor = 'replacement-admin';
+  f.page = 'other';
   f.statusFailure = true;
   const v = ui(f);
   await v.mount();
@@ -959,8 +954,8 @@ function typeOnlyFirstStep(f, during = () => {}) {
     f.screens.clock.left = 3_500;
     during();
   };
-  const advance = f.api.advance;
-  f.api.advance = async (...a) => {
+  const advance = f.batch.advance;
+  f.batch.advance = async (...a) => {
     try {
       return await advance(...a);
     } finally {
@@ -1454,9 +1449,9 @@ test('after a lost step response the space in flight needs inspection, not confi
   const f = batchFixture();
   const v = ui(f, [f.projects.get('1'), f.projects.get('2')]);
   await reviewNew(v);
-  const advance = f.api.advance;
+  const advance = f.batch.advance;
   let lost = true;
-  f.api.advance = async (...args) => {
+  f.batch.advance = async (...args) => {
     const value = await advance(...args);
     if (lost) {
       lost = false;

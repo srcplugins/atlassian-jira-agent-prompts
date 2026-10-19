@@ -258,11 +258,10 @@ try {
     page.setDefaultTimeout(30000);
     const t = installation('agent-prompts');
     // Space configuration renders only for an eligible space, so opening it on the retained
-    // fixture checks app eligibility before any creation. Opening it also cancels this actor's own
-    // interrupted configuration and returns progress.
+    // fixture checks app eligibility before any creation. Opening it also returns saved progress.
     const before = await observeAction(
       page,
-      'configuration-cancel-interrupted',
+      'configuration-status',
       () => spaceSettings(page, fixtureProject(agentPromptsFixture)),
       t,
     );
@@ -1146,17 +1145,17 @@ try {
         b.setDefaultTimeout(30000);
         // A freshly signed-in administrator meets Jira's first-run dialog over the page.
         await dismissOnboarding(b);
-        // Opening the view must not cancel another administrator's configuration.
+        // Opening the view leaves the configuration started on the other page unchanged, and the
+        // saved run names no account.
         const seen = await observeAction(
           b,
-          'configuration-cancel-interrupted',
+          'configuration-status',
           () => spaceSettings(b, primary.key),
           t,
         );
-        assert.equal(seen.data.actor, owner.accountId);
+        assert.equal(JSON.stringify(seen).includes(owner.accountId), false);
         assert.equal(seen.data.status, 'ready');
         assert.equal(seen.data.index, 1);
-        assert.notEqual(seen.data.cancelRequested, true);
         await b.getByRole('button', { name: 'Review saved configuration', exact: true }).click();
         const release = b.getByRole('button', {
           name: 'Release abandoned configuration',

@@ -542,7 +542,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         availableTypes: [] as { id: string; name: string }[],
         screens,
       };
-      return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
+      return { ...result, fingerprint: hash(result), screenProjects: labels };
     }
     const project = await admin(c);
     // A team-managed space's administrator creates the prompt type and places the field by hand,
@@ -582,7 +582,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         availableTypes: [] as { id: string; name: string }[],
         screens,
       };
-      return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
+      return { ...result, fingerprint: hash(result), screenProjects: labels };
     }
     const value = await inspect(c, project);
     if (value.state.data.pending)
@@ -663,7 +663,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       screens,
     };
     // Space names for the screen impact review are display-only, so outside the fingerprint.
-    return { ...result, fingerprint: hash([c.accountId, result]), screenProjects: labels };
+    return { ...result, fingerprint: hash(result), screenProjects: labels };
   }
   return {
     async preferences(c: Context, input: { revision: number; refreshAfterSave: boolean }) {

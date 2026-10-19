@@ -23,11 +23,11 @@ import {
   Stack,
   Text,
   Textfield,
-  useProductContext,
 } from '@forge/react';
 import { call } from './client';
 import { readSpaces } from './space-reads';
 import { finished } from './batch-status';
+import { runKeys } from './run-keys';
 import { createLatch } from './shared/latch.mjs';
 import type {
   createConfigurationBatch,
@@ -126,7 +126,6 @@ export function ConfigurationDialog({
   onClose: (mutated: boolean) => void;
   onBusy: (value: boolean) => void;
 }) {
-  const accountId = useProductContext()?.accountId;
   const [catalog, setCatalog] = useState<Catalog>();
   const [ids, setIds] = useState(projects.map((p) => p.id));
   const [mode, setMode] = useState('existing');
@@ -179,7 +178,8 @@ export function ConfigurationDialog({
   // Any input change starts a new review revision; a review that returns after one is dropped.
   const reviewRevision = useRef(0);
   const active = !!record && !finished(record.data.status);
-  const foreignRun = !!accountId && !!record && record.data.actor !== accountId;
+  // Only the page that started a run holds its key and can continue it.
+  const ownRun = !!record && !!runKeys.get(record.data.id);
   // The admin page selects spaces of one kind. Team-managed spaces each use one of their own work
   // types; the global prompt type and screens are for company-managed spaces.
   const team = projects.length > 0 && projects.every((p) => p.teamManaged);
@@ -447,6 +447,7 @@ export function ConfigurationDialog({
       const next = await call<BatchRecord>('configuration-advance', {
         id: current.data.id,
         revision: current.revision,
+        key: runKeys.get(current.data.id),
       });
       setRecord(next);
       setProgress({ done: next.data.index, total });
@@ -475,7 +476,7 @@ export function ConfigurationDialog({
     setAttempted(true);
     setUncertain(true);
     setProgress({ done: 0, total: applied.length });
-    const current = await call<BatchRecord>('configuration-start', {
+    const { key, ...current } = await call<BatchRecord & { key: string }>('configuration-start', {
       ...input,
       ...(shared.length && sharedAck ? { allowShared: true } : {}),
       ...(sharedScreens.length && screenAck ? { allowSharedScreens: true } : {}),
@@ -490,6 +491,7 @@ export function ConfigurationDialog({
       })),
       revision: record?.revision ?? 0,
     });
+    runKeys.set(current.data.id, key);
     setRecord(current);
     clearReview();
     await advance(current);
@@ -1142,8 +1144,7 @@ export function ConfigurationDialog({
                   Check saved progress
                 </Button>
               )}
-              {/* Until the product context names the viewer, the run cannot be known to be theirs. */}
-              {!!accountId && !uncertain && !foreignRun && record?.data.status === 'ready' && (
+              {!uncertain && ownRun && record?.data.status === 'ready' && (
                 <Button
                   isDisabled={busy}
                   onClick={() =>
@@ -1157,14 +1158,15 @@ export function ConfigurationDialog({
                   Continue reviewed changes
                 </Button>
               )}
-              {active && foreignRun && (
+              {active && !uncertain && (!ownRun || record.data.status !== 'ready') && (
                 <>
                   <Text>
-                    Only the administrator who reviewed this configuration can continue its changes.
-                    If that administrator is unavailable, inspect the saved results and any affected
-                    space in Jira before releasing the abandoned configuration. An uncertain or
-                    in-flight step requires a two-minute wait; releasing it cannot stop a delayed
-                    Jira request. Completed changes and space recovery records are kept.
+                    Only the page that started this configuration can continue its changes. If it
+                    was closed or reloaded, or its administrator is unavailable, inspect the saved
+                    results and any affected space in Jira before releasing the abandoned
+                    configuration. An uncertain or in-flight step requires a two-minute wait;
+                    releasing it cannot stop a delayed Jira request. Completed changes and space
+                    recovery records are kept.
                   </Text>
                   <Checkbox
                     label="I confirmed this configuration is abandoned and inspected its affected Jira changes."
@@ -1182,6 +1184,7 @@ export function ConfigurationDialog({
                           await call<BatchRecord>('configuration-stop', {
                             id: record.data.id,
                             revision: record.revision,
+                            key: runKeys.get(record.data.id),
                             acknowledged: abandonedAck,
                           }),
                         );
@@ -1193,13 +1196,6 @@ export function ConfigurationDialog({
                     Release abandoned configuration
                   </Button>
                 </>
-              )}
-              {record && !foreignRun && ['running', 'attention'].includes(record.data.status) && (
-                <Text>
-                  Close this dialog and reload Space configuration to cancel your interrupted
-                  configuration automatically. Completed changes are kept. Inspect the affected
-                  space using View details; a Jira request already in progress may still finish.
-                </Text>
               )}
             </>
           )}
@@ -1233,8 +1229,9 @@ export function ConfigurationDialog({
               {applying && (
                 <SectionMessage appearance="warning">
                   <Text>
-                    Keep this page open until the changes finish. Reloading or leaving cancels the
-                    remaining spaces; completed changes are kept.
+                    Keep this page open until the changes finish. If you reload or leave, the
+                    remaining spaces wait until an administrator releases the configuration;
+                    completed changes are kept.
                   </Text>
                 </SectionMessage>
               )}

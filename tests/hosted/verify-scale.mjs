@@ -248,7 +248,7 @@ try {
               ...entry.expected.description.content,
               {
                 type: 'expand',
-                attrs: { localId: `npl-${entry.id}`, title: 'Agent Prompts' },
+                attrs: { localId: `agent-prompts-${entry.id}`, title: 'Agent Prompts' },
                 content: sources.flatMap((source) => [
                   {
                     type: 'heading',

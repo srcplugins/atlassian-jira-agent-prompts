@@ -8,7 +8,7 @@ import { hookHost, load, standIns, view } from './support/ui-harness.mjs';
 function fixture(
   failInventory = false,
   progress = null,
-  viewer = 'admin',
+  ownRuns = [],
   beforeHealth,
   props,
   team = [],
@@ -27,7 +27,7 @@ function fixture(
         throw failInventory instanceof Error ? failInventory : Error('Inventory unavailable');
       return { projects, incomplete: false };
     }
-    if (name === 'configuration-status' || name === 'configuration-cancel-interrupted') {
+    if (name === 'configuration-status') {
       if (progress instanceof Error) throw progress;
       return progress;
     }
@@ -41,10 +41,11 @@ function fixture(
       checks: [{ ok: p.projectId !== '4', label: 'Type', detail: 'Available' }],
     };
   };
-  return render(call, calls, props ?? (failInventory ? { projectId: '1' } : {}), viewer);
+  return render(call, calls, props ?? (failInventory ? { projectId: '1' } : {}), ownRuns);
 }
-/** Mounts the space configuration view over `call`, recording calls in `calls`. */
-function render(call, calls, props, viewer = 'admin') {
+/** Mounts the space configuration view over `call`, recording calls in `calls`. The page holds the
+ * one-time keys of the runs named in `ownRuns`, as if it had started them. */
+function render(call, calls, props, ownRuns = []) {
   const hooks = hookHost();
   const { HealthProjects } = load('health-ui.tsx', {
     react: hooks.react,
@@ -53,9 +54,9 @@ function render(call, calls, props, viewer = 'admin') {
     './space-status': spaceStatus,
     './settings-ui': { Settings: 'Settings' },
     './configuration-dialog': { ConfigurationDialog: 'ConfigurationDialog' },
+    './run-keys': { runKeys: { get: (id) => (ownRuns.includes(id) ? 'key' : undefined) } },
     '@forge/react': {
       xcss: (v) => v,
-      useProductContext: () => ({ accountId: viewer }),
       ...standIns(
         'SectionMessage',
         'Modal',
@@ -108,7 +109,7 @@ test('opening 100 spaces makes no health calls; checks only explicitly selected 
   await f.mount();
   assert.deepEqual(
     f.calls.map((c) => c.name),
-    ['settings-projects', 'configuration-cancel-interrupted'],
+    ['settings-projects', 'configuration-status'],
   );
   assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 100);
   assert.equal(f.button('Check selected').props.isDisabled, true);
@@ -304,16 +305,11 @@ test('Configure checks only selected spaces and cancelling preserves selection a
   assert.equal(f.calls.length, before);
 });
 
-test('historical cancellation stays quiet, fresh cancellation is dismissible and unresolved outcomes remain visible', async () => {
-  const record = { revision: 2, data: { id: 'old', status: 'stopped', cancelRequested: true } };
+test('a released run stays quiet and an unresolved outcome remains visible', async () => {
+  const record = { revision: 2, data: { id: 'old', status: 'stopped' } };
   const old = fixture(false, record);
   await old.mount();
   assert.equal(old.nodes('SectionMessage').length, 0);
-  const fresh = fixture(false, { ...record, cancelledNow: true });
-  await fresh.mount();
-  assert.equal(fresh.nodes('SectionMessage')[0].props.title, 'Interrupted configuration cancelled');
-  await fresh.click('Dismiss');
-  assert.equal(fresh.nodes('SectionMessage').length, 0);
   const pending = fixture(false, { ...record, data: { ...record.data, inspectProject: '1' } });
   await pending.mount();
   assert.equal(pending.nodes('SectionMessage')[0].props.title, 'Space needs an outcome check');
@@ -351,7 +347,7 @@ test('status check shows a spinner while pending and removes it on completion', 
   const pending = new Promise((resolve) => {
     release = resolve;
   });
-  const f = fixture(false, null, 'admin', () => pending);
+  const f = fixture(false, null, [], () => pending);
   await f.mount();
   assert.equal(f.nodes('Spinner').length, 0);
   f.check('Select PR1', true);
@@ -374,34 +370,27 @@ test('a second Check selected click delivered before the host re-renders is igno
   assert.equal(f.calls.filter((c) => c.name === 'settings-health').length, 3);
 });
 
-test('another administrator’s configuration stuck while cancelling stays reviewable for release', async () => {
-  const stuck = {
+test('a running configuration started on another page stays reviewable for release', async () => {
+  const running = {
     revision: 4,
     data: {
       id: 'run',
-      actor: 'owner',
       status: 'running',
-      cancelRequested: true,
       started: Date.now() - 200_000,
       index: 0,
       entries: [{ projectId: '1', fingerprint: 'f', status: 'waiting' }],
     },
   };
-  const foreign = fixture(false, stuck, 'other-admin');
-  await foreign.mount();
-  assert.match(foreign.text(), /being cancelled. If it does not finish, review it/);
-  await foreign.click('Review saved configuration');
-  assert.equal(foreign.nodes('ConfigurationDialog').length, 1);
-  // The owner's own page waits for the automatic unlock instead.
-  const owner = fixture(false, stuck, 'owner');
-  await owner.mount();
-  assert.equal(owner.button('Review saved configuration'), undefined);
-  assert.match(owner.text(), /unlock automatically/);
+  const other = fixture(false, running);
+  await other.mount();
+  assert.match(other.text(), /started on another page is unfinished/);
+  await other.click('Review saved configuration');
+  assert.equal(other.nodes('ConfigurationDialog').length, 1);
 });
 
 test('permission denial survives a subsequent configuration-progress failure', async () => {
   const denial = 'This needs the Jira permission Administer Jira.';
-  const f = fixture(Error(denial), Error(denial), 'ordinary-user');
+  const f = fixture(Error(denial), Error(denial));
   await f.mount();
   assert.match(f.text(), /This needs the Jira permission Administer Jira\./);
   assert.doesNotMatch(f.text(), /Saved configuration progress could not be checked/);
@@ -417,12 +406,12 @@ test('progress failure remains visible when inventory succeeds', async () => {
 });
 
 test('the space the page was opened from stays reachable when the inventory misses it', async () => {
-  const f = fixture(false, null, 'admin', undefined, { projectId: '500' });
+  const f = fixture(false, null, [], undefined, { projectId: '500' });
   await f.mount();
   const rows = f.nodes('DynamicTable')[0].props.rows;
   assert.equal(rows.length, 101);
   assert.ok(rows.some((row) => row.key === '500'));
-  const listed = fixture(false, null, 'admin', undefined, { projectId: '5' });
+  const listed = fixture(false, null, [], undefined, { projectId: '5' });
   await listed.mount();
   assert.equal(listed.nodes('DynamicTable')[0].props.rows.length, 100);
 });
@@ -430,7 +419,7 @@ test('the space the page was opened from stays reachable when the inventory miss
 test('a failed affected-space check stays with that space and never locks configuration', async () => {
   const record = {
     revision: 2,
-    data: { id: 'old', status: 'stopped', cancelRequested: true, inspectProject: '2' },
+    data: { id: 'old', status: 'stopped', inspectProject: '2' },
   };
   const f = fixture(false, record);
   await f.mount();
@@ -444,7 +433,7 @@ test('a failed affected-space check stays with that space and never locks config
 });
 
 test('company- and team-managed spaces each have their own tab, counts and selection', async () => {
-  const f = fixture(false, null, 'admin', undefined, undefined, ['10', '11']);
+  const f = fixture(false, null, [], undefined, undefined, ['10', '11']);
   await f.mount();
   const tabs = () => f.nodes('Tab').map((t) => t.props.children[0]);
   assert.deepEqual(tabs(), ['Company-managed (98)', 'Team-managed (2)']);
@@ -474,20 +463,20 @@ test('company- and team-managed spaces each have their own tab, counts and selec
   assert.equal(f.nodes('DynamicTable')[0].props.head.cells.length, 5);
 });
 test('the space configuration opens on the current space’s kind', async () => {
-  const f = fixture(false, null, 'admin', undefined, { projectId: '10' }, ['10']);
+  const f = fixture(false, null, [], undefined, { projectId: '10' }, ['10']);
   await f.mount();
   assert.equal(f.nodes('Tabs')[0].props.selected, 1);
   assert.match(f.text(), /PR10 · Current space/);
 });
 test('a site with only team-managed spaces has no tabs and marks them in the list', async () => {
   const team = Array.from({ length: 100 }, (_, i) => String(i + 1));
-  const f = fixture(false, null, 'admin', undefined, undefined, team);
+  const f = fixture(false, null, [], undefined, undefined, team);
   await f.mount();
   assert.equal(f.nodes('Tabs').length, 0);
   assert.match(f.text(), /PR10 · Team-managed/);
 });
 test('team-managed spaces reach the dialog with their style', async () => {
-  const f = fixture(false, null, 'admin', undefined, undefined, ['10']);
+  const f = fixture(false, null, [], undefined, undefined, ['10']);
   await f.mount();
   f.nodes('Tabs')[0].props.onChange(1);
   f.render();
@@ -517,7 +506,7 @@ function standInFixture({ team = [], count = 12 } = {}) {
   const call = async (name, p) => {
     calls.push({ name, p });
     if (name === 'settings-projects') return { projects, incomplete: true };
-    if (name === 'configuration-status' || name === 'configuration-cancel-interrupted') return null;
+    if (name === 'configuration-status') return null;
     assert.equal(name, 'settings-health');
     const listed = projects.find((x) => x.id === p.projectId);
     const teamManaged = listed ? listed.teamManaged : p.projectId === '500';
@@ -639,34 +628,30 @@ test('Configure selected on an unchecked stand-in takes it out and opens nothing
     /1 space is team-managed and was taken out of the selection: .* Review the selection, then configure again\./,
   );
 });
-test('an unfinished configuration says whose it is', async () => {
+test('an unfinished configuration says whether this page started it', async () => {
   const run = {
     revision: 3,
     data: {
       id: 'run',
-      actor: 'admin',
       status: 'ready',
-      cancelRequested: false,
       index: 0,
       entries: [{ projectId: '1', fingerprint: 'f', status: 'waiting' }],
     },
   };
-  const own = fixture(false, run, 'admin');
+  const own = fixture(false, run, ['run']);
   await own.mount();
-  assert.match(own.text(), /Your configuration is unfinished/);
-  assert.doesNotMatch(own.text(), /Another administrator/);
-  const other = fixture(false, run, 'other-admin');
+  assert.match(own.text(), /This page’s configuration is unfinished/);
+  assert.doesNotMatch(own.text(), /another page/);
+  const other = fixture(false, run);
   await other.mount();
-  assert.match(other.text(), /Another administrator has an unfinished configuration/);
+  assert.match(other.text(), /A configuration started on another page is unfinished/);
 });
 test('Review saved configuration and Check affected space keep focus while their action runs', async () => {
   const run = {
     revision: 3,
     data: {
       id: 'run',
-      actor: 'admin',
       status: 'ready',
-      cancelRequested: false,
       index: 0,
       entries: [{ projectId: '1', fingerprint: 'f', status: 'waiting' }],
     },
@@ -682,9 +667,9 @@ test('Review saved configuration and Check affected space keep focus while their
     false,
     {
       revision: 2,
-      data: { id: 'old', status: 'stopped', cancelRequested: true, inspectProject: '4' },
+      data: { id: 'old', status: 'stopped', inspectProject: '4' },
     },
-    'admin',
+    [],
     () => held,
   );
   await inspecting.mount();
@@ -716,7 +701,7 @@ test('the inventory limit line counts only the spaces the inventory listed', asy
   }));
   const call = async (name) => {
     if (name === 'settings-projects') return { projects, incomplete: true };
-    if (name === 'configuration-cancel-interrupted' || name === 'configuration-status') return null;
+    if (name === 'configuration-status') return null;
     assert.fail(name);
   };
   // Opened from a space the truncated inventory missed, which the view adds to its rows.

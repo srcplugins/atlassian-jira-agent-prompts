@@ -22,5 +22,5 @@ test('the field key and storage entity the code uses are the ones manifest.yml d
 });
 
 test('a managed description section is identified by the work item ID', () => {
-  assert.equal(sectionLocalId('10'), 'npl-10');
+  assert.equal(sectionLocalId('10'), 'agent-prompts-10');
 });

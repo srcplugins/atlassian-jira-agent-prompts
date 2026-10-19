@@ -3,13 +3,13 @@
 // all three, so they are permanent once the app is registered.
 
 /** The `jira:customField` module key in manifest.yml. */
-export const fieldKey = 'native-prompts-field';
+export const fieldKey = 'agent-prompts-field';
 
 /** The Forge storage entity in manifest.yml (`app.storage.entities`). */
-export const storageEntity = 'native-prompt-state';
+export const storageEntity = 'agent-prompt-state';
 
 /** Prefix of a managed description section's local ID; the work item ID follows it. */
-const sectionIdPrefix = 'npl-';
+const sectionIdPrefix = 'agent-prompts-';
 
 export const sectionLocalId = (issueId: string) => `${sectionIdPrefix}${issueId}`;
 

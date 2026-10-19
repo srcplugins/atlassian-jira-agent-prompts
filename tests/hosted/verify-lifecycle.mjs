@@ -206,8 +206,8 @@ try {
         await snapshotJourney({ page: userPage, owned, blank, testInfo });
         owned.run.check(
           blank
-            ? 'NPL-03 ordinary-user blank round trip'
-            : 'NPL-01 ordinary-user add, Sync and remove',
+            ? 'AP-03 ordinary-user blank round trip'
+            : 'AP-01 ordinary-user add, Sync and remove',
           testInfo.annotations,
         );
       }
@@ -317,7 +317,7 @@ try {
       const resource = state.resources.find((r) => r.id === backup.targetId);
       const repaired = structuredClone(backup.linked.description);
       repaired.content = repaired.content.filter(
-        (n) => n.attrs?.localId !== `npl-${backup.targetId}`,
+        (n) => n.attrs?.localId !== `agent-prompts-${backup.targetId}`,
       );
       resource.expected.descriptionVariants.push(repaired);
       owned.run.persist();

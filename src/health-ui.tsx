@@ -24,7 +24,6 @@ import {
   Tabs,
   Text,
   Textfield,
-  useProductContext,
 } from '@forge/react';
 import { call } from './client';
 import { createLatch } from './shared/latch.mjs';
@@ -33,6 +32,7 @@ import { finished } from './batch-status';
 import { Settings, type Health } from './settings-ui';
 import { appearance, configurationStatus, type Status } from './space-status';
 import { ConfigurationDialog } from './configuration-dialog';
+import { runKeys } from './run-keys';
 import type { InventoryProject, BatchRecord } from './configuration-batch';
 type Result = { id: string; value?: Health; error?: string };
 /** A listed space. A stand-in added before its first check has no known style yet. */
@@ -53,7 +53,6 @@ const selectionLabel = (id: string, text: string) => (
   </Box>
 );
 // Cancellation notification metadata belongs to the response, not stored progress.
-type ProgressResponse = BatchRecord & { cancelledNow?: boolean };
 const priority = ['Needs attention', 'Check failed', 'Not configured', 'Healthy', 'Not checked'];
 type Kind = 'company' | 'team';
 const kindName = { company: 'company-managed', team: 'team-managed' };
@@ -87,15 +86,11 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     [pressed, setPressed] = useState(''),
     [progress, setProgress] = useState<BatchRecord | null>(null),
     [checked, setChecked] = useState(''),
-    [cancelledRun, setCancelledRun] = useState<string>(),
     [checking, setChecking] = useState<string[]>([]),
-    [completed, setCompleted] = useState(0),
-    [pollRetry, setPollRetry] = useState(0);
+    [completed, setCompleted] = useState(0);
   const mounted = useRef(true);
-  const pollFailures = useRef(0);
   // UI Kit can deliver a second click before the disabled tree reaches the host.
   const latch = useRef(createLatch()).current;
-  const accountId = useProductContext()?.accountId;
   const working = (v: boolean) => {
     setBusy(v);
   };
@@ -128,28 +123,15 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         if (projectId) setProjects([{ id: projectId, key: projectId, name: 'Current space' }]);
       }
     } finally {
-      await refreshProgress(true);
+      await refreshProgress();
       if (mounted.current) working(false);
     }
   }
-  /** `poll`: the id of the cancelling batch this view is waiting for. A failed poll is retried
-   * (three times) instead of silently ending the wait. */
-  async function refreshProgress(cancelInterrupted = false, poll?: string) {
+  async function refreshProgress() {
     try {
-      const value = await call<ProgressResponse | null>(
-        cancelInterrupted ? 'configuration-cancel-interrupted' : 'configuration-status',
-        poll ? { id: poll } : {},
-      );
-      pollFailures.current = 0;
-      if (mounted.current) {
-        setProgress(value);
-        if (value?.cancelledNow) setCancelledRun(value.data.id);
-      }
+      const value = await call<BatchRecord | null>('configuration-status', {});
+      if (mounted.current) setProgress(value);
     } catch {
-      if (poll && mounted.current && ++pollFailures.current < 3) {
-        setPollRetry((n) => n + 1);
-        return;
-      }
       if (mounted.current)
         // Keep the inventory error (especially an administration denial) visible when the
         // follow-up progress read fails too. Either failure still disables configuration.
@@ -237,15 +219,6 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Load once per configuration visit; space selection and filtering are local.
   }, []);
-  useEffect(() => {
-    if (!progress?.data.cancelRequested || progress.data.status !== 'running') return;
-    const id = progress.data.id;
-    const timer = setTimeout(() => {
-      void refreshProgress(true, id);
-    }, 5000);
-    return () => clearTimeout(timer);
-    // Poll only an explicitly cancelled in-flight operation; never scan space health.
-  }, [progress, pollRetry]);
   // A check knows the space's style even when the inventory row is a stand-in.
   const rows = projects.map((p) => {
     const result = results.find((r) => r.id === p.id);
@@ -379,75 +352,39 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     <Stack space="space.200">
       <Heading as="h2">Space configuration</Heading>
       {active ? (
-        <SectionMessage
-          appearance="warning"
-          title={
-            progress.data.cancelRequested
-              ? 'Cancelling interrupted configuration'
-              : 'Configuration in progress'
-          }
-        >
+        <SectionMessage appearance="warning" title="Configuration in progress">
           <Text>
-            {!progress.data.cancelRequested
-              ? progress.data.actor === accountId
-                ? 'Your configuration is unfinished. Review its progress to continue or cancel it.'
-                : 'Another administrator has an unfinished configuration. Review its progress before starting a new one.'
-              : progress.data.actor === accountId
-                ? 'The current request may still finish. Remaining spaces will not be configured. This page will unlock automatically.'
-                : 'Another administrator’s configuration is being cancelled. If it does not finish, review it and release the abandoned configuration.'}
+            {runKeys.get(progress.data.id)
+              ? 'This page’s configuration is unfinished. Review its progress to continue it.'
+              : 'A configuration started on another page is unfinished. Review its progress, and release it if it was abandoned, before starting a new one.'}
           </Text>
-          {/* Another administrator's configuration can be stuck mid-cancellation if its owner left;
-              only the dialog's acknowledged release can end it. */}
-          {(!progress.data.cancelRequested || progress.data.actor !== accountId) && (
-            <Button
-              isDisabled={disabled && !keeps('review')}
-              onClick={() => {
-                if (disabled) return;
-                setPressed('review');
-                setConfigure(progress.data.entries.map((e) => e.projectId));
-              }}
-            >
-              Review saved configuration
-            </Button>
-          )}
+          <Button
+            isDisabled={disabled && !keeps('review')}
+            onClick={() => {
+              if (disabled) return;
+              setPressed('review');
+              setConfigure(progress.data.entries.map((e) => e.projectId));
+            }}
+          >
+            Review saved configuration
+          </Button>
         </SectionMessage>
-      ) : progress?.data.cancelRequested &&
-        (cancelledRun === progress.data.id || progress.data.inspectProject) ? (
-        <SectionMessage
-          appearance={progress.data.inspectProject ? 'warning' : 'information'}
-          title={
-            cancelledRun === progress.data.id
-              ? 'Interrupted configuration cancelled'
-              : 'Space needs an outcome check'
-          }
-        >
-          {cancelledRun === progress.data.id && (
-            <Text>Completed changes were kept. You can configure spaces again.</Text>
-          )}
-          {!progress.data.inspectProject && (
-            <Button appearance="subtle" onClick={() => setCancelledRun(undefined)}>
-              Dismiss
-            </Button>
-          )}
-          {progress.data.inspectProject && (
-            <>
-              <Text>
-                One space may have an incomplete change. Check its outcome before configuring it
-                again.
-              </Text>
-              <Button
-                isDisabled={disabled && !keeps('inspect')}
-                onClick={() => {
-                  const id = progress.data.inspectProject;
-                  if (disabled || !id) return;
-                  setPressed('inspect');
-                  void checkAffected(id);
-                }}
-              >
-                Check affected space
-              </Button>
-            </>
-          )}
+      ) : progress?.data.inspectProject ? (
+        <SectionMessage appearance="warning" title="Space needs an outcome check">
+          <Text>
+            One space may have an incomplete change. Check its outcome before configuring it again.
+          </Text>
+          <Button
+            isDisabled={disabled && !keeps('inspect')}
+            onClick={() => {
+              const id = progress.data.inspectProject;
+              if (disabled || !id) return;
+              setPressed('inspect');
+              void checkAffected(id);
+            }}
+          >
+            Check affected space
+          </Button>
         </SectionMessage>
       ) : null}
       {split && (
@@ -731,11 +668,9 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
               )}
               {active && (
                 <Text>
-                  {progress.data.cancelRequested
-                    ? 'The interrupted configuration is being cancelled. Configuration will unlock automatically when its current request finishes.'
-                    : progress.data.actor === accountId
-                      ? 'Your configuration is unfinished. Close these details to review its progress.'
-                      : 'Another administrator has an unfinished configuration. Close these details to review its progress.'}
+                  {runKeys.get(progress.data.id)
+                    ? 'This page’s configuration is unfinished. Close these details to review its progress.'
+                    : 'A configuration started on another page is unfinished. Close these details to review its progress.'}
                 </Text>
               )}
               {error && <Text>{error}</Text>}

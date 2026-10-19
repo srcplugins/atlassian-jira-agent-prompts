@@ -37,7 +37,7 @@ const source = {
 const original = doc(paragraph('Original'));
 const saved = doc(paragraph('Original'), {
   type: 'expand',
-  attrs: { localId: 'npl-10', title: 'Agent Prompts' },
+  attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' },
   content: [
     { type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: 'TEST-20: Prompt' }] },
     paragraph('Instructions'),
@@ -60,13 +60,13 @@ function store() {
     FilterConditions: { notExists: () => 'missing', equalTo: (value) => ['equal', value] },
     kvs: {
       entity: (name) => {
-        assert.equal(name, 'native-prompt-state');
+        assert.equal(name, 'agent-prompt-state');
         return { get: async (key) => structuredClone(records.get(key)) };
       },
       transact: () => ({
         set: (key, value, options) => ({
           execute: async () => {
-            assert.equal(options.entityName, 'native-prompt-state');
+            assert.equal(options.entityName, 'agent-prompt-state');
             const [, condition] = options.conditions.condition;
             conditions.push([key, condition]);
             const current = records.get(key);

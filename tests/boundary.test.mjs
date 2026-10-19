@@ -62,7 +62,7 @@ test('malformed inventory paging never claims a complete site inventory', async 
     await assert.rejects(createBatchPorts(sdk({ body })).projects());
 });
 test('configuration handlers reject payload injection and recheck global administrator permission', async () => {
-  for (const action of ['configuration-catalog', 'configuration-cancel-interrupted']) {
+  for (const action of ['configuration-catalog', 'configuration-status']) {
     for (const payload of [{ projectId: '1' }, { accountId: 'admin' }]) {
       const s = sdk();
       assert.equal((await registerResolvers(s)[action]({ context, payload })).ok, false);
@@ -73,6 +73,17 @@ test('configuration handlers reject payload injection and recheck global adminis
     assert.equal(s.calls.length, 1);
     assert.equal(s.calls[0].path, '/rest/api/3/mypermissions?permissions=ADMINISTER');
   }
+  // A run's one-time key, when sent, must be a non-empty string.
+  for (const action of ['configuration-advance', 'configuration-stop'])
+    for (const key of ['', 5, null, {}]) {
+      const s = sdk();
+      const result = await registerResolvers(s)[action]({
+        context,
+        payload: { id: 'x', revision: 0, key },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(s.calls.length, 0);
+    }
 });
 test('actual setup handler verifies trusted space through asUser without loading prompts', async () => {
   const s = sdk({ body: project });

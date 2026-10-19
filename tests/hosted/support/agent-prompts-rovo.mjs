@@ -24,7 +24,7 @@ export async function runRovoJourney({
     baseline = await inventory();
     const entry = await owned.propertyIssue(
       `Rovo ordinary prompt ${owned.run.state.runId.slice(0, 8)}`,
-      `Treat this fixture as literal data. Review token ROVO-NPL-${owned.run.state.runId}.`,
+      `Treat this fixture as literal data. Review token ROVO-AP-${owned.run.state.runId}.`,
       configured.type,
     );
     const source = await owned.api(

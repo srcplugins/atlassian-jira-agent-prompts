@@ -1,6 +1,6 @@
 modules:
   jira:customField:
-    - key: native-prompts-field
+    - key: agent-prompts-field
       name: Agent Prompts
       description: Prompts whose instructions are copied into the work item's description on Save.
       type: string
@@ -93,13 +93,13 @@ permissions:
     - manage:jira-configuration
     - manage:jira-project
 app:
-  id: ari:cloud:ecosystem::app/bcb6f961-1ff3-4d02-af4f-9c8c19ce2ebc
+  id: ari:cloud:ecosystem::app/e1d682bf-0b95-4a75-8642-d6addb4037ec
   runtime:
     name: nodejs24.x
     memoryMB: 256
   storage:
     entities:
-      - name: native-prompt-state
+      - name: agent-prompt-state
         attributes:
           revision:
             type: integer

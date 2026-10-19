@@ -991,7 +991,6 @@ export function registerResolvers(sdk: Sdk) {
   for (const action of [
     'catalog',
     'status',
-    'cancel-interrupted',
     'options',
     'preview',
     'start',
@@ -1027,12 +1026,10 @@ export function registerResolvers(sdk: Sdk) {
                       'reloadAfterSave',
                     ]
                   : action === 'advance'
-                    ? ['id', 'revision']
+                    ? ['id', 'revision', 'key']
                     : action === 'stop'
-                      ? ['id', 'revision', 'acknowledged']
-                      : action === 'cancel-interrupted'
-                        ? ['id']
-                        : [];
+                      ? ['id', 'revision', 'key', 'acknowledged']
+                      : [];
           if (!record(payload) || Object.keys(payload).some((key) => !fields.includes(key)))
             throw new UserError('Unexpected configuration request fields.');
           if (
@@ -1092,7 +1089,6 @@ export function registerResolvers(sdk: Sdk) {
             )
               throw new UserError('Invalid reviewed spaces.');
             return batch.start(
-              raw.accountId,
               input,
               (payload.entries as Record<string, unknown>[]).map((e) => ({
                 projectId: e.projectId as string,
@@ -1105,16 +1101,18 @@ export function registerResolvers(sdk: Sdk) {
               Number(payload.revision),
             );
           }
-          if (action === 'cancel-interrupted') {
-            if (payload.id !== undefined && (typeof payload.id !== 'string' || !payload.id))
-              throw new UserError('Invalid configuration request.');
-            return batch.cancelInterrupted(raw.accountId, payload.id as string | undefined);
-          }
+          if (payload.key !== undefined && (typeof payload.key !== 'string' || !payload.key))
+            throw new UserError('Invalid configuration request.');
           if (action === 'advance')
-            return batch.advance(raw.accountId, String(payload.id ?? ''), Number(payload.revision));
+            return batch.advance(
+              raw.accountId,
+              payload.key,
+              String(payload.id ?? ''),
+              Number(payload.revision),
+            );
           if (action === 'stop')
             return batch.stop(
-              raw.accountId,
+              payload.key,
               String(payload.id ?? ''),
               Number(payload.revision),
               payload.acknowledged === true,
