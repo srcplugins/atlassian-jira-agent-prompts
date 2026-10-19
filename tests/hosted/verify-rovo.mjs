@@ -7,14 +7,13 @@ import {
   allIssues,
   openRun,
   installation,
-  observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { openRovoChat, askRovo } from '@srcplugins/atlassian-forge-test-framework/browser';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { runRovoJourney } from './support/agent-prompts-rovo.mjs';
 import { expect } from './support/expect.mjs';
 import { agentPromptsFixture, teamManagedFixture } from './support/fixture.mjs';
-import { spaceSettings } from './support/space-settings.mjs';
+import { spaceHealth } from './support/space-settings.mjs';
 import {
   checkSpace,
   configureOwnType,
@@ -79,7 +78,10 @@ try {
           const checked = await setOwnType();
           return { project: checked.project, type: checked.state.data.type };
         }
-      : () => observeAction(p, 'setup', () => spaceSettings(p, key), target),
+      : async () => {
+          const checked = await spaceHealth(p, owned.project);
+          return { project: checked.project, type: checked.state.data.type };
+        },
     // Wait until Jira's search index returns the new source; the Rovo searches below then
     // exercise the app's own search path.
     discover: async (key) => {

@@ -39,6 +39,7 @@ const directory = `${activeTarget().directory}/native-lifecycle-runs`;
 const expected = JSON.parse(
   readFileSync(
     `${browserTarget(siteFor('isolation')).directory}/second-site-prerequisites/accounts.json`,
+    'utf8',
   ),
 ).actors;
 const request = await tokenRequest();

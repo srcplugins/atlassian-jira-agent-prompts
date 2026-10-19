@@ -518,7 +518,7 @@ test('reload preference waits while a configuration step is changing the space',
   const asked = [];
   f.s.configuring = async (project) => {
     asked.push(project);
-    return true;
+    return { revision: 1, changing: true };
   };
   await assert.rejects(
     f.settings.preferences(c, { revision: 1, refreshAfterSave: true }),
@@ -526,7 +526,14 @@ test('reload preference waits while a configuration step is changing the space',
   );
   assert.deepEqual(asked, ['1']);
   assert.deepEqual(f.writes, []);
-  f.s.configuring = async () => false;
+  // Before the first configuration run there is no setup whose preference could matter.
+  f.s.configuring = async () => ({ revision: 0, changing: false });
+  await assert.rejects(
+    f.settings.preferences(c, { revision: 1, refreshAfterSave: true }),
+    /^Error: Configure this space before saving its preferences\.$/,
+  );
+  assert.deepEqual(f.writes, []);
+  f.s.configuring = async () => ({ revision: 1, changing: false });
   await f.settings.preferences(c, { revision: 1, refreshAfterSave: true });
   assert.deepEqual(f.state().data, { type: '3', refreshAfterSave: true });
 });
@@ -762,6 +769,31 @@ test('after attaching, a space read that does not list the type yet is read agai
     // The space is read only to confirm the association, at most three times.
     assert.equal(after, reads);
   }
+});
+test('with under two seconds left, a space read missing the new type is not waited on again', async () => {
+  const f = fixture();
+  f.types.push({ id: '6', name: 'Runbook', subtask: false, hierarchyLevel: 0 });
+  const plan = await f.settings.preview(c, { type: '6' });
+  const read = f.p.project;
+  let attached = false;
+  let after = 0;
+  f.s.attach = async () => {
+    f.writes.push('attach');
+    attached = true;
+    f.screens.clock.left = 1_999;
+  };
+  f.p.project = async () => {
+    if (attached) after++;
+    // Jira has not listed the association yet.
+    return read();
+  };
+  await assert.rejects(
+    f.settings.apply(c, { type: '6', fingerprint: plan.fingerprint }),
+    /uncertain/,
+  );
+  assert.ok(f.state().data.pending);
+  assert.equal(after, 1);
+  assert.deepEqual(f.writes, ['config', 'attach']);
 });
 
 test('a failed claim release after a rejection stays uncertain and keeps the claim', async () => {

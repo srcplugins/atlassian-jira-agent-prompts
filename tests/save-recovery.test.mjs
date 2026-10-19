@@ -261,6 +261,12 @@ test('a read fences a paused sender and its late cleanup preserves a replacement
 
 test('release is refused when Jira no longer holds the pre-save state, even with a current fingerprint', async () => {
   const f = fixture();
+  // A changed section is still present; with no section at all, release is allowed.
+  f.target.fields.description.content.push({
+    type: 'expand',
+    attrs: { localId: 'npl-10', title: 'Agent Prompts' },
+    content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Edited copy' }] }],
+  });
   await f.p.cas('10', 0, {
     ids: [],
     managed: null,
@@ -281,6 +287,7 @@ test('release is refused when Jira no longer holds the pre-save state, even with
   });
   const status = await f.service.saveStatus(c);
   assert.equal(status.unchanged, false);
+  assert.equal(status.sectionRemoved, false);
   const before = structuredClone(f.stored());
   await assert.rejects(
     f.service.resolveSave(c, { ...status, acknowledged: true }),

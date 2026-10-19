@@ -466,6 +466,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
           message: `${uncertain} ${error.message}`,
         });
       }
+      let next: BatchData;
       try {
         const result = await s.get(entry.projectId);
         const left = new Set(outcome.remaining.map((r) => `${r.screen}:${r.field}`));
@@ -500,7 +501,7 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
                 message: d.input.unlink ? 'Setup removed' : 'Configured',
               };
         });
-        const next: BatchData = {
+        next = {
           ...d,
           entries,
           // A company-managed space's type becomes the run's type, reused by later spaces; a
@@ -522,11 +523,17 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
           status: !partial && d.index + 1 === entries.length ? 'complete' : 'ready',
           started: Date.now(),
         };
+      } catch {
+        // After a successful apply, any failure to confirm the outcome needs inspection.
+        return finish(attention);
+      }
+      try {
         return await finish(next);
       } catch {
-        // After a successful apply, any failure to confirm or record it needs inspection.
-        // If even recording the outcome fails, the durable running claim remains.
-        return finish(attention);
+        // A cancel requested from another view can land between finish's read and its write; a
+        // second try reads it and records the confirmed outcome with the cancel. If recording
+        // still fails, the durable running claim remains.
+        return finish(next);
       }
     },
     async stop(actor: string, id: string, revision: number, acknowledged: boolean) {

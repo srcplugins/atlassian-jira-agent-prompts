@@ -1,7 +1,7 @@
 import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { createService, hash } = await import('../src/service.ts');
+const { createService, hash, JiraRejected } = await import('../src/service.ts');
 const c = { accountId: 'admin', projectId: '1', issueId: '10' };
 const doc = (...content) => ({ type: 'doc', version: 1, content });
 const paragraph = (text) => ({ type: 'paragraph', content: [{ type: 'text', text }] });
@@ -307,6 +307,78 @@ test('a lost Sync that changed only a link and never landed is released, not acc
   await assert.rejects(f.service.acceptSave(c, { ...status, acknowledged: true }), /no longer/);
 });
 
+test('a section whose instruction attributes differ after the save is never adopted', async () => {
+  const rich = doc(
+    { type: 'heading', attrs: { level: 3 }, content: [{ type: 'text', text: 'Rules' }] },
+    { type: 'orderedList', content: [{ type: 'listItem', content: [paragraph('One')] }] },
+    { type: 'codeBlock', content: [{ type: 'text', text: 'npm test' }] },
+    {
+      type: 'paragraph',
+      content: [
+        {
+          type: 'text',
+          text: 'Docs',
+          marks: [{ type: 'link', attrs: { href: 'https://a.test' } }],
+        },
+        { type: 'text', text: '2', marks: [{ type: 'subsup', attrs: { type: 'sub' } }] },
+        { type: 'text', text: 'Red', marks: [{ type: 'textColor', attrs: { color: '#ff5630' } }] },
+      ],
+    },
+  );
+  /** Changes the first node in the saved section that `is` picks, as Jira or another editor might. */
+  const inSection = (is, change) => (fields) => {
+    const description = structuredClone(fields.description);
+    const find = (node) => (is(node) ? node : node.content?.map(find).find(Boolean));
+    change(find(block(description)));
+    return normalizeLocalIds({ ...fields, description });
+  };
+  const type = (name) => (node) => node.type === name;
+  const marked = (name) => (node) => node.marks?.some((m) => m.type === name);
+  const attrs = (name) => (node) => node.marks.find((m) => m.type === name).attrs;
+  const cases = [
+    // Values Jira fills in or writes differently, with the same meaning, are accepted.
+    [true, inSection(type('orderedList'), (n) => (n.attrs = { order: 1 }))],
+    [true, inSection(type('codeBlock'), (n) => (n.attrs = { language: null }))],
+    [true, inSection(marked('textColor'), (n) => (attrs('textColor')(n).color = '#FF5630'))],
+    [true, inSection(marked('link'), (n) => (attrs('link')(n).title = 'Docs'))],
+    // A different link target, list start, heading level, code language or sub/superscript is not.
+    [false, inSection(marked('link'), (n) => (attrs('link')(n).href = 'https://b.test'))],
+    [false, inSection(type('orderedList'), (n) => (n.attrs = { order: 3 }))],
+    [
+      false,
+      inSection(
+        (n) => n.attrs?.level === 3,
+        (n) => (n.attrs.level = 4),
+      ),
+    ],
+    [false, inSection(type('codeBlock'), (n) => (n.attrs = { language: 'bash' }))],
+    [false, inSection(marked('subsup'), (n) => (attrs('subsup')(n).type = 'sup'))],
+  ];
+  for (const [accepted, jira] of cases) {
+    for (const lost of [false, true]) {
+      const f = fixture();
+      const issue = f.p.issue;
+      f.p.issue = async (id) => {
+        const value = await issue(id);
+        if (id === '20') value.fields.description = structuredClone(rich);
+        return value;
+      };
+      f.jira = jira;
+      f.lose = lost;
+      if (lost) {
+        await assert.rejects(f.save(['20']), /could not be confirmed/);
+        f.age();
+        const status = await f.service.saveStatus(c);
+        assert.equal(status.adoptable, accepted, String(jira));
+        continue;
+      }
+      if (accepted) assert.deepEqual((await f.save(['20'])).ids, ['20']);
+      else await assert.rejects(f.save(['20']), /did not match the requested change/);
+      assert.equal(f.stored().data.managed?.localId !== undefined, accepted);
+    }
+  }
+});
+
 test('accept requires Administer Jira, Edit work items and the inspected revision and work item', async () => {
   const f = fixture();
   f.jira = normalizeLocalIds;
@@ -418,4 +490,146 @@ test('a lost forget save settles by observation, or is releasable when Jira is u
     resolved: true,
   });
   assert.equal(hash(unapplied.stored().data.ids), hash(['20']));
+});
+
+// Owner decision 2026-10-18: once the user deletes the section, a save whose outcome is unknown
+// can always be released, so the work item is never stuck.
+test('a lost Sync whose section the user then deletes is released and the work item saves again', async () => {
+  for (const reached of [true, false]) {
+    const f = fixture();
+    await f.save(['20']);
+    f.sources[20].text = 'Updated instructions';
+    if (!reached) f.jira = () => ({});
+    f.lose = true;
+    await assert.rejects(f.save(['20']), /could not be confirmed/);
+    f.lose = false;
+    f.jira = (fields) => fields;
+    f.target.fields.description = doc(paragraph('Original'));
+    f.target.fields.updated += 'u';
+    await assert.rejects(f.service.load(c), /previous save could not be verified/);
+    f.age();
+    const status = await f.service.saveStatus(c);
+    assert.deepEqual(
+      [status.unchanged, status.adoptable, status.sectionRemoved],
+      [false, false, true],
+      `reached ${reached}`,
+    );
+    const writes = f.writes();
+    assert.deepEqual(await f.service.resolveSave(c, { ...status, acknowledged: true }), {
+      resolved: true,
+    });
+    assert.equal(f.writes(), writes);
+    assert.equal(f.stored().data.pending, undefined);
+    // The removed-section rule applies as after any deleted section.
+    await assert.rejects(f.save(['20']), /section was removed in Jira/);
+    await f.save([]);
+    assert.deepEqual(f.target.fields[FIELD], []);
+    await f.save(['20']);
+    assert.match(JSON.stringify(block(f.target.fields.description)), /Updated instructions/);
+  }
+});
+
+test('a lost save whose section was edited is released only after the section is deleted', async () => {
+  const f = fixture();
+  await f.save(['20']);
+  f.sources[20].text = 'Updated instructions';
+  f.jira = () => ({});
+  f.lose = true;
+  await assert.rejects(f.save(['20']), /could not be confirmed/);
+  const edited = structuredClone(f.target.fields.description);
+  block(edited).content.push(paragraph('User note'));
+  f.target.fields.description = edited;
+  f.target.fields.updated += 'u';
+  f.age();
+  let status = await f.service.saveStatus(c);
+  assert.deepEqual(
+    [status.unchanged, status.adoptable, status.sectionRemoved],
+    [false, false, false],
+  );
+  const input = { ...status, acknowledged: true };
+  await assert.rejects(f.service.resolveSave(c, input), /Delete the Agent Prompts section/);
+  await assert.rejects(f.service.acceptSave(c, input), /no longer matches/);
+  assert.ok(f.stored().data.pending);
+  // A section moved inside other content still counts as present.
+  f.target.fields.description = doc({ type: 'panel', content: [block(edited)] });
+  f.target.fields.updated += 'm';
+  status = await f.service.saveStatus(c);
+  assert.equal(status.sectionRemoved, false);
+  f.target.fields.description = doc(paragraph('Original'));
+  f.target.fields.updated += 'd';
+  status = await f.service.saveStatus(c);
+  assert.equal(status.sectionRemoved, true);
+  await f.service.resolveSave(c, { ...status, acknowledged: true });
+  assert.equal(f.stored().data.pending, undefined);
+});
+
+test('a lost forget save is released after the field is changed in Jira', async () => {
+  const f = fixture();
+  await f.save(['20']);
+  f.target.fields.description = doc(paragraph('Original'));
+  f.target.fields.updated += 'x';
+  f.jira = () => ({});
+  f.lose = true;
+  await assert.rejects(f.save([]), /could not be confirmed/);
+  // Someone edits the field in Jira's own editor before the save is inspected.
+  f.target.fields[FIELD] = ['TEST-21'];
+  f.target.fields.updated += 'f';
+  f.age();
+  const status = await f.service.saveStatus(c);
+  assert.deepEqual([status.unchanged, status.sectionRemoved], [false, true]);
+  await f.service.resolveSave(c, { ...status, acknowledged: true });
+  assert.equal(f.stored().data.pending, undefined);
+  assert.deepEqual(f.target.fields[FIELD], ['TEST-21']);
+});
+
+// A reader's work item snapshot can predate a save's claim; it must not settle that claim.
+test('a reader whose work item read predates a claim never settles it', async () => {
+  const f = fixture();
+  await f.save(['20']);
+  // Reader L reads the work item, then its storage read waits.
+  const get = f.p.get;
+  let release;
+  const reached = new Promise((resolve) => {
+    let armed = true;
+    f.p.get = async (...args) => {
+      if (armed) {
+        armed = false;
+        resolve();
+        await new Promise((go) => (release = go));
+      }
+      return get(...args);
+    };
+  });
+  const reader = f.service.load(c).then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await reached;
+  // Meanwhile the user removes the prompt and adds it back; Jira refuses the second PUT later.
+  await f.save([]);
+  const update = f.p.update;
+  let refuse;
+  const sent = new Promise((resolve) => {
+    f.p.update = async () => {
+      resolve();
+      await new Promise((go) => (refuse = go));
+      throw new JiraRejected(429, 'Jira is limiting requests. Wait a moment, then try again.');
+    };
+  });
+  const again = f.save(['20']).then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await sent;
+  // L now sees the submitted claim and compares it with Jira.
+  release();
+  const read = await reader;
+  refuse();
+  assert.match((await again).error?.message ?? '', /limiting requests/);
+  f.p.update = update;
+  assert.match(read.error?.message ?? '', /previous save could not be verified/);
+  // Jira never applied the second save, and storage still says so.
+  assert.deepEqual(f.target.fields[FIELD], []);
+  assert.equal(block(f.target.fields.description), undefined);
+  assert.deepEqual(f.stored().data, { ids: [], managed: null });
 });

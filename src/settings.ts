@@ -137,12 +137,14 @@ export function sortScreenChanges(changes: ScreenChange[]) {
 export interface SettingsPorts {
   get(project: string): Promise<SettingsRecord | undefined>;
   /** With `screen`, the ownership record is written (or deleted when `data` is null) in the same
-   * storage transaction, conditioned on its revision. */
+   * storage transaction, conditioned on its revision. With `run`, it commits only while the stored
+   * configuration run still has that revision. */
   cas(
     project: string,
     revision: number,
     data: SettingsData,
     screen?: { id: string; revision: number; data: ScreenRecordData | null },
+    run?: number,
   ): Promise<void>;
   types(): Promise<WorkType[]>;
   scheme(project: string): Promise<Scheme>;
@@ -152,8 +154,14 @@ export interface SettingsPorts {
   /** The screen used for each requested work type and operation; no type means the default. */
   screenUses(project: string, uses: { type?: string; op: ScreenOp }[]): Promise<string[]>;
   /** Screens in order, undefined for a screen Jira no longer has. Tabs list `field` where it is;
-   * every field only for the screens in `full`. A screen without `field` lists all its tabs. */
-  screens(ids: string[], field: string, full?: string[]): Promise<(ScreenInfo | undefined)[]>;
+   * every field only for the screens in `full`. A screen without `field` lists all its tabs.
+   * Reads stop at the review cutoff, or with `confirm` (after writes) when the write time ends. */
+  screens(
+    ids: string[],
+    field: string,
+    full?: string[],
+    confirm?: boolean,
+  ): Promise<(ScreenInfo | undefined)[]>;
   /** The spaces using a screen; incomplete when there are too many, or the reads ran out of time. */
   screenImpact(
     screen: string,
@@ -161,8 +169,9 @@ export interface SettingsPorts {
   addScreenField(screen: string, tab: string, field: string): Promise<void>;
   removeScreenField(screen: string, tab: string, field: string): Promise<void>;
   screenRecord(screen: string): Promise<ScreenRecord | undefined>;
-  /** Whether a step of the stored configuration run is changing this space right now. */
-  configuring(project: string): Promise<boolean>;
+  /** The stored configuration run's revision (0 before the first run) and whether its step is
+   * changing this space right now. */
+  configuring(project: string): Promise<{ revision: number; changing: boolean }>;
   /** Milliseconds this request can still spend before it must have finished its writes. */
   timeLeft(): number;
 }
@@ -669,15 +678,22 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       if (current.revision !== input.revision || current.data.pending)
         throw new UserError('Configuration changed or is unfinished. Reload Space configuration.');
       // A running step that changes only screens takes no claim, but it commits each screen change
-      // with the setup revision it read, so a save now would leave that change unrecorded.
-      if (await s.configuring(c.projectId))
+      // with the setup revision it read, so a save now would leave that change unrecorded. The save
+      // commits only while the run is as checked here, so a step starting meanwhile refuses it.
+      const run = await s.configuring(c.projectId);
+      if (run.changing)
         throw new UserError(
           'A configuration is changing this space right now. Save the preference after it finishes.',
         );
-      await s.cas(c.projectId, current.revision, {
-        ...current.data,
-        refreshAfterSave: input.refreshAfterSave,
-      });
+      // Every setup is made by a configuration run, so before the first one there is none to keep.
+      if (!run.revision) throw new UserError('Configure this space before saving its preferences.');
+      await s.cas(
+        c.projectId,
+        current.revision,
+        { ...current.data, refreshAfterSave: input.refreshAfterSave },
+        undefined,
+        run.revision,
+      );
       return { saved: true };
     },
     async health(c: Context) {
@@ -905,7 +921,17 @@ export function createSettings(p: Ports, s: SettingsPorts) {
        * transaction that records it, so a recorded screen is always one the app changed. */
       async function screenPhase() {
         const touched: ScreenChange[] = [];
-        for (const ch of changes) {
+        for (const [i, ch] of changes.entries()) {
+          // A slow Jira write or read can use the time fitted for the later changes, so each one
+          // starts only while its second and the closing reserve are left; the rest wait.
+          if (s.timeLeft() < 4_000) {
+            outcome.remaining = [
+              ...changes.slice(i).map((later) => ({ screen: later.screen.id, field: later.field })),
+              ...outcome.remaining,
+            ];
+            changes = changes.slice(0, i);
+            break;
+          }
           const existing = await s.screenRecord(ch.screen.id);
           if (ch.action !== 'require' && (existing?.revision ?? 0) !== ch.record)
             throw new UserError(
@@ -973,7 +999,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         const full = [
           ...new Set(touched.filter((ch) => ch.field !== field).map((ch) => ch.screen.id)),
         ];
-        const after = ids.length ? await s.screens(ids, field, full) : [];
+        const after = ids.length ? await s.screens(ids, field, full, true) : [];
         for (const ch of touched) {
           const info = after[ids.indexOf(ch.screen.id)];
           const shown = !!info?.tabs.some((t) => t.fields.includes(ch.field));
@@ -1076,7 +1102,9 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         for (let attempt = 1; ; attempt++) {
           const project = await p.project(c.projectId);
           if (project.issueTypes.some((t) => t.id === type)) return;
-          if (attempt === 3) throw new UserError('Jira has not confirmed the type association.');
+          // The pause must leave the step time to record its outcome.
+          if (attempt === 3 || s.timeLeft() < 2_000)
+            throw new UserError('Jira has not confirmed the type association.');
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }

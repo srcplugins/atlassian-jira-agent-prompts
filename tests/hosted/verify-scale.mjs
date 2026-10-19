@@ -12,7 +12,7 @@ import {
   installation,
   observeAction,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
-import { spaceSettings } from './support/space-settings.mjs';
+import { spaceHealth } from './support/space-settings.mjs';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
 const host = activeTarget();
@@ -31,7 +31,7 @@ const saveFile = (name, value) =>
     mode: 0o600,
   });
 const metrics = existsSync(`${directory}/metrics.json`)
-  ? JSON.parse(readFileSync(`${directory}/metrics.json`))
+  ? JSON.parse(readFileSync(`${directory}/metrics.json`, 'utf8'))
   : [];
 const record = (scale, operation, started, session) => {
   metrics.push({ scale, operation, ms: Math.round(performance.now() - started), session });
@@ -61,22 +61,17 @@ try {
     }
     const pages = await Promise.all(contexts.map((c) => c.newPage()));
     const t = installation('agent-prompts');
-    const setup = await observeAction(
-      pages[0],
-      'setup',
-      () => spaceSettings(pages[0], owned.project.key),
-      t,
-    );
-    assert.match(setup.type, /^[1-9]\d*$/);
+    const promptType = (await spaceHealth(pages[0], owned.project)).state.data.type;
+    assert.match(promptType, /^[1-9]\d*$/);
     if (!existsSync(`${directory}/baseline.json`))
       saveFile('baseline', await allIssues(api, owned.project.id));
-    const baseline = JSON.parse(readFileSync(`${directory}/baseline.json`));
+    const baseline = JSON.parse(readFileSync(`${directory}/baseline.json`, 'utf8'));
     const term = `Scale${run.state.runId.replaceAll('-', '')}`;
     run.state.scale = {
       count: 1000,
       retainedForManualTesting: true,
       term,
-      type: setup.type,
+      type: promptType,
       sessions: 5,
     };
     run.persist();
@@ -128,7 +123,7 @@ try {
                 randomBytes(Math.ceil(length / 2))
                   .toString('hex')
                   .slice(0, length),
-                setup.type,
+                promptType,
               );
               const count = sourceEntries().filter((r) => r.prepareMs).length;
               if (count % 50 === 0) console.log(`Created and verified ${count}/1000 prompts`);
@@ -141,7 +136,7 @@ try {
       if (failed) throw failed;
       record(scale, 'seed-batch', started, 0);
       console.log(`Checking indexed inventory at ${scale} prompts`);
-      let indexed;
+      let indexed = [];
       await expect(async () => {
         indexed = (await allIssues(api, owned.project.id)).filter((x) =>
           x.fields.summary.startsWith(`${term} prompt `),

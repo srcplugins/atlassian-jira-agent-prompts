@@ -72,6 +72,7 @@ function ui(
         'DynamicTable',
         'Inline',
         'Button',
+        'LoadingButton',
         'Checkbox',
         'Heading',
         'HelperMessage',
@@ -321,7 +322,8 @@ test('the spinner remains visible during review and apply, then clears', async (
     assert.equal(v.nodes('ProgressBar')[0]?.props.value, 0);
     // Only applying warns against reloading, which cancels the remaining spaces.
     assert.equal(/Keep this page open/.test(v.text()), method === 'start');
-    assert.ok(!v.hasButton(button) || v.disabled(button));
+    // The pressed button shows that it is working instead of being disabled, so it keeps focus.
+    assert.ok(!v.hasButton(button) || (v.button(button).props.isLoading && !v.disabled(button)));
     release();
     await action;
     assert.equal(v.nodes('Spinner').length, 0);
@@ -329,6 +331,73 @@ test('the spinner remains visible during review and apply, then clears', async (
     f.api[method] = original;
   }
   assert.equal(f.state().data.status, 'complete');
+});
+
+test('keyboard focus stays on the pressed button, starts the Review step at Back and ends at Done', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  assert.ok(!v.button('Back').props.autoFocus);
+  const original = f.api.preview;
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  f.api.preview = async (...args) => {
+    await pending;
+    return original(...args);
+  };
+  const action = v.click('Review changes');
+  v.render();
+  // Only the pressed button shows that it is working; the others can't be pressed meanwhile.
+  assert.equal(v.button('Review changes').props.isLoading, true);
+  assert.ok(!v.disabled('Review changes'));
+  assert.equal(v.disabled('Back'), true);
+  assert.equal(v.disabled('Cancel'), true);
+  assert.ok(!v.button('Back').props.autoFocus);
+  release();
+  await action;
+  f.api.preview = original;
+  // The review starts at Back, so pressing Enter again can't apply what was not read.
+  assert.equal(v.button('Back').props.autoFocus, true);
+  assert.ok(!v.button('Apply changes').props.autoFocus);
+  assert.ok(!v.button('Apply changes').props.isLoading);
+  await v.click('Apply changes');
+  assert.equal(v.button('Done').props.autoFocus, true);
+});
+
+// autoFocus applies only when a button mounts, so a button that should take focus must also get a
+// new key; React keeps one with the same key mounted and the browser leaves focus where it was.
+test('Back moves keyboard focus to a button on the step it opens', async () => {
+  const f = batchFixture();
+  const v = ui(f);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
+  await v.click('Next');
+  await v.click('Review changes');
+  const reviewBack = v.button('Back').props.key;
+  // Review back to Work types: the pressed Back is mounted again, so it starts with focus.
+  await v.click('Back');
+  assert.match(v.text(), /Choose the work types/);
+  assert.equal(v.button('Back').props.autoFocus, true);
+  assert.notEqual(v.button('Back').props.key, reviewBack);
+  assert.ok(!v.button('Review changes').props.autoFocus);
+  // Work types back to Prompt type: Back is gone, so focus moves to Next, mounted again.
+  const next = v.button('Review changes').props.key;
+  await v.click('Back');
+  assert.equal(v.hasButton('Back'), false);
+  assert.equal(v.button('Next').props.autoFocus, true);
+  assert.notEqual(v.button('Next').props.key, next);
+  // Going forward again, the pressed Next keeps its key (and focus), and Back does not take it.
+  const returned = v.button('Next').props.key;
+  await v.click('Next');
+  assert.equal(v.button('Review changes').props.key, returned);
+  assert.ok(!v.button('Review changes').props.autoFocus);
+  assert.ok(!v.button('Back').props.autoFocus);
 });
 
 test('clicking outside the dialog or pressing Escape keeps it open; the footer button closes it', async () => {
@@ -1202,9 +1271,10 @@ test('a team-managed space changes its saved type, or removes setup behind its o
     unlink: true,
   });
   assert.equal(v.button('Remove setup').props.appearance, 'danger');
-  // Back leaves the removal: the space's own type choice is reviewed again.
+  // Back leaves the removal: the space's own type choice is reviewed again, starting at its button.
   await v.click('Back');
   assert.equal(v.hasButton('Remove setup'), false);
+  assert.equal(v.button('Review changes').props.autoFocus, true);
   await v.click('Review changes');
   assert.match(v.text('Heading'), /Confirm changes/);
   assert.match(v.text(), /Prompt type: Prompt → Task/);

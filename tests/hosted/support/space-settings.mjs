@@ -1,5 +1,6 @@
 import { installation } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
+import { checkSpace } from './team-managed.mjs';
 
 /** The app's space settings page: it calls `setup` on load and renders Space configuration. */
 export async function spaceSettings(page, key) {
@@ -8,6 +9,15 @@ export async function spaceSettings(page, key) {
     `${activeTarget().site}/jira/software/projects/${key}/settings/apps/${t.appId}/${t.environmentId}`,
     { waitUntil: 'domcontentloaded' },
   );
+}
+
+/**
+ * The space's health as Check selected reads it on its settings page; `state.data.type` is the
+ * configured prompt work type. The page's `setup` reply carries only the space.
+ */
+export async function spaceHealth(page, project) {
+  await spaceSettings(page, project.key);
+  return checkSpace(page, installation('agent-prompts'), project.key, project.id);
 }
 
 /**

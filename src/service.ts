@@ -204,6 +204,16 @@ function untouched(issue: Issue, field: string, pending: Receipt) {
     return false;
   }
 }
+/** No node carries the work item's section identifier, so a later save cannot overwrite text the
+ * app does not recognise. An administrator may then release a save whose outcome is unknown, for
+ * example one whose section the user deleted after the response was lost. */
+function sectionRemoved(issue: Issue) {
+  try {
+    return trackedBlock(issue.fields.description, sectionLocalId(issue.id)) === hash([]);
+  } catch {
+    return false;
+  }
+}
 export interface SaveStatus {
   pending: boolean;
   revision?: number;
@@ -211,6 +221,8 @@ export interface SaveStatus {
   unchanged?: boolean;
   /** Jira holds the requested save in a different representation; an administrator may accept it. */
   adoptable?: boolean;
+  /** The description has no Agent Prompts section; an administrator may release the save. */
+  sectionRemoved?: boolean;
   keys?: string[];
   administrator?: boolean;
   waitSeconds?: number;
@@ -248,16 +260,20 @@ export function createService(p: Ports) {
     }
     if (stored.data.pending) {
       const pending = stored.data.pending;
-      if (receiptHash(issue, field, pending) !== pending.after) {
+      // `issue` was read before the claim, so a match may be Jira's state before that save:
+      // only a read made after the claim settles it.
+      const now =
+        receiptHash(issue, field, pending) === pending.after
+          ? await p.issue(issue.id, field)
+          : undefined;
+      if (!now || receiptHash(now, field, pending) !== pending.after) {
         if (allowPending) return stored;
         throw new UserError(
           'The previous save could not be verified. Check saved state; a Jira administrator can investigate an unchanged outcome.',
         );
       }
       const managed =
-        pending.scope === 'field'
-          ? null
-          : observedManaged(issue.fields.description, pending.managed);
+        pending.scope === 'field' ? null : observedManaged(now.fields.description, pending.managed);
       await p.cas(issue.id, stored.revision, { ids: pending.ids, managed });
       stored = {
         revision: stored.revision + 1,
@@ -323,6 +339,7 @@ export function createService(p: Ports) {
         fingerprint: targetHash(issue, field),
         unchanged: untouched(issue, field, pending),
         adoptable: adoptable(issue, field, pending),
+        sectionRemoved: sectionRemoved(issue),
         // The pending keys are for the administrator who inspects the save, not for every viewer.
         ...(administrator && pending.scope !== 'field' ? { keys: pending.keys } : {}),
         administrator,
@@ -331,9 +348,12 @@ export function createService(p: Ports) {
     },
     async resolveSave(c: Context, input: RecoveryInput) {
       const { issue, field, stored, pending } = await recoveryTarget(c, input, 'releasing');
-      if (!untouched(issue, field, pending))
+      // Either outcome keeps the last confirmed selection. When a section the app saved is gone,
+      // the next save that copies prompts asks the user to remove them all first, which clears
+      // the field.
+      if (!untouched(issue, field, pending) && !sectionRemoved(issue))
         throw new UserError(
-          'The work item differs from the pre-save state. Investigate in Jira; no recovery record was released.',
+          'The work item differs from the pre-save state. Delete the Agent Prompts section from the description, then check saved state again; no recovery record was released.',
         );
       await p.cas(issue.id, stored.revision, withoutPending(stored.data));
       return { resolved: true };

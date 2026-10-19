@@ -38,7 +38,7 @@ const command = args[commandIndex];
 const owned = environments(args, command === 'environments').find((name) => name !== 'development');
 if (owned && process.env.FORGE_ALLOW_PRODUCTION !== '1')
   throw Error(
-    `Only development runs without the owner; ${owned} is owner-run. Set FORGE_ALLOW_PRODUCTION=1 yourself to proceed.`,
+    `Only the development environment runs by default; ${owned} needs a maintainer to set FORGE_ALLOW_PRODUCTION=1.`,
   );
 if (
   command === 'register' &&

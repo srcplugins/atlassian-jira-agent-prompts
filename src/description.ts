@@ -113,14 +113,38 @@ export const hash = (value: unknown) =>
   createHash('sha256').update(canonicalJson(value)).digest('hex');
 const fingerprint = (node: AdfNode) => hash(node);
 
-/** Structural identity of a block: node types, text and mark types, ignoring every attribute.
- * Jira may add or normalize attributes on save; text and structure must survive unchanged. */
+type Meaning = (attrs: JsonObject) => JsonValue;
+const color: Meaning = (a) => (typeof a.color === 'string' ? a.color.toLowerCase() : null);
+/** The attributes that carry instructions, by node and mark type, each with the value Jira may
+ * fill in when it is left out. Every other attribute, such as an editor's localId, is ignored. */
+const nodeMeaning: Record<string, Meaning> = {
+  expand: (a) => a.title ?? '',
+  heading: (a) => a.level ?? null,
+  orderedList: (a) => a.order ?? 1,
+  codeBlock: (a) => a.language || null,
+};
+const markMeaning: Record<string, Meaning> = {
+  link: (a) => a.href ?? null,
+  subsup: (a) => a.type ?? null,
+  textColor: color,
+  backgroundColor: color,
+  alignment: (a) => a.align ?? null,
+  indentation: (a) => a.level ?? null,
+};
+
+/** Identity of a block: node types, text, mark types and the attributes that carry meaning.
+ * Jira may add or normalize other attributes on save; instructions must survive unchanged. */
 function blockShape(node: AdfNode): string {
   function skeleton(n: AdfNode): JsonValue {
+    const meaning = nodeMeaning[n.type];
     return {
       type: n.type,
       ...(typeof n.text === 'string' ? { text: n.text } : {}),
-      marks: ((n.marks as { type: string }[] | undefined) ?? []).map((mark) => mark.type),
+      ...(meaning ? { attrs: meaning(n.attrs ?? {}) } : {}),
+      marks: ((n.marks as { type: string; attrs?: JsonObject }[] | undefined) ?? []).map((mark) => {
+        const meaning = markMeaning[mark.type];
+        return meaning ? [mark.type, meaning(mark.attrs ?? {})] : mark.type;
+      }),
       content: (n.content ?? []).map(skeleton),
     };
   }

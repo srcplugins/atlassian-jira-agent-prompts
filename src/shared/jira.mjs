@@ -87,8 +87,8 @@ export function requireEmptyPayload(payload = {}) {
 }
 
 /**
- * Confirms the response is the requested company-managed Jira Software space. Use it only where the
- * spec's Supported spaces table marks team-managed Software as Not supported or Open.
+ * Confirms the response is the requested company-managed Jira Software space. Use it only in a
+ * plugin that doesn't support team-managed Software spaces.
  * @param {unknown} project
  * @param {string} idOrKey The numeric ID or key that was requested.
  */
@@ -102,7 +102,7 @@ export function requireCompanyManagedSoftware(project, idOrKey) {
 
 /**
  * Confirms the response is the requested Jira Software space, company-managed or team-managed, and
- * says which. Use it where the spec's Supported spaces table marks both as Supported.
+ * says which. Use it in a plugin that supports both.
  * @param {unknown} project
  * @param {string} idOrKey The numeric ID or key that was requested.
  * @returns {'company-managed' | 'team-managed'}
@@ -122,18 +122,20 @@ export function requireSoftwareSpace(project, idOrKey) {
  * Runs a read up to three times, pausing between tries, while `transient` says its failure was
  * Jira being briefly unavailable (a transport failure or a 5xx); Jira can briefly fail a read,
  * often of a space created moments earlier. Any other failure stands at once. Never pass a write:
- * repeating one could apply it twice.
+ * repeating one could apply it twice. With a `deadline` (epoch milliseconds), a try starts only
+ * if its pause ends before it, so a read near a time budget's end fails instead of outrunning it.
  * @template T
  * @param {() => Promise<T>} read
  * @param {(error: unknown) => boolean} transient
+ * @param {number} [deadline]
  * @returns {Promise<T>}
  */
-export async function readWithRetries(read, transient) {
+export async function readWithRetries(read, transient, deadline = Infinity) {
   for (let attempt = 1; ; attempt++) {
     try {
       return await read();
     } catch (error) {
-      if (attempt === 3 || !transient(error)) throw error;
+      if (attempt === 3 || !transient(error) || Date.now() + 500 * attempt >= deadline) throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
   }

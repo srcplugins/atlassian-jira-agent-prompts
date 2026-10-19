@@ -1,0 +1,14 @@
+// Shared srcplugins file, synchronized across repositories.
+// Hosted tests and their helpers read live Jira responses, so they are checked for wrong calls,
+// arguments and names, without the strict null and implicit-any rules that deployed source keeps.
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "useUnknownInCatchVariables": false
+  },
+  "include": ["tests/hosted/**/*", "tests/support/**/*", "forge-test.mjs"]
+}

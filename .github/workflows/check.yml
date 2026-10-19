@@ -15,7 +15,9 @@ defaults:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
+    # The self-hosted px-0 runners while the repository is private; GitHub-hosted once it is
+    # public, so code from fork pull requests never runs on them.
+    runs-on: ${{ github.event.repository.private && 'px-0' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -36,7 +38,7 @@ jobs:
           base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
           git config --global url."$base".insteadOf ssh://git@github.com/
           # A development copy sets these repository variables to read its sibling copies:
-          # srcplugins/<name> then resolves to <owner>/<prefix><name> (see the factory's ci.md).
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
           [ -n "$OWNER$PREFIX" ] || exit 0
           [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
             { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }

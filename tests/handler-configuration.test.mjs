@@ -214,10 +214,21 @@ function store() {
       transact: () => {
         // All operations commit together, and only when every condition holds.
         const operations = [];
+        const checks = [];
         const transaction = {
           set: (key, value, options) => (operations.push([key, value, options]), transaction),
           delete: (key, options) => (operations.push([key, undefined, options]), transaction),
+          // A check, like Forge's, needs the key to exist and meet its condition.
+          check: (key, options) => (checks.push([key, options]), transaction),
           execute: async () => {
+            for (const [key, options] of checks) {
+              assert.equal(options.entityName, 'native-prompt-state');
+              const [attribute, condition] = options.conditions.condition;
+              assert.equal(attribute, 'revision');
+              conditions.push([key, condition]);
+              if (records.get(key)?.revision !== condition[1])
+                throw Error('conditional check failed');
+            }
             for (const [key, , options] of operations) {
               assert.equal(options.entityName, 'native-prompt-state');
               const [attribute, condition] = options.conditions.condition;
@@ -690,6 +701,83 @@ test('the reload preference is refused while a configuration step is changing th
     assert.equal(h.kv.records.get('config-1').revision, before.revision + 1);
   }
   assert.deepEqual(h.site.writes, []);
+});
+test('a reload preference checked just before a screen-only step claims the run cannot orphan its field', async () => {
+  const h = harness();
+  const prompt = { id: '20', name: 'Prompt', subtask: false, hierarchyLevel: 0 };
+  h.site.types.push(prompt);
+  h.site.project.issueTypes.push(prompt);
+  h.site.mapping.push({ issueTypeId: '10', screenSchemeId: '41' });
+  h.kv.records.set('config-1', { revision: 1, data: { type: '20' } });
+  const input = { type: '20', reloadAfterSave: 'keep', screenTypes: ['10'] };
+  const preview = await h.call('configuration-preview', { projectId: '1', ...input });
+  const r = await h.call('configuration-start', {
+    type: '20',
+    reloadAfterSave: 'keep',
+    allowSharedScreens: true,
+    entries: [{ projectId: '1', fingerprint: preview.fingerprint, screenTypes: ['10'] }],
+    revision: 0,
+  });
+  const deferred = () => {
+    let resolve;
+    return { promise: new Promise((r) => (resolve = r)), resolve };
+  };
+  const checked = deferred();
+  const resume = deferred();
+  const landed = deferred();
+  const resumeWrite = deferred();
+  // The preference sees the run between steps, then waits while the step claims the run and adds
+  // the field in Jira.
+  const entity = h.kv.kvs.entity;
+  let armed = true;
+  h.kv.kvs.entity = (...args) => ({
+    get: async (key) => {
+      const value = await entity(...args).get(key);
+      if (key === 'configuration-batch' && armed) {
+        armed = false;
+        assert.equal(value.data.status, 'ready');
+        checked.resolve();
+        await resume.promise;
+      }
+      return value;
+    },
+  });
+  const preference = h.resolvers['settings-preferences']({
+    context,
+    payload: { projectId: '1', revision: 1, refreshAfterSave: true },
+  });
+  await checked.promise;
+  const asUser = h.site.api.asUser;
+  h.site.api.asUser = () => {
+    const actor = asUser();
+    return {
+      requestJira: async (path, options) => {
+        const result = await actor.requestJira(path, options);
+        if (options?.method === 'POST' && path === '/rest/api/3/screens/51/tabs/61/fields') {
+          landed.resolve();
+          await resumeWrite.promise;
+        }
+        return result;
+      },
+    };
+  };
+  const advance = h.call('configuration-advance', { id: r.data.id, revision: r.revision });
+  await landed.promise;
+  resume.resolve();
+  assert.deepEqual(await preference, {
+    ok: false,
+    error: 'Configuration changed or storage is unavailable. Check the space again.',
+  });
+  resumeWrite.resolve();
+  assert.equal((await advance).data.status, 'complete');
+  assert.deepEqual(h.kv.records.get('screen-51').data.projects, ['1']);
+  assert.equal(h.kv.records.get('config-1').data.refreshAfterSave, undefined);
+  // The app still knows it added the field, so removing setup removes it again.
+  const removal = await h.call('configuration-preview', { projectId: '1', unlink: true });
+  assert.deepEqual(
+    removal.screens.changes.map((ch) => [ch.action, ch.screen.id]),
+    [['remove', '51']],
+  );
 });
 
 test('a configuration run saved with the retired reload option stops without a change', async () => {

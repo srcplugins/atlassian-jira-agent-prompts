@@ -26,19 +26,20 @@ function compile(file) {
 /**
  * Evaluate a `src/` module in a fresh context. Only the listed imports resolve; anything else
  * fails closed. Host Error keeps `instanceof Error` true across modules, and timers resolve at call
- * time so node:test mock timers apply.
+ * time so node:test mock timers apply. `globals` adds browser stand-ins such as `document`.
  */
 // App modules every component may use without a per-test stand-in.
 const builtIns = { './shared/latch.mjs': await import('../../src/shared/latch.mjs') };
 
-export function load(file, dependencies = {}) {
+export function load(file, dependencies = {}, globals = {}) {
   dependencies = { ...builtIns, ...dependencies };
   const exports = {};
   runInNewContext(compile(file), {
+    ...globals,
     exports,
     Error,
     Date,
-    setTimeout: (...args) => setTimeout(...args),
+    setTimeout: (handler, ms, ...rest) => setTimeout(handler, ms, ...rest),
     clearTimeout: (id) => clearTimeout(id),
     require: (name) => {
       if (!Object.hasOwn(dependencies, name))
@@ -65,11 +66,14 @@ export async function turns(count = 10) {
 /**
  * Hook host keyed by call order: state (including functional updates), refs, identity callbacks
  * and effects that are queued once on first render. Call `render` to evaluate with a fresh order.
+ * `rerun(n)` runs the latest render's nth effect again, as React does when its dependencies change.
  */
 export function hookHost() {
   const slots = [];
   const effects = [];
+  const latest = [];
   let index = 0;
+  let effect = 0;
   const react = {
     Fragment: 'Fragment',
     createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
@@ -88,11 +92,12 @@ export function hookHost() {
       if (!(slot in slots)) slots[slot] = { current: initial };
       return slots[slot];
     },
-    useEffect(effect) {
+    useEffect(fn) {
       const slot = index++;
+      latest[effect++] = fn;
       if (!(slot in slots)) {
         slots[slot] = true;
-        effects.push(effect);
+        effects.push(fn);
       }
     },
     useCallback: (fn) => fn,
@@ -100,8 +105,10 @@ export function hookHost() {
   return {
     react: { __esModule: true, default: react, ...react },
     effects,
+    rerun: (n) => latest[n](),
     render(fn) {
       index = 0;
+      effect = 0;
       return fn();
     },
   };
@@ -121,11 +128,12 @@ export function view(hooks, component) {
     tree = hooks.render(component);
   };
   const nodes = (type) => {
+    const types = [type].flat();
     const found = [];
     const visit = (value) => {
       if (Array.isArray(value)) return value.forEach(visit);
       if (!value || typeof value !== 'object') return;
-      if (value.type === type) found.push(value);
+      if (types.includes(value.type)) found.push(value);
       visit(value.props?.children);
       for (const cell of value.props?.head?.cells ?? []) visit(cell.content);
       for (const row of value.props?.rows ?? []) for (const cell of row.cells) visit(cell.content);
@@ -133,7 +141,9 @@ export function view(hooks, component) {
     visit(tree);
     return found;
   };
-  const button = (text) => nodes('Button').find((node) => label(node) === text);
+  // UI Kit's LoadingButton is a button that can also show that its action is running.
+  const buttons = () => nodes(['Button', 'LoadingButton']);
+  const button = (text) => buttons().find((node) => label(node) === text);
   async function settle() {
     await turns();
     render();
@@ -144,7 +154,7 @@ export function view(hooks, component) {
     nodes,
     button,
     settle,
-    labels: () => nodes('Button').map(label),
+    labels: () => buttons().map(label),
     text: (type = 'Text') => nodes(type).map(label).join('\n'),
     async mount() {
       for (const effect of hooks.effects.splice(0)) effect();
@@ -153,7 +163,7 @@ export function view(hooks, component) {
     async click(text) {
       const node = button(text);
       assert.ok(node, `Missing button: ${text}`);
-      assert.ok(!node.props.isDisabled, `Disabled button: ${text}`);
+      assert.ok(!node.props.isDisabled && !node.props.isLoading, `Disabled button: ${text}`);
       node.props.onClick();
       await settle();
     },

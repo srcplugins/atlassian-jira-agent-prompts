@@ -1,6 +1,7 @@
 import './support/typescript-loader.mjs';
 import { readSpaces } from '../src/space-reads.ts';
 import { finished } from '../src/batch-status.ts';
+import * as spaceStatus from '../src/space-status.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { hookHost, load, standIns, view } from './support/ui-harness.mjs';
@@ -49,6 +50,7 @@ function render(call, calls, props, viewer = 'admin') {
     react: hooks.react,
     './space-reads': { readSpaces },
     './batch-status': { finished },
+    './space-status': spaceStatus,
     './settings-ui': { Settings: 'Settings' },
     './configuration-dialog': { ConfigurationDialog: 'ConfigurationDialog' },
     '@forge/react': {
@@ -62,6 +64,7 @@ function render(call, calls, props, viewer = 'admin') {
         'ModalBody',
         'ModalFooter',
         'Button',
+        'LoadingButton',
         'Box',
         'Label',
         'Checkbox',
@@ -108,10 +111,7 @@ test('opening 100 spaces makes no health calls; checks only explicitly selected 
     ['settings-projects', 'configuration-cancel-interrupted'],
   );
   assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 100);
-  assert.equal(
-    f.nodes('Button').find((b) => b.props.children[0] === 'Check selected').props.isDisabled,
-    true,
-  );
+  assert.equal(f.button('Check selected').props.isDisabled, true);
   assert.ok(f.nodes('Lozenge').every((n) => n.props.children[0] === 'Not checked'));
   for (const id of ['1', '2', '3', '4']) f.check(`Select PR${id}`, true);
   assert.equal(f.calls.length, 2, 'selection alone never reads health');
@@ -151,10 +151,7 @@ test('select all uses all filtered rows across pages, clears on search and sends
   await f.nodes('ConfigurationDialog')[0].props.onClose();
   await f.settle();
   f.search('PR1');
-  assert.equal(
-    f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
-    true,
-  );
+  assert.equal(f.button('Configure selected').props.isDisabled, true);
   f.check('Select all matching spaces', true);
   await f.click('Configure selected');
   assert.equal(f.nodes('ConfigurationDialog')[0].props.projects.length, 12);
@@ -293,15 +290,16 @@ test('Configure checks only selected spaces and cancelling preserves selection a
     f.calls.filter((c) => c.name === 'settings-health').map((c) => c.p.projectId),
     ['10'],
   );
+  // The button that opened the dialog stays focusable, so the dialog returns focus to it.
+  assert.ok(!f.button('Configure selected').props.isDisabled);
+  assert.ok(!f.button('Configure selected').props.isLoading);
+  assert.equal(f.button('Check selected').props.isDisabled, true);
   const before = f.calls.length;
   await f.nodes('ConfigurationDialog')[0].props.onClose(false);
   await f.settle();
   assert.equal(f.calls.length, before);
   assert.ok(f.nodes('Lozenge').some((n) => n.props.children[0] === 'Healthy'));
-  assert.equal(
-    f.nodes('Button').find((n) => n.props.children[0] === 'Configure selected').props.isDisabled,
-    false,
-  );
+  assert.equal(f.button('Configure selected').props.isDisabled, false);
   await f.click('View details');
   assert.equal(f.calls.length, before);
 });
@@ -407,10 +405,7 @@ test('permission denial survives a subsequent configuration-progress failure', a
   await f.mount();
   assert.match(f.text(), /This needs the Jira permission Administer Jira\./);
   assert.doesNotMatch(f.text(), /Saved configuration progress could not be checked/);
-  assert.equal(
-    f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
-    true,
-  );
+  assert.equal(f.button('Configure selected').props.isDisabled, true);
   assert.equal(f.nodes('ConfigurationDialog').length, 0);
 });
 
@@ -418,10 +413,7 @@ test('progress failure remains visible when inventory succeeds', async () => {
   const f = fixture(false, Error('Unavailable'));
   await f.mount();
   assert.match(f.text(), /Saved configuration progress could not be checked/);
-  assert.equal(
-    f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
-    true,
-  );
+  assert.equal(f.button('Configure selected').props.isDisabled, true);
 });
 
 test('the space the page was opened from stays reachable when the inventory misses it', async () => {
@@ -448,10 +440,7 @@ test('a failed affected-space check stays with that space and never locks config
   assert.equal(f.nodes('Modal').length, 1);
   assert.equal(f.nodes('Lozenge').filter((n) => n.props.children[0] === 'Check failed').length, 1);
   f.check('Select PR5', true);
-  assert.equal(
-    f.nodes('Button').find((b) => b.props.children[0] === 'Configure selected').props.isDisabled,
-    false,
-  );
+  assert.equal(f.button('Configure selected').props.isDisabled, false);
 });
 
 test('company- and team-managed spaces each have their own tab, counts and selection', async () => {
@@ -649,4 +638,90 @@ test('Configure selected on an unchecked stand-in takes it out and opens nothing
     f.text(),
     /1 space is team-managed and was taken out of the selection: .* Review the selection, then configure again\./,
   );
+});
+test('an unfinished configuration says whose it is', async () => {
+  const run = {
+    revision: 3,
+    data: {
+      id: 'run',
+      actor: 'admin',
+      status: 'ready',
+      cancelRequested: false,
+      index: 0,
+      entries: [{ projectId: '1', fingerprint: 'f', status: 'waiting' }],
+    },
+  };
+  const own = fixture(false, run, 'admin');
+  await own.mount();
+  assert.match(own.text(), /Your configuration is unfinished/);
+  assert.doesNotMatch(own.text(), /Another administrator/);
+  const other = fixture(false, run, 'other-admin');
+  await other.mount();
+  assert.match(other.text(), /Another administrator has an unfinished configuration/);
+});
+test('Review saved configuration and Check affected space keep focus while their action runs', async () => {
+  const run = {
+    revision: 3,
+    data: {
+      id: 'run',
+      actor: 'admin',
+      status: 'ready',
+      cancelRequested: false,
+      index: 0,
+      entries: [{ projectId: '1', fingerprint: 'f', status: 'waiting' }],
+    },
+  };
+  const reviewing = fixture(false, run);
+  await reviewing.mount();
+  await reviewing.click('Review saved configuration');
+  assert.equal(reviewing.nodes('ConfigurationDialog').length, 1);
+  assert.equal(reviewing.button('Review saved configuration').props.isDisabled, false);
+  let release;
+  const held = new Promise((resolve) => (release = resolve));
+  const inspecting = fixture(
+    false,
+    {
+      revision: 2,
+      data: { id: 'old', status: 'stopped', cancelRequested: true, inspectProject: '4' },
+    },
+    'admin',
+    () => held,
+  );
+  await inspecting.mount();
+  const check = inspecting.click('Check affected space');
+  await new Promise((resolve) => setImmediate(resolve));
+  inspecting.render();
+  assert.equal(inspecting.button('Check affected space').props.isDisabled, false);
+  release();
+  await check;
+});
+test('the active status filter is marked as selected, not by colour alone', async () => {
+  const f = fixture();
+  await f.mount();
+  const filter = (label) =>
+    f.nodes('Button').find((b) => b.props.children.flat(Infinity).join('').startsWith(label));
+  assert.equal(filter('All spaces').props.isSelected, true);
+  assert.equal(filter('Healthy').props.isSelected, false);
+  filter('Healthy').props.onClick();
+  f.render();
+  assert.equal(filter('Healthy').props.isSelected, true);
+  assert.equal(filter('All spaces').props.isSelected, false);
+});
+test('the inventory limit line counts only the spaces the inventory listed', async () => {
+  const projects = Array.from({ length: 3 }, (_, i) => ({
+    id: String(i + 1),
+    key: `PR${i + 1}`,
+    name: `P${i + 1}`,
+    teamManaged: false,
+  }));
+  const call = async (name) => {
+    if (name === 'settings-projects') return { projects, incomplete: true };
+    if (name === 'configuration-cancel-interrupted' || name === 'configuration-status') return null;
+    assert.fail(name);
+  };
+  // Opened from a space the truncated inventory missed, which the view adds to its rows.
+  const f = render(call, [], { projectId: '99' });
+  await f.mount();
+  assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 4);
+  assert.match(f.text(), /Showing the first 3 supported spaces/);
 });

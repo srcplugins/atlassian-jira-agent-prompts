@@ -2,7 +2,7 @@ import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const { createPorts, registerResolvers } = await import('../src/integration.ts');
-const { JiraRejected } = await import('../src/service.ts');
+const { JiraRejected, JiraUnavailable } = await import('../src/service.ts');
 import { forgeContract } from './support/forge-contract.mjs';
 const context = { accountId: 'actor', extension: { project: { id: '1' } } };
 const project = {
@@ -510,15 +510,16 @@ test('preference and resolution resolvers reject extra authority fields, bad rev
   for (const removed of ['settings-preview', 'settings-apply', 'settings-unlink'])
     assert.equal(definitions[removed], undefined);
 });
-test('a settings space key is resolved only after the global administrator check', async () => {
-  const denied = sdk({ body: { permissions: { ADMINISTER: { havePermission: false } } } });
-  const result = await registerResolvers(denied)['settings-health']({
-    context: { accountId: 'actor', extension: {} },
-    payload: { projectId: 'TEST' },
-  });
-  assert.equal(result.ok, false);
-  assert.equal(denied.calls.length, 1);
-  assert.match(denied.calls[0].path, /^\/rest\/api\/3\/mypermissions\?permissions=ADMINISTER/);
+test('settings requests name their space by numeric ID only, refused before any Jira read', async () => {
+  for (const projectId of ['TEST', '0', '1.5', 7, ' 1']) {
+    const s = sdk();
+    const result = await registerResolvers(s)['settings-health']({
+      context: { accountId: 'actor', extension: {} },
+      payload: { projectId },
+    });
+    assert.deepEqual(result, { ok: false, error: 'Choose a Jira space.' });
+    assert.equal(s.calls.length, 0);
+  }
 });
 test('a partly listed shared scheme is marked incomplete; inconsistent lists are refused', async () => {
   const { createSettingsPorts } = await import('../src/integration.ts');
@@ -1354,6 +1355,35 @@ test('screen impact lists every screen scheme with its users, then reads the spa
   );
   assert.equal((await createSettingsPorts(s).screenImpact('1101')).complete, true);
   s.assertDrained();
+  // Jira may return shorter pages than the first: the gap after the short page at 10 is read page
+  // by page, so scheme 16, the only one linking screen 51 to space TWO, is found.
+  const used = { 1: ['30'], 16: ['31'] };
+  const short = (from, count) =>
+    schemes(from, count, used).map((x) => (used[x.id] ? { ...x, screens: { default: 51 } } : x));
+  s = sdk(
+    listPage(0, false, short(1, 10), 25),
+    listPage(10, false, short(11, 5), 25),
+    listPage(20, true, short(21, 5), 25),
+    listPage(15, false, short(16, 5), 25),
+    listPage(20, true, short(21, 5), 25),
+    spaces(30, { id: '1', key: 'ONE' }),
+    spaces(31, { id: '2', key: 'TWO' }),
+  );
+  assert.deepEqual(await createSettingsPorts(s).screenImpact('51'), {
+    projects: [
+      { id: '1', key: 'ONE' },
+      { id: '2', key: 'TWO' },
+    ],
+    complete: true,
+  });
+  s.assertDrained();
+  // Fewer schemes than Jira's final count (one added at an earlier offset was skipped) is refused
+  // as a passing failure, so a review or a configuration step can simply run again.
+  s = sdk(listPage(0, false, short(1, 10)), listPage(10, true, short(11, 15), 26));
+  await assert.rejects(
+    createSettingsPorts(s).screenImpact('51'),
+    (error) => error instanceof JiraUnavailable && /changed while being read/.test(error.message),
+  );
 
   // More than one page of spaces per work type screen scheme is read; past ten it is incomplete.
   const page = (start, isLast) =>
@@ -1396,4 +1426,89 @@ test('screen impact reads stop after twelve seconds of the request and report th
   assert.deepEqual(result, { projects: [], complete: false, timedOut: true });
   assert.equal(ports.timeLeft(), 9_999);
   s.assertDrained();
+});
+test('screen reads stop at the review cutoff, and reads confirming writes when the write time ends', async (t) => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  let now = 1_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const get = (path, body) => ({ expect: { method: 'GET', path: `/rest/api/3/${path}` }, body });
+  // A prompt create screen with 30 tabs, each read taking a second.
+  const tabs = Array.from({ length: 30 }, (_, i) => ({ id: 100 + i, name: `Tab ${i}` }));
+  const routes = () => [
+    get('screens?id=50&maxResults=100', { isLast: true, values: [{ id: 50, name: 'Create' }] }),
+    get('screens/50/tabs', tabs),
+    ...tabs.map((tab) => get(`screens/50/tabs/${tab.id}/fields`, [{ id: 'summary' }])),
+  ];
+  const timed = (s) => {
+    const started = [];
+    const asUser = s.api.asUser;
+    s.api.asUser = () => {
+      const user = asUser();
+      return {
+        requestJira: (...args) => {
+          started.push(now - 1_000_000);
+          now += 1_000;
+          return user.requestJira(...args);
+        },
+      };
+    };
+    return started;
+  };
+  let s = sdk(...routes());
+  let started = timed(s);
+  await assert.rejects(
+    createSettingsPorts(s).screens(['50'], 'customfield_1', ['50']),
+    /could not all be read in time/,
+  );
+  assert.equal(Math.max(...started), 12_000);
+  // The same reads confirming writes go on until the write time ends at 22 seconds.
+  now = 1_000_000;
+  s = sdk(...routes());
+  started = timed(s);
+  await assert.rejects(
+    createSettingsPorts(s).screens(['50'], 'customfield_1', ['50'], true),
+    /could not all be read in time/,
+  );
+  assert.equal(Math.max(...started), 22_000);
+});
+test('a read failing near the end of the write time is not tried again, so the step ends in time', async (t) => {
+  const { createSettingsPorts } = await import('../src/integration.ts');
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1_000_000 });
+  const names = {
+    expect: { method: 'GET', path: '/rest/api/3/screens?id=50&maxResults=100' },
+    body: { isLast: true, values: [{ id: 50, name: 'Edit' }] },
+  };
+  const placed = {
+    expect: { method: 'GET', path: /^\/rest\/api\/3\/field\/customfield_1\/screens\?/ },
+    body: { startAt: 0, isLast: true, values: [{ id: 50, tab: { id: 7 } }] },
+  };
+  // Each Jira answer takes 800 ms; the retry pauses (500 ms, then 1 s) run on the mocked clock.
+  const confirm = async (startAt, ...responses) => {
+    const s = sdk(...responses);
+    const asUser = s.api.asUser;
+    s.api.asUser = () => ({
+      requestJira: (...args) => (t.mock.timers.tick(800), asUser().requestJira(...args)),
+    });
+    const ports = createSettingsPorts(s);
+    t.mock.timers.tick(startAt);
+    const read = ports.screens(['50'], 'customfield_1', [], true).then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+    for (let i = 0; i < 40; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(100);
+    }
+    return { outcome: await read, s, ports };
+  };
+  // Early in the step, a 503 is tried again as usual.
+  const early = await confirm(10_000, { status: 503 }, names, placed);
+  assert.deepEqual(early.outcome.value, [
+    { id: '50', name: 'Edit', tabs: [{ id: '7', fields: ['customfield_1'] }] },
+  ]);
+  early.s.assertDrained();
+  // Started at 21.5 seconds, the 503 arrives at 22.3: no retry, the read fails at once.
+  const late = await confirm(21_500, { status: 503 }, names, placed);
+  assert.match(late.outcome.error.message, /HTTP 503/);
+  assert.equal(late.s.calls.length, 1);
 });

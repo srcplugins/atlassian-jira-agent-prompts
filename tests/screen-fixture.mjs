@@ -59,8 +59,8 @@ export function screenFixture(spaces, writes = []) {
       t.fields.splice(t.fields.indexOf(field), 1);
     },
     screenRecord: async (id) => structuredClone(records.get(id)),
-    // No configuration run here; the batch fixture answers from its stored run.
-    configuring: async () => false,
+    // An earlier run, finished; the batch fixture answers from its stored run.
+    configuring: async () => ({ revision: 1, changing: false }),
     timeLeft: () => clock.left,
   };
   const clock = { left: 22_000 };

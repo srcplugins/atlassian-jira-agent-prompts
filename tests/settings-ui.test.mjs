@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { forgeContract } from './support/forge-contract.mjs';
 import { bridgeClient, hookHost, load, standIns, view } from './support/ui-harness.mjs';
 const { registerResolvers } = await import('../src/integration.ts');
+const spaceStatus = await import('../src/space-status.ts');
 
 // Exercise real component callbacks, bridge serialization and backend handlers.
 function fixture(invoke, props = {}) {
@@ -11,6 +12,7 @@ function fixture(invoke, props = {}) {
   const { Settings } = load('settings-ui.tsx', {
     react: hooks.react,
     './client': bridgeClient(invoke),
+    './space-status': spaceStatus,
     '@forge/react': {
       useProductContext: () => ({ siteUrl: 'https://example.atlassian.net' }),
       xcss: (value) => value,
@@ -20,6 +22,7 @@ function fixture(invoke, props = {}) {
         'SectionMessage',
         'Inline',
         'Button',
+        'LoadingButton',
         'Checkbox',
         'Heading',
         'Label',
@@ -365,4 +368,26 @@ test('the settings status region exists before any outcome is announced', async 
   });
   const regions = v.nodes('Box').filter((box) => box.props.role === 'status');
   assert.equal(regions.length, 1);
+});
+test('the details lozenge colours each status like the space list', async () => {
+  const health = (data, ok) => ({
+    project: { id: '1', key: 'ONE', teamManaged: false, issueTypes: [] },
+    state: { revision: 1, data },
+    types: [{ id: '7', name: 'Prompt' }],
+    checks: [
+      { label: 'Work type', ok, detail: ok ? 'Available' : 'Choose or create a work type.' },
+    ],
+  });
+  const invoke = async () => assert.fail('no call expected');
+  for (const [data, ok, label, colour] of [
+    // A space without a type always has a failing work type check, yet is only not configured.
+    [{}, false, 'Not configured', 'default'],
+    [{ type: '7' }, true, 'Healthy', 'success'],
+    [{ type: '7' }, false, 'Needs attention', 'moved'],
+    [{ type: '7', pending: { scheme: '9', started: 1 } }, true, 'Needs attention', 'moved'],
+  ]) {
+    const ui = fixture(invoke, { initialHealth: health(data, ok) });
+    const lozenge = ui.nodes('Lozenge')[0];
+    assert.deepEqual([lozenge.props.children[0], lozenge.props.appearance], [label, colour]);
+  }
 });

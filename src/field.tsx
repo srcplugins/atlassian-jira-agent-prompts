@@ -20,6 +20,12 @@ interface Loaded extends PromptPage {
 function retainSearchFocus(event: React.MouseEvent<HTMLButtonElement>) {
   event.preventDefault();
 }
+// The pressed button was disabled or removed, which leaves keyboard focus on the page.
+function focusLost() {
+  const active = document.activeElement;
+  return !active || active === document.body || active.matches(':disabled');
+}
+const focusPicker = () => document.getElementById('agent-prompts')?.focus();
 export function Field() {
   const search = usePromptSearch();
   // Nothing to show: with a query that means no match; without one, the space has no prompts.
@@ -32,7 +38,10 @@ export function Field() {
   const [recovery, setRecovery] = useState(false);
   const [recoveryStatus, setRecoveryStatus] = useState<SaveStatus>();
   const [loadError, setLoadError] = useState('');
-  const [saving, setSaving] = useState(false);
+  // The button whose save is running.
+  const [saving, setSaving] = useState<'' | 'Save' | 'Sync'>('');
+  // Set by a button whose work may disable or remove it; focus returns to the picker afterwards.
+  const refocus = useRef(false);
   const resetSearch = search.reset;
   // A load resolves the saved selection, so a saved prompt it leaves out is unavailable now. A
   // draft choice it never read keeps the label it was picked with.
@@ -68,7 +77,14 @@ export function Field() {
   useEffect(() => {
     void load();
   }, [load]);
+  useEffect(() => {
+    if (!refocus.current || busy || recovery || search.busy) return;
+    refocus.current = false;
+    if (focusLost()) focusPicker();
+  }, [busy, recovery, search.busy]);
   async function recovered() {
+    // The recovery panel closes, taking its focused button with it.
+    refocus.current = true;
     setBusy(true);
     try {
       const value = await call<Loaded>('load');
@@ -102,9 +118,10 @@ export function Field() {
     if (!data || busy || recovery) return;
     const dirty = JSON.stringify(ids) !== JSON.stringify(data.ids);
     if (refresh ? dirty || !data.ids.length : !dirty) return;
+    refocus.current = true;
     setMessage('');
     setBusy(true);
-    setSaving(true);
+    setSaving(refresh ? 'Sync' : 'Save');
     try {
       const value = await call<Pick<Loaded, 'revision' | 'fingerprint' | 'ids'>>('save', {
         ids,
@@ -145,7 +162,7 @@ export function Field() {
       }
     } finally {
       setBusy(false);
-      setSaving(false);
+      setSaving('');
     }
   }
   const selectedIds = new Set([...ids, ...(data?.ids ?? [])]);
@@ -157,8 +174,15 @@ export function Field() {
   ];
   const options = data
     ? [
+        // A prompt the picker never offers (retired, of a previous type, or any prompt on a
+        // prompt work item) stays an option while it is saved or still in the draft.
         ...visible
-          .filter((p) => (!data.cleanupOnly && !p.selectedOnly) || data.ids.includes(p.id))
+          .filter(
+            (p) =>
+              (!data.cleanupOnly && !p.selectedOnly) ||
+              data.ids.includes(p.id) ||
+              ids.includes(p.id),
+          )
           .map((p) => ({ label: `${p.key} — ${p.name}`, value: p.id })),
         ...Array.from(new Set([...data.ids, ...ids]))
           .filter((id) => !visible.some((p) => p.id === id))
@@ -177,15 +201,17 @@ export function Field() {
             maxMenuHeight={240}
             styles={{ menu: (base) => ({ ...base, position: 'relative' }) }}
             noOptionsMessage={() =>
-              search.busy
-                ? 'Searching…'
-                : search.error ||
-                  (search.query.trim()
-                    ? 'No matching prompts'
-                    : // The menu hides selected options, so suggestions can all be hidden.
-                      search.items.length
-                      ? 'All suggested prompts are selected. Search to find others.'
-                      : 'No available prompts in this space yet.')
+              data.cleanupOnly
+                ? 'All prompts on this work item are selected.'
+                : search.busy
+                  ? 'Searching…'
+                  : search.error ||
+                    (search.query.trim()
+                      ? 'No matching prompts'
+                      : // The menu hides selected options, so suggestions can all be hidden.
+                        search.items.length
+                        ? 'All suggested prompts are selected. Search to find others.'
+                        : 'No available prompts in this space yet.')
             }
             isSearchable={!data.cleanupOnly}
             inputValue={search.query}
@@ -195,14 +221,17 @@ export function Field() {
             }}
             isLoading={search.busy}
             inputId="agent-prompts"
+            autoFocus
             isMulti
             isDisabled={busy || !!recovery}
             isOptionDisabled={(option) => ids.length >= 5 && !ids.includes(option.value)}
+            // A saved prompt the picker never offers (retired, or of a previous type) stays only
+            // while selected: once deselected, only Discard changes brings it back.
             options={options.filter(
               (p) =>
                 data.cleanupOnly ||
                 ids.includes(p.value) ||
-                search.items.some((item) => item.id === p.value),
+                search.items.some((item) => item.id === p.value && !item.selectedOnly),
             )}
             value={ids.map((id) => options.find((o) => o.value === id)!)}
             onChange={(value) => {
@@ -233,8 +262,12 @@ export function Field() {
               {search.error && (
                 <Button
                   onMouseDown={retainSearchFocus}
-                  isDisabled={search.busy || busy}
-                  onClick={search.nextCursor ? search.more : search.refresh}
+                  isLoading={search.busy}
+                  isDisabled={busy}
+                  onClick={() => {
+                    refocus.current = true;
+                    void (search.nextCursor ? search.more() : search.refresh());
+                  }}
                 >
                   Retry search
                 </Button>
@@ -245,8 +278,12 @@ export function Field() {
               {!!search.query.trim() && search.nextCursor && (
                 <Button
                   onMouseDown={retainSearchFocus}
-                  isDisabled={search.busy || busy || recovery}
-                  onClick={() => void search.more()}
+                  isLoading={search.busy}
+                  isDisabled={busy || recovery}
+                  onClick={() => {
+                    refocus.current = true;
+                    void search.more();
+                  }}
                 >
                   Load more
                 </Button>
@@ -268,8 +305,9 @@ export function Field() {
       {data?.loadWarning && <p>{data.loadWarning}</p>}
       {/* Present from the first render so assistive technology announces each outcome. */}
       <p role="status">{loadError || message}</p>
+      {/* Pressing it removes it; the picker or a new Try again starts with focus afterwards. */}
       {loadError && !busy && (
-        <Button onMouseDown={retainSearchFocus} onClick={() => void load()}>
+        <Button onMouseDown={retainSearchFocus} autoFocus onClick={() => void load()}>
           Try again
         </Button>
       )}
@@ -277,17 +315,22 @@ export function Field() {
       {busy && <Spinner size="small" label={saving ? 'Saving prompts' : 'Loading prompts'} />}
       {data && !recovery && (
         <div className="prompt-actions">
+          {/* Loading, not disabled, while it runs, so the pressed button keeps keyboard focus. */}
           <Button
             onMouseDown={retainSearchFocus}
             appearance="primary"
-            isDisabled={busy || !dirty || ids.length > 5}
+            isLoading={saving === 'Save'}
+            isDisabled={(busy && saving !== 'Save') || !dirty || ids.length > 5}
             onClick={() => void save()}
           >
             Save
           </Button>
           <Button
             onMouseDown={retainSearchFocus}
-            isDisabled={busy || dirty || !data.ids.length || data.cleanupOnly}
+            isLoading={saving === 'Sync'}
+            isDisabled={
+              (busy && saving !== 'Sync') || dirty || !data.ids.length || data.cleanupOnly
+            }
             onClick={() => void save(true)}
           >
             Sync
@@ -297,6 +340,7 @@ export function Field() {
               onMouseDown={retainSearchFocus}
               isDisabled={busy}
               onClick={() => {
+                focusPicker();
                 setIds(data.ids);
                 setMessage('');
               }}

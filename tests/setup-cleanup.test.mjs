@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setupCleanup } from './hosted/support/setup-cleanup.mjs';
-import { fakeJira } from './support/fake-jira-setup.mjs';
+import { fakeJira, kanbanSpace } from './support/fake-jira-setup.mjs';
 
 const id = '0f6c2b1e-7d4a-4c1f-9a2b-3c4d5e6f7a8b';
 const description = 'Reusable instructions managed through Agent Prompts for Jira.';
@@ -137,7 +137,46 @@ test('cleanup before steps mode planned its fixtures reads no screens', async ()
   const h = harness(world, j);
   await h.cleanup();
   assert.deepEqual(h.writes, ['DELETE /issuetype/30001', ...removeSpaces(j)]);
-  assert.ok(!h.calls.some((c) => /^\w+ \/(screens|screenscheme|issuetypescreenscheme)/.test(c)));
+  // Only the search for what Jira kept of the deleted spaces, by space key.
+  const keys = j.fixtures.map((f) => `queryString=${f.key}&`).join('|');
+  const leftovers = new RegExp(`^GET /(screens|screenscheme|issuetypescreenscheme)\\?(${keys})`);
+  assert.ok(
+    !h.calls.some(
+      (c) => /^\w+ \/(screens|screenscheme|issuetypescreenscheme)/.test(c) && !leftovers.test(c),
+    ),
+  );
+  assertClean(h, j);
+});
+
+test('cleanup deletes what Jira created with each space once the spaces are gone', async () => {
+  const { world, j } = run();
+  for (const [n, f] of j.fixtures.entries())
+    Object.assign(world.projects[f.project.id], kanbanSpace(world, f.key, 60000 + 100 * n));
+  kanbanSpace(world, 'OTHER', 61000);
+  world.projects[20100] = { key: 'OTHER', description: '', scheme: '10100', itss: '61000' };
+  const h = harness(world, j);
+  await h.cleanup();
+  const spaces = removeSpaces(j);
+  assert.deepEqual(h.writes.slice(0, spaces.length), spaces);
+  // Per space: one work type screen scheme, three screen schemes and screens, one of the rest.
+  const each = { issuetypescreenscheme: 2, screenscheme: 6, screens: 6 };
+  assert.deepEqual(
+    h.writes.slice(spaces.length).map((w) => w.split('/')[1]),
+    [
+      'issuetypescreenscheme',
+      'screenscheme',
+      'screens',
+      'workflowscheme',
+      'workflow',
+      'filter',
+    ].flatMap((kind) => Array(each[kind] ?? 2).fill(kind)),
+  );
+  assert.ok(
+    h.before.slice(spaces.length).every((s) => s.leftovers.some((x) => x.state === 'intent')),
+  );
+  assert.ok(j.leftovers.every((x) => x.state === 'deleted'));
+  assert.deepEqual(Object.keys(world.itss), ['61000']);
+  assert.deepEqual(Object.keys(world.filters), ['61000']);
   assertClean(h, j);
 });
 
@@ -177,14 +216,15 @@ test('cleanup after a bulk run removes leftover fields and restores the create s
     `DELETE /screens/30103/tabs/40113/fields/${field}`,
     'POST /screens/30105/tabs/40105/fields {"fieldId":"summary"}',
     ...removeSpaces(j),
+    // The spaces' own screens go only after them.
+    ...['30101', '30102', '30105', '30103', '30104'].map((x) => `DELETE /screens/${x}`),
   ]);
   assert.equal(h.before[0].screenCleanupIntent, true);
   assert.deepEqual(
     h.before[1].requiredRemoved.map((x) => x.restoreIntent),
     [undefined, true],
   );
-  assert.deepEqual(world.screens[30103].tabs[1].fields, []);
-  assert.deepEqual(world.screens[30105].tabs[0].fields, ['description', 'summary']);
+  assert.deepEqual(world.screens, {});
   assertSiteRestored(world, j);
   assertClean(h, j);
 });
@@ -273,6 +313,17 @@ const stepsDeletes = [
     `DELETE /issuetype/${x}`,
   ]),
 ];
+// What Jira created with the two spaces, deleted after them.
+const stepsLeftovers = [
+  ...['50000', '50001'].map((x) => `DELETE /issuetypescreenscheme/${x}`),
+  ...['60000', '60001'].map((x) => `DELETE /screenscheme/${x}`),
+  ...['70000', '70001'].map((x) => `DELETE /screens/${x}`),
+];
+const assertNothingLeft = (world) => {
+  assert.deepEqual(world.itss, {});
+  assert.deepEqual(world.screenSchemes, {});
+  assert.deepEqual(world.screens, {});
+};
 
 test('cleanup after steps mode stopped mid-removal undoes its fixtures in reverse', async () => {
   const { world, j, steps } = stepsRun();
@@ -287,6 +338,7 @@ test('cleanup after steps mode stopped mid-removal undoes its fixtures in revers
     'POST /issuetypescreenscheme/50000/mapping/remove {"issueTypeIds":["30010","30011"]}',
     ...stepsDeletes,
     ...removeSpaces(j),
+    ...stepsLeftovers,
   ]);
   assert.equal(h.before[2].steps.restoreIntent, true);
   assert.equal(h.before[3].steps.unmapIntent, true);
@@ -296,12 +348,7 @@ test('cleanup after steps mode stopped mid-removal undoes its fixtures in revers
   assert.equal(h.before[12].steps.types[0].deleteIntent, true);
   assert.equal(steps.defaultRestored, true);
   assert.ok([...steps.types, ...steps.screens, ...steps.schemes].every((x) => x.gone));
-  assert.deepEqual(world.itss, {
-    50000: { name: world.itss[50000].name, rows: { default: '60000' } },
-    50001: { name: world.itss[50001].name, rows: { default: '60001' } },
-  });
-  assert.deepEqual(Object.keys(world.screens), ['70000', '70001']);
-  assert.deepEqual(Object.keys(world.screenSchemes), ['60000', '60001']);
+  assertNothingLeft(world);
   assertSiteRestored(world, j);
   assertClean(h, j);
 });
@@ -322,6 +369,7 @@ test('steps cleanup finds a screen scheme whose creation response was lost', asy
   assert.deepEqual(h.writes, [
     ...stepsDeletes.filter((x) => !x.endsWith('/60012')),
     ...removeSpaces(j),
+    ...stepsLeftovers,
   ]);
   assert.ok(!h.calls.some((c) => c.includes('/issuetypescreenscheme/mapping')));
   assertSiteRestored(world, j);
@@ -342,6 +390,7 @@ test('steps cleanup rerun after a lost delete response skips screens already gon
     'DELETE /issuetypescheme/21000/issuetype/30011',
     'DELETE /issuetype/30011',
     ...removeSpaces(j),
+    ...stepsLeftovers,
   ]);
   assert.equal(steps.types[0].gone, true);
   assertSiteRestored(world, j);
@@ -367,10 +416,11 @@ test('steps cleanup rerun after a failed screen delete reads that screen back by
         ...(failure === 'drop' ? ['DELETE /screens/70011'] : []),
         ...stepsDeletes.slice(5),
         ...removeSpaces(j),
+        ...stepsLeftovers,
       ],
       failure,
     );
-    assert.deepEqual(Object.keys(world.screens), ['70000', '70001'], failure);
+    assertNothingLeft(world);
     assert.ok(
       steps.screens.every((x) => x.gone),
       failure,

@@ -1,9 +1,11 @@
 // Journal-driven cleanup of the setup runner (verify-setup.mjs), separate so it runs offline too.
 import assert from 'node:assert/strict';
 import { verifyTypeMappings } from './agent-prompts-setup.mjs';
+import { spaceLeftovers } from './space-leftovers.mjs';
 
 /** Cleanup over a run journal `j`, a Jira client `api` and the journal writer `persist`. */
 export function setupCleanup({ j, api, persist }) {
+  const leftovers = spaceLeftovers(api);
   async function pages(endpoint) {
     const out = [];
     for (let start = 0, n = 0; n < 100; n++) {
@@ -291,6 +293,15 @@ export function setupCleanup({ j, api, persist }) {
         assert.equal((await pages(`/issuetypescheme?id=${f.scheme.id}`)).length, 0);
       }
     }
+    // The rest of what Jira created with the spaces stays after them.
+    if (!j.leftovers) {
+      j.leftovers = await leftovers.find({
+        keys: j.fixtures.filter((f) => f.project).map((f) => f.key),
+      });
+      persist();
+    }
+    const stay = await leftovers.remove(j.leftovers, persist);
+    if (stay.length) console.log(`${stay.length} space leftovers stay; see the journal.`);
     j.clean = true;
     persist();
   }

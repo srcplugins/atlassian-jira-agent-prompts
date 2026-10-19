@@ -19,7 +19,7 @@ function comparedWithTrue(node) {
   return other.type === 'Literal' && other.value === true;
 }
 
-// Jira permission responses are untrusted JSON; only the boolean true grants access (F-029).
+// Jira permission responses are untrusted JSON; only the boolean true grants access.
 const strictPermissionCheck = {
   meta: {
     type: 'problem',
@@ -43,7 +43,7 @@ const strictPermissionCheck = {
   },
 };
 
-// UI Kit components are not DOM, so jsx-a11y cannot check their labels (defect F-021).
+// UI Kit components are not DOM, so jsx-a11y cannot check their labels.
 const labelledControls = new Set([
   'Textfield',
   'TextArea',
@@ -210,9 +210,9 @@ function namesHarness(name) {
   );
 }
 
-// Deployed source must not carry test hooks (docs/factory/scope-and-hygiene.md).
+// Deployed source must not carry test hooks.
 export const testOnlyMessage =
-  "Test-only code doesn't belong in deployed source; put it in the SDK double or the hosted harness (docs/factory/scope-and-hygiene.md).";
+  "Test-only code doesn't belong in deployed source; put it in the SDK double or the hosted harness.";
 
 const testHarnessNames = {
   meta: {

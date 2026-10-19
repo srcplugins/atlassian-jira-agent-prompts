@@ -105,9 +105,9 @@ async function readState<T>(kvs: Sdk['kvs'], key: string) {
     throw new StorageUnavailable('App storage is unavailable. Try again shortly.');
   }
 }
-function requester({ api }: Sdk) {
+function requester({ api }: Sdk, deadline?: number) {
   /** A read (GET, or `read` for a read-only POST such as search) is tried up to three times when
-   * Jira is briefly unavailable; a write is sent once. */
+   * Jira is briefly unavailable, but never past `deadline`; a write is sent once. */
   async function request(
     path: ReturnType<Sdk['route']>,
     method = 'GET',
@@ -119,6 +119,7 @@ function requester({ api }: Sdk) {
       () => send(path, method, body),
       (error) =>
         error instanceof JiraUnavailable || (error instanceof JiraHttpError && error.status >= 500),
+      deadline,
     );
   }
   async function send(path: ReturnType<Sdk['route']>, method: string, body?: unknown) {
@@ -347,10 +348,11 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
 }
 export function createSettingsPorts(sdk: Sdk): SettingsPorts {
   const { route, kvs, Filter, FilterConditions } = sdk;
-  const request = requester(sdk);
   // One resolver invocation may run for 25 seconds. Reads that find who uses a screen stop after
   // 12, so a blocked review comes back instead of a timeout; writes need the rest (`timeLeft`).
+  // No read is tried again past 22 seconds, so the step's last storage writes still fit.
   const started = Date.now();
+  const request = requester(sdk, started + 22_000);
   const late = () => Date.now() > started + 12_000;
   // Who uses a screen: Jira has no direct lookup, so every screen scheme is listed once per
   // request with the work type screen schemes using it, then those schemes' spaces.
@@ -364,7 +366,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
   > = {};
   return {
     get: (project) => readState<SettingsRecord>(kvs, `config-${project}`),
-    cas: async (project, revision, data, screen) => {
+    cas: async (project, revision, data, screen, run) => {
       const condition = (revision: number) => ({
         entityName: storageEntity,
         conditions: new Filter<SettingsRecord>().and(
@@ -389,6 +391,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
                 condition(screen.revision),
               )
             : transaction.delete(`screen-${screen.id}`, condition(screen.revision));
+        if (run !== undefined) transaction = transaction.check(batchStorageKey, condition(run));
         await transaction.execute();
       } catch {
         throw new UserError(
@@ -599,10 +602,18 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
       });
     },
     // Names come from one bulk read and where the field sits from one field read, so only a
-    // screen without the field (for its first tab) or one in `full` reads its tabs.
-    screens: async (ids, field, full = []) => {
+    // screen without the field (for its first tab) or one in `full` reads its tabs. Reads stop at
+    // the review cutoff; reads confirming writes may also use the time set aside for the writes.
+    screens: async (ids, field, full = [], confirm = false) => {
+      const due = () => {
+        if (confirm ? Date.now() > started + 22_000 : late())
+          throw new JiraUnavailable(
+            'The screens could not all be read in time. Review this space again.',
+          );
+      };
       const names = new Map<string, string>();
       for (const chunk of pages(ids)) {
+        due();
         const value = await request(route`/rest/api/3/screens?${byIds(chunk)}`);
         if (value?.isLast !== true || !Array.isArray(value.values))
           throw new UserError('A screen could not be read.');
@@ -615,28 +626,27 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
       // A screen deleted in Jira is reported as missing, so its stale ownership can be dropped.
       const present = ids.filter((id) => names.has(id));
       const placed = present.some((id) => !full.includes(id))
-        ? await fieldTabs(field)
+        ? await fieldTabs(field, due)
         : new Map<string, string>();
       return limited(ids, async (id): Promise<ScreenInfo | undefined> => {
         const name = names.get(id);
         if (name === undefined) return undefined;
         const tab = placed.get(id);
         if (tab && !full.includes(id)) return { id, name, tabs: [{ id: tab, fields: [field] }] };
+        due();
         const tabs = await request(route`/rest/api/3/screens/${id}/tabs`);
         if (!Array.isArray(tabs) || tabs.length > 50)
           throw new UserError('A screen’s tabs could not be read.');
-        const read = [];
-        for (const t of tabs) {
-          const tabId = numeric(String(t?.id));
-          if (!full.includes(id)) {
-            read.push({ id: tabId, fields: [] });
-            continue;
-          }
+        const tabIds = tabs.map((t) => numeric(String(t?.id)));
+        if (!full.includes(id))
+          return { id, name, tabs: tabIds.map((t) => ({ id: t, fields: [] })) };
+        const read = await limited(tabIds, async (tabId) => {
+          due();
           const fields = await request(route`/rest/api/3/screens/${id}/tabs/${tabId}/fields`);
           if (!Array.isArray(fields) || fields.some((f) => typeof f?.id !== 'string'))
             throw new UserError('A screen’s fields could not be read.');
-          read.push({ id: tabId, fields: fields.map((f: { id: string }) => f.id) });
-        }
+          return { id: tabId, fields: fields.map((f: { id: string }) => f.id) };
+        });
         return { id, name, tabs: read };
       });
     },
@@ -699,20 +709,23 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
     screenRecord: (screen) => readState<ScreenRecord>(kvs, `screen-${screen}`),
     configuring: async (project) => {
       const run = await readState<BatchRecord>(kvs, batchStorageKey);
-      return (
-        run?.data.status === 'running' && run.data.entries[run.data.index]?.projectId === project
-      );
+      return {
+        revision: run?.revision ?? 0,
+        changing:
+          run?.data.status === 'running' && run.data.entries[run.data.index]?.projectId === project,
+      };
     },
     timeLeft: () => started + 22_000 - Date.now(),
   };
   /** Where `field` sits: screen ID to tab ID, across every screen that has it. */
-  async function fieldTabs(field: string) {
+  async function fieldTabs(field: string, due: () => void) {
     if (!/^customfield_[1-9]\d*$/.test(field)) throw new UserError('Invalid prompt field.');
     const tabs = new Map<string, string>();
     // Ten pages, like the screen scheme mapping: a thousand screens is past any review budget.
     for (let start = 0, page = 0; ; page++) {
       if (page >= 10)
         throw new UserError('Too many screens use the Agent Prompts field to review at once.');
+      due();
       const value = await request(
         route`/rest/api/3/field/${field}/screens?startAt=${start}&maxResults=100&expand=tab`,
       );
@@ -734,7 +747,7 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
   }
   /** Every screen scheme with its screens and, when Jira listed them all, the work type screen
    * schemes using it (none when the expansion is omitted). The first page gives the total, so the
-   * rest are read four at a time. */
+   * rest are read four at a time, each starting where a page as long as the first would end. */
   async function listScreenSchemes() {
     const schemes = new Map<string, { id: string; screens: string[]; itss?: string[] }>();
     const page = async (start: number) => {
@@ -782,17 +795,29 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
     let read = await page(0);
     if (!read) return done(false);
     if (!read.isLast && typeof read.total === 'number' && read.total > read.next) {
-      const starts = [];
+      const starts: number[] = [];
       for (let start = read.next; start < read.total; start += read.next) starts.push(start);
       const rest = await limited(starts, page);
       if (rest.some((r) => !r)) return done(false);
-      read = rest.at(-1)!;
+      // Jira may return a shorter page than the first, leaving schemes between that page and the
+      // next start unread: the scan goes on page by page from the first such gap, and a scheme
+      // read twice is kept once.
+      const gap = rest.findIndex((r, i) => i < starts.length - 1 && r!.next < starts[i + 1]!);
+      read = gap === -1 ? rest.at(-1)! : { ...rest[gap]!, isLast: false };
     }
     // Without a total, or when schemes were added meanwhile, the rest is read page by page.
     while (!read.isLast) {
       read = await page(read.next);
       if (!read) return done(false);
     }
+    // A scheme added during the scan shifts later ones to later offsets, where one can be missed:
+    // fewer schemes than Jira counts is never a complete list, but a new scan can be. A deletion
+    // can hide one without changing the count, but only in one scan, so the fresh review before
+    // writes then differs.
+    if (typeof read.total === 'number' && schemes.size < read.total)
+      throw new JiraUnavailable(
+        'Screen schemes changed while being read. Review this space again.',
+      );
     return done(true);
   }
   /** Every work type screen scheme row, grouped by screen scheme. */
@@ -1193,20 +1218,12 @@ export function registerResolvers(sdk: Sdk) {
             accountId: raw.accountId,
             projectId:
               (!payload.projectId ? trustedProject : undefined) ??
-              (await (async () => {
+              (() => {
                 const reference = payload.projectId;
-                if (
-                  typeof reference !== 'string' ||
-                  !/^(?:[1-9]\d{0,19}|[A-Z][A-Z0-9_]{1,30})$/.test(reference)
-                )
-                  throw new UserError('Enter a Jira space key or numeric ID.');
-                if (/^[1-9]\d*$/.test(reference)) return reference;
-                // Resolve a key only for a Jira administrator, so the lookup reveals nothing
-                // a non-administrator could not already learn from Jira.
-                await createBatchPorts(sdk).admin();
-                const value = await requester(sdk)(sdk.route`/rest/api/3/project/${reference}`);
-                return numeric(value?.id);
-              })()),
+                if (typeof reference !== 'string' || !/^[1-9]\d{0,19}$/.test(reference))
+                  throw new UserError('Choose a Jira space.');
+                return reference;
+              })(),
           };
           if (action === 'resolve') return settings.resolve(c, Number(payload.revision));
           if (action === 'preferences')

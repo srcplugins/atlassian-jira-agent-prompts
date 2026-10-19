@@ -192,7 +192,11 @@ async function explore(seed, now) {
     if (!accepted) await w.drive([w.service.resolveSave(c, input)]);
     const released = !accepted && settled();
     assert.equal(accepted, !!status.value.adoptable, `${label}: accept disagrees with status`);
-    assert.equal(released, !!status.value.unchanged, `${label}: release disagrees with status`);
+    assert.equal(
+      released,
+      !!(status.value.unchanged || status.value.sectionRemoved),
+      `${label}: release disagrees with status`,
+    );
     outcome = accepted ? 'accepted' : released ? 'released' : 'pending';
   } else if (status.value && !successes.length && w.stats.puts) outcome = 'observed';
   assert.equal(w.stats.puts, putsBefore, `${label}: recovery wrote Jira`);

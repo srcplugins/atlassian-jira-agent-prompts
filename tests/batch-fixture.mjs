@@ -35,8 +35,10 @@ export function batchFixture(ids = ['1', '2', '7']) {
   };
   const s = {
     get: async (id) => structuredClone(configs.get(id)),
-    cas: async (id, revision, data, screen) => {
+    cas: async (id, revision, data, screen, runRevision) => {
       if ((configs.get(id)?.revision ?? 0) !== revision) throw new UserError('Conflict');
+      if (runRevision !== undefined && (run?.revision ?? 0) !== runRevision)
+        throw new UserError('Conflict');
       screens.check(screen);
       configs.set(id, { revision: revision + 1, data: structuredClone(data) });
       screens.commit(screen);
@@ -58,8 +60,11 @@ export function batchFixture(ids = ['1', '2', '7']) {
       }
     },
     ...screens.ports,
-    configuring: async (id) =>
-      run?.data.status === 'running' && run.data.entries[run.data.index]?.projectId === id,
+    configuring: async (id) => ({
+      revision: run?.revision ?? 0,
+      changing:
+        run?.data.status === 'running' && run.data.entries[run.data.index]?.projectId === id,
+    }),
   };
   const w = {
     admin: async () => {},

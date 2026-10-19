@@ -1,17 +1,73 @@
-// In-memory Jira for the setup runner's cleanup: only the REST endpoints it uses, paged two at a
-// time. Anything else throws, so a new request in cleanup fails its test until it is modelled.
+// In-memory Jira for the setup runner's cleanup and the space leftovers: only the REST endpoints
+// they use, paged two at a time. Anything else throws, so a new request in cleanup fails its test
+// until it is modelled.
 //
-// World: { projects, typeSchemes, types, screens, screenSchemes, itss }, each keyed by id.
-// projects: { key, description, scheme, itss }; typeSchemes: { name, isDefault?, types: [id] };
-// types: { name, description, hierarchyLevel, subtask }; screens: { name, description,
-// tabs: [{ id, fields: [fieldId] }] }; screenSchemes: { name, description, screens };
-// itss: { name, rows: { [workTypeId | 'default']: screenSchemeId } }.
+// World: { projects, typeSchemes, types, screens, screenSchemes, itss, workflowSchemes, workflows,
+// filters }, each keyed by id. projects: { key, description, scheme, itss, workflowScheme? };
+// typeSchemes: { name, isDefault?, types: [id] }; types: { name, description, hierarchyLevel,
+// subtask }; screens: { name, description, tabs: [{ id, fields: [fieldId] }] }; screenSchemes:
+// { name, description, screens }; itss: { name, rows: { [workTypeId | 'default']: screenSchemeId } };
+// workflowSchemes: { name, defaultWorkflow }; workflows: { name }; filters: { name, jql, owner }.
 // `lose` names one write ('METHOD path') that Jira applies but whose response is lost; `drop` one
-// that fails without reaching Jira.
-export function fakeJira(world, { lose, drop } = {}) {
+// that fails without reaching Jira; `refuse` one that Jira rejects with an error status.
+const account = 'runner-account';
+
+/** What Jira creates with a Kanban space `key`, numbered from `base`; returns the space's ids. */
+export function kanbanSpace(world, key, base) {
+  const id = (n) => String(base + n);
+  for (const kind of ['workflowSchemes', 'workflows', 'filters']) world[kind] ??= {};
+  const kinds = [
+    ['Default', 'Default Issue'],
+    ['Bug', 'Bug'],
+    ['Epic', 'Epic'],
+  ];
+  world.itss[id(0)] = {
+    name: `${key}: Kanban Issue Type Screen Scheme`,
+    rows: { default: id(10), 10004: id(11), 10000: id(12) },
+  };
+  kinds.forEach(([scheme, screen], n) => {
+    world.screenSchemes[id(10 + n)] = {
+      name: `${key}: Kanban ${scheme} Screen Scheme`,
+      description: '',
+      screens: { default: base + 20 + n },
+    };
+    world.screens[id(20 + n)] = {
+      name: `${key}: Kanban ${screen} Screen`,
+      description: '',
+      tabs: [],
+    };
+  });
+  const workflow = `Software Simplified Workflow for Project ${key}`;
+  world.workflowSchemes[id(0)] = {
+    name: `${key}: Software Simplified Workflow Scheme`,
+    defaultWorkflow: workflow,
+  };
+  world.workflows[`workflow-${id(0)}`] = { name: workflow };
+  world.filters[id(0)] = {
+    name: `Filter for ${key} board`,
+    jql: `project = "${key}" ORDER BY Rank ASC`,
+    owner: account,
+  };
+  return { itss: id(0), workflowScheme: id(0) };
+}
+
+/**
+ * @param {any} world
+ * @param {{ lose?: string, drop?: string, refuse?: string }} [faults]
+ */
+export function fakeJira(world, { lose, drop, refuse } = {}) {
   const calls = [];
   const writes = [];
+  world.workflowSchemes ??= {};
+  world.workflows ??= {};
+  world.filters ??= {};
   const { projects, typeSchemes, types, screens, screenSchemes, itss } = world;
+  const { workflowSchemes, workflows, filters } = world;
+  // Jira answers a write on something still in use with an error status, changing nothing.
+  const inUse = (what) =>
+    Object.assign(Error(`Fixture API DELETE failed (HTTP 400): ${what} in use`), {
+      definitiveRejection: true,
+    });
   const page = (values, q) => {
     const startAt = Number(q.get('startAt') ?? 0);
     const slice = values.slice(startAt, startAt + Math.min(Number(q.get('maxResults')), 2));
@@ -45,6 +101,16 @@ export function fakeJira(world, { lose, drop } = {}) {
   });
   const usingScheme = (scheme) =>
     Object.keys(itss).filter((i) => Object.values(itss[i].rows).includes(scheme));
+  const workflowScheme = (id) => ({
+    id: Number(id),
+    name: workflowSchemes[id].name,
+    defaultWorkflow: workflowSchemes[id].defaultWorkflow,
+    issueTypeMappings: {},
+  });
+  const usingWorkflow = (id) =>
+    Object.keys(workflowSchemes).filter(
+      (s) => workflowSchemes[s].defaultWorkflow === workflows[id].name,
+    );
   const screenScheme = (id, expand) => ({
     id: Number(id),
     name: screenSchemes[id].name,
@@ -66,7 +132,18 @@ export function fakeJira(world, { lose, drop } = {}) {
   };
   const paged = ['startAt', 'maxResults'];
   // [method, path pattern, query parameters allowed, handler(match, query, body)]
+  /** @type {Array<[string, RegExp, string[], (match: any, q: URLSearchParams, body?: any) => any]>} */
   const routes = [
+    [
+      'GET',
+      /^\/project\/search$/,
+      paged,
+      (_, q) =>
+        page(
+          Object.keys(projects).map((id) => ({ id, key: projects[id].key })),
+          q,
+        ),
+    ],
     [
       'GET',
       /^\/project\/(\w+)$/,
@@ -217,7 +294,7 @@ export function fakeJira(world, { lose, drop } = {}) {
             Object.values(x.screens).map(String).includes(id),
           )
         )
-          throw Error('Screen in use');
+          throw inUse('Screen');
         delete screens[id];
       },
     ],
@@ -233,7 +310,7 @@ export function fakeJira(world, { lose, drop } = {}) {
       [],
       ([, id]) => {
         exists(screenSchemes, id);
-        if (usingScheme(id).length) throw Error('Screen scheme in use');
+        if (usingScheme(id).length) throw inUse('Screen scheme');
         delete screenSchemes[id];
       },
     ],
@@ -273,6 +350,153 @@ export function fakeJira(world, { lose, drop } = {}) {
         for (const t of body.issueTypeIds) delete rows[t];
       },
     ],
+    ['GET', /^\/myself$/, [], () => ({ accountId: account })],
+    [
+      'GET',
+      /^\/issuetypescreenscheme$/,
+      ['id', 'queryString', ...paged],
+      (_, q) =>
+        page(
+          named(itss, q, (id) => ({ id, name: itss[id].name, description: '' })),
+          q,
+        ),
+    ],
+    [
+      'GET',
+      /^\/issuetypescreenscheme\/(\d+)\/project$/,
+      paged,
+      ([, id], q) =>
+        page(
+          Object.keys(projects)
+            .filter((p) => projects[p].itss === id)
+            .map((p) => ({ id: p })),
+          q,
+        ),
+    ],
+    [
+      'DELETE',
+      /^\/issuetypescreenscheme\/(\d+)$/,
+      [],
+      ([, id]) => {
+        exists(itss, id);
+        if (Object.values(projects).some((p) => p.itss === id))
+          throw inUse('Work type screen scheme');
+        delete itss[id];
+      },
+    ],
+    [
+      'GET',
+      /^\/workflowscheme$/,
+      paged,
+      (_, q) => page(Object.keys(workflowSchemes).map(workflowScheme), q),
+    ],
+    [
+      'GET',
+      /^\/workflowscheme\/(\d+)$/,
+      [],
+      ([, id]) => (workflowSchemes[id] ? workflowScheme(id) : null),
+    ],
+    [
+      'GET',
+      /^\/workflowscheme\/(\d+)\/projectUsages$/,
+      ['maxResults'],
+      ([, id], q) =>
+        workflowSchemes[id]
+          ? {
+              workflowSchemeId: id,
+              projects: {
+                nextPageToken: null,
+                values: Object.keys(projects)
+                  .filter((p) => projects[p].workflowScheme === id)
+                  .slice(0, Number(q.get('maxResults')))
+                  .map((p) => ({ id: p })),
+              },
+            }
+          : null,
+    ],
+    [
+      'DELETE',
+      /^\/workflowscheme\/(\d+)$/,
+      [],
+      ([, id]) => {
+        exists(workflowSchemes, id);
+        if (Object.values(projects).some((p) => p.workflowScheme === id))
+          throw inUse('Workflow scheme');
+        delete workflowSchemes[id];
+      },
+    ],
+    [
+      'GET',
+      /^\/workflows\/search$/,
+      ['queryString', ...paged],
+      (_, q) =>
+        page(
+          named(workflows, q, (id) => ({ id, name: workflows[id].name })),
+          q,
+        ),
+    ],
+    [
+      'GET',
+      /^\/workflow\/([\w-]+)\/workflowSchemes$/,
+      ['maxResults'],
+      ([, id], q) =>
+        workflows[id]
+          ? {
+              workflowId: id,
+              workflowSchemes: {
+                nextPageToken: null,
+                values: usingWorkflow(id)
+                  .slice(0, Number(q.get('maxResults')))
+                  .map((s) => ({ id: s })),
+              },
+            }
+          : null,
+    ],
+    [
+      'DELETE',
+      /^\/workflow\/([\w-]+)$/,
+      [],
+      ([, id]) => {
+        exists(workflows, id);
+        if (usingWorkflow(id).length) throw inUse('Workflow');
+        delete workflows[id];
+      },
+    ],
+    [
+      'GET',
+      /^\/filter\/search$/,
+      ['filterName', ...paged],
+      (_, q) =>
+        page(
+          Object.keys(filters)
+            .filter((id) => filters[id].name.includes(q.get('filterName')))
+            .map((id) => ({ id, name: filters[id].name })),
+          q,
+        ),
+    ],
+    [
+      'GET',
+      /^\/filter\/(\d+)$/,
+      ['expand'],
+      ([, id]) =>
+        filters[id]
+          ? {
+              id,
+              name: filters[id].name,
+              jql: filters[id].jql,
+              owner: { accountId: filters[id].owner },
+            }
+          : null,
+    ],
+    [
+      'DELETE',
+      /^\/filter\/(\d+)$/,
+      [],
+      ([, id]) => {
+        exists(filters, id);
+        delete filters[id];
+      },
+    ],
   ];
   async function api(path, method = 'GET', body) {
     calls.push(`${method} ${path}`);
@@ -289,6 +513,12 @@ export function fakeJira(world, { lose, drop } = {}) {
       if (write && drop === `${method} ${path}`) {
         drop = undefined;
         throw Error('Fixture API request failed');
+      }
+      if (write && refuse === `${method} ${path}`) {
+        refuse = undefined;
+        throw Object.assign(Error(`Fixture API ${method} failed (HTTP 429)`), {
+          definitiveRejection: true,
+        });
       }
       const value = structuredClone(handle(match, url.searchParams, body) ?? null);
       if (write && lose === `${method} ${path}`) {

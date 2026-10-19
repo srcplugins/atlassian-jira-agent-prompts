@@ -16,6 +16,7 @@ import {
 } from '@forge/react';
 import { call } from './client';
 import { createLatch } from './shared/latch.mjs';
+import { appearance, configurationStatus } from './space-status';
 import type { createSettings } from './settings';
 export type Health = Awaited<ReturnType<ReturnType<typeof createSettings>['health']>>;
 const divider = xcss({ height: '1px', backgroundColor: 'color.background.neutral' });
@@ -86,9 +87,10 @@ export function Settings({
     await onUpdated?.(updated);
     setMessage(done);
   }
+  const status = health && configurationStatus(health);
   return (
     <Stack space="space.150">
-      {health && (
+      {health && status && (
         <>
           <Box xcss={divider} role="separator" />
           <Box paddingBlockStart="space.100">
@@ -97,23 +99,7 @@ export function Settings({
                 <Heading as="h3" size="small">
                   Configuration
                 </Heading>
-                <Lozenge
-                  appearance={
-                    health.state.data.pending || health.checks.some((check) => !check.ok)
-                      ? 'moved'
-                      : health.state.data.type
-                        ? 'success'
-                        : 'default'
-                  }
-                >
-                  {health.state.data.pending
-                    ? 'Needs attention'
-                    : !health.state.data.type
-                      ? 'Not configured'
-                      : health.checks.every((check) => check.ok)
-                        ? 'Healthy'
-                        : 'Needs attention'}
-                </Lozenge>
+                <Lozenge appearance={appearance[status]}>{status}</Lozenge>
               </Inline>
               <Inline space="space.600" rowSpace="space.150" shouldWrap>
                 <Stack space="space.050">

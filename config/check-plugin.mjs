@@ -8,8 +8,8 @@ import { parseDocument } from 'yaml';
 // Self-contained so standalone plugin repositories can run it in their own CI (synchronized
 // to config/check-plugin.mjs).
 
-// Usage and Rovo control may live on the plugin's website page instead (Forge README rules).
-export const requiredSections = ['Permissions', 'Data'];
+// Usage and Rovo control may live on the plugin's website page instead.
+export const requiredSections = ['Permissions', 'Data', 'Support'];
 
 /**
  * Manifest defaults every Forge app must keep unless an explicit review says otherwise.
@@ -82,7 +82,7 @@ const anchor = (heading) =>
     .replace(/\s/g, '-');
 
 /** README structure, local links and an exact scope table. It cannot check factual accuracy. */
-export function readmeFindings(appDir) {
+export function readmeFindings(appDir, { sections = requiredSections } = {}) {
   const path = join(appDir, 'README.md');
   if (!existsSync(path)) return ['README.md: missing'];
   const errors = [];
@@ -90,7 +90,7 @@ export function readmeFindings(appDir) {
   if (!text.trim().startsWith('# ')) errors.push('README.md: missing title');
   if (/\b(?:TODO|TBD|FIXME)\b|__[A-Z_]+__/.test(text))
     errors.push('README.md: unresolved placeholder; state the actual limitation instead');
-  for (const heading of requiredSections) {
+  for (const heading of sections) {
     const marker = `## ${heading}\n`;
     const start = text.indexOf(marker);
     const body = start < 0 ? '' : text.slice(start + marker.length).split(/^## /m)[0];
@@ -135,10 +135,12 @@ export function readmeFindings(appDir) {
 
 // Public prose uses Jira Cloud's current terms: work item, work type and space. Code spans name
 // identifiers, link targets are URLs, and bold or double-quoted text quotes a host label exactly
-// (even one that still uses an old word), so none of those count.
+// (even one that still uses an old word), so none of those count. "An issue on GitHub" is
+// GitHub's term, used where a README says how to report a problem.
 const oldHostTerm = /\b(issues?|projects?|tickets?)\b/i;
 const visibleWords = (text) =>
   text
+    .replace(/\bissues? on \[?(?:\*\*)?GitHub\b/g, '')
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/`[^`\n]*`/g, '')
     .replace(/\]\([^)]*\)/g, ']')
@@ -187,8 +189,8 @@ export function hostTermFindings(appDir) {
 }
 
 // Before 1.0.0 the only installs are on owned sites, so compatibility code protects nobody:
-// rename and remove outright, and reinstall owned sites (scope-and-hygiene.md). Shared files serve
-// released plugins too and are checked in dev-platform.
+// rename and remove outright, and reinstall owned sites. Shared files serve released plugins too,
+// so they are checked where they are maintained.
 const compatWording =
   /\b(legacy|backwards?|compat(?:ible|ibility)?|migrat\w*|(?:older|installed|previous) (?:versions?|builds?|installs?)|predates|permanent (?:key|id))\b/i;
 export function compatFindings(appDir) {
@@ -364,12 +366,24 @@ export const nodeMajor = (directory) =>
 
 // Plugin repositories are public. Tracked files carry no agent instructions, no Atlassian site
 // host (example hosts are fine) and no Atlassian account ID; sites and accounts come from private
-// configuration. File names are reported, never the values.
+// configuration. File names are reported, never the values. Nor do they point readers at private
+// documents: a Markdown file the repository doesn't have, or the private factory.
 const agentFile =
   /(?:^|\/)(?:CLAUDE\.md|AGENTS\.md|\.claude\/|\.codex\/|\.cursor\/|\.cursorrules$|\.github\/copilot-instructions\.md$)/;
 const siteHost = /\b([a-z0-9-]+)\.atlassian\.net\b/g;
 const accountId = /\b[0-9]{6}:[0-9a-f-]{36}\b|\b5[0-9a-f]{23}\b/;
-export function publicRepositoryFindingsIn(file, text) {
+// Character classes keep this file, which is synchronized into plugins, from matching itself.
+const privateReference = /\bdev-platfor[m]\b|\bdocs\/factor[y]\b|\bthe factor[y]'s\b/i;
+// Private improvement IDs (F- and three digits) mean nothing to a public reader.
+const privateTracker = /\bF-[0-9]{3}\b/;
+const markdownName = /(?<![\w.-])([\w-]+\.md)(?![\w-]|\.\w)/g;
+/**
+ * @param {string} file
+ * @param {string} text
+ * @param {Set<string>} [names] basenames of the repository's tracked files; when given, a Markdown
+ *   file name the repository doesn't have is reported
+ */
+export function publicRepositoryFindingsIn(file, text, names) {
   const findings = [];
   if (agentFile.test(file)) findings.push(`${file}: agent instructions must not be committed`);
   for (const [, name] of text.matchAll(siteHost))
@@ -379,15 +393,25 @@ export function publicRepositoryFindingsIn(file, text) {
     }
   if (accountId.test(text))
     findings.push(`${file}: contains an Atlassian account ID; use configuration instead`);
+  if (privateReference.test(text) || privateTracker.test(text))
+    findings.push(`${file}: refers to the private factory; state what readers need instead`);
+  // Lockfiles and generated notices name third-party files.
+  if (names && !/(?:^|\/)(?:package-lock\.json|THIRD_PARTY_NOTICES\.md)$/.test(file))
+    for (const [, name] of text.replace(/https?:\/\/\S+/g, '').matchAll(markdownName))
+      if (!names.has(name)) {
+        findings.push(`${file}: refers to ${name}, which this repository doesn't have`);
+        break;
+      }
   return findings;
 }
 export function publicRepositoryFindings(appDir) {
   const tracked = spawnSync('git', ['ls-files', '-z'], { cwd: appDir, encoding: 'utf8' });
   if (tracked.status !== 0) return [];
-  return tracked.stdout
-    .split('\0')
-    .filter((file) => file && existsSync(join(appDir, file)))
-    .flatMap((file) => publicRepositoryFindingsIn(file, readFileSync(join(appDir, file), 'utf8')));
+  const files = tracked.stdout.split('\0').filter((file) => file && existsSync(join(appDir, file)));
+  const names = new Set(files.map((file) => file.split('/').pop()));
+  return files.flatMap((file) =>
+    publicRepositoryFindingsIn(file, readFileSync(join(appDir, file), 'utf8'), names),
+  );
 }
 
 export function pluginFindings(appDir, { release = false } = {}) {

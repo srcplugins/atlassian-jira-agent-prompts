@@ -8,13 +8,29 @@ name: Hosted
 # steps whose names contain them, for example "Hosted: bulk, rovo"). Marking a pull request ready
 # for review runs the full suite, and Publish runs the release suite. Site, accounts and evidence
 # stay private: values come from the `acceptance` environment's secrets and are masked, and
-# reports and journals are uploaded only age-encrypted. Setup: the test framework's docs/ci.md.
+# reports and journals are uploaded only age-encrypted. Setup:
+# https://github.com/srcplugins/atlassian-forge-test-framework/blob/main/docs/ci.md
 
 on:
   push:
     # Dependabot branches get no environment secrets, so the suite could not run there.
     branches-ignore: [main, 'dependabot/**']
-    paths-ignore: ['**.md']
+    # A push that changes only what the offline Check reads (docs, its checkers, format and lint
+    # configuration, unit tests, the other workflows) skips the suite; Check still runs on it.
+    paths-ignore:
+      - '**.md'
+      - '.github/dependabot.yml'
+      - '.github/workflows/check.yml'
+      - '.github/workflows/security.yml'
+      - '.prettierignore'
+      - '.prettierrc.json'
+      - 'eslint.config.mjs'
+      - 'knip.config.js'
+      - 'config/check-licenses.mjs'
+      - 'config/check-plugin.mjs'
+      - 'config/eslint-local-rules.mjs'
+      - 'config/forge-eslint.mjs'
+      - 'tests/*.test.mjs'
   pull_request:
     types: [ready_for_review]
   workflow_dispatch:
@@ -66,7 +82,9 @@ jobs:
     if: >-
       !contains(github.event.head_commit.message, 'Hosted: none') &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ubuntu-24.04
+    # The self-hosted px-0 runners while the repository is private; GitHub-hosted once it is
+    # public and for Publish's release suite.
+    runs-on: ${{ github.event.repository.private && !inputs.deploy_tag && 'px-0' || 'ubuntu-24.04' }}
     timeout-minutes: 180
     environment: acceptance
     # Queued, never cancelled: a started run must finish its own cleanup.
@@ -117,7 +135,7 @@ jobs:
           base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
           git config --global url."$base".insteadOf ssh://git@github.com/
           # A development copy sets these repository variables to read its sibling copies:
-          # srcplugins/<name> then resolves to <owner>/<prefix><name> (see the factory's ci.md).
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
           [ -n "$OWNER$PREFIX" ] || exit 0
           [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
             { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
@@ -130,7 +148,15 @@ jobs:
           node config/prepare-forge-cli.mjs
           npm ci --no-audit --no-fund
           sudo apt-get update > /dev/null
-          sudo apt-get install -y --no-install-recommends age > /dev/null
+          sudo apt-get install -y --no-install-recommends age unzip > /dev/null
+          # The self-hosted runner image lacks what GitHub's image ships: Google Chrome and gh.
+          command -v google-chrome > /dev/null || npx playwright install --with-deps chrome > /dev/null
+          if ! command -v gh > /dev/null; then
+            gh=gh_2.102.0_linux_amd64
+            curl -fsSLo "$RUNNER_TEMP/gh.tgz" "https://github.com/cli/cli/releases/download/v2.102.0/$gh.tar.gz"
+            echo "bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386  $RUNNER_TEMP/gh.tgz" | sha256sum -c --quiet
+            sudo tar -xzf "$RUNNER_TEMP/gh.tgz" -C /usr/local --strip-components=1 "$gh/bin/gh"
+          fi
       # During development the test framework may follow a branch: test that branch's latest
       # commit rather than the one the lockfile recorded. A release pins a tag or commit.
       - name: Test framework version
@@ -161,9 +187,9 @@ jobs:
           npx forge-test mask
           npx forge-test restore
           npx forge-test mask
-      # Run journals carry fixture ownership between runs, encrypted to the owner, the optional
-      # debugging agent and this workflow. An unresolved journal makes the next run refuse
-      # instead of ignoring leftovers.
+      # Run journals carry fixture ownership between runs, encrypted to the maintainers' keys and
+      # this workflow. An unresolved journal makes the next run refuse instead of ignoring
+      # leftovers.
       - name: Restore run journals
         id: state
         env:
@@ -171,20 +197,41 @@ jobs:
           CI_AGE_KEY: ${{ secrets.CI_AGE_KEY }}
           OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
           AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
+          REPO_ID: ${{ github.repository_id }}
         run: |
           # Fail before the suite if this run's journals could not be encrypted afterwards.
           [ -n "$OWNER" ] || { echo "::error::OWNER_AGE_RECIPIENT is not set"; exit 1; }
           printf x | age -r "$OWNER" > /dev/null || { echo "::error::OWNER_AGE_RECIPIENT is not an age recipient"; exit 1; }
           [ -z "$AGENT" ] || printf x | age -r "$AGENT" > /dev/null || { echo "::error::AGENT_AGE_RECIPIENT is not an age recipient"; exit 1; }
           # The API doesn't list newest first and pages at 100; runs are serial, so the newest
-          # unexpired state is current.
+          # unexpired state is current. Any workflow run can upload an artifact of this name,
+          # including a fork's pull request, so only runs of this repository's own code count.
           # gh refuses --slurp with its own --jq, so the merged pages go through jq.
-          id=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-state&per_page=100" |
-            jq -r '[.[].artifacts[] | select(.expired | not)] | max_by(.created_at) | .id // empty')
-          if [ -z "$id" ]; then echo "::warning::No earlier run journals; starting without them."; exit 0; fi
+          found=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hosted-state&per_page=100" |
+            jq -r --argjson repo "$REPO_ID" '[.[].artifacts[]
+              | select((.expired | not) and .workflow_run.repository_id == $repo
+                       and .workflow_run.head_repository_id == $repo)]
+              | max_by(.created_at) // empty | "\(.id) \(.workflow_run.id)"')
+          if [ -z "$found" ]; then echo "::warning::No earlier run journals; starting without them."; exit 0; fi
+          read -r id run <<< "$found"
+          # Only this workflow writes the state, directly or called by Publish.
+          path=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .path)
+          [[ "$path" =~ ^\.github/workflows/(hosted|publish)\.yml(@.*)?$ ]] ||
+            { echo "::error::Run journals in artifact $id came from another workflow."; exit 1; }
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/state.zip"
           unzip -o -q "$RUNNER_TEMP/state.zip" -d "$RUNNER_TEMP/state"
-          age -d -i <(printf '%s' "$CI_AGE_KEY") "$RUNNER_TEMP/state/journals.tar.age" | tar -xz -C .local
+          archive="$RUNNER_TEMP/journals.tgz"
+          age -d -i <(printf '%s' "$CI_AGE_KEY") "$RUNNER_TEMP/state/journals.tar.age" > "$archive"
+          # Only regular files at the paths "Encrypt journals and evidence" archives. No pipes into
+          # grep -q here: under pipefail, its early exit could make a found entry look like none.
+          listing=$(tar -tvzf "$archive")
+          members=$(tar -tzf "$archive")
+          if [ -n "$(grep -v '^-' <<< "$listing")" ] ||
+            [ -n "$(grep -Ev '^sites/[^/]+/e2e/[^/]*runs/[^/]+\.json$' <<< "$members")" ] ||
+            grep -q '\.\.' <<< "$members"; then
+            echo "::error::Run journals in artifact $id hold unexpected entries."; exit 1
+          fi
+          tar -xzf "$archive" -C .local --no-same-owner --no-same-permissions
           echo "Restored run journals from artifact $id."
       - name: Forge CLI settings
         # The guarded wrapper requires credentials for every Forge command.
@@ -245,7 +292,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/out"
           ci=$(age-keygen -y <(printf '%s' "$CI_AGE_KEY"))
-          # The owner and, when set, the agent that debugs failures can read both archives.
+          # The maintainers' keys can read both archives.
           readers=(-r "$OWNER")
           [ -z "$AGENT" ] || readers+=(-r "$AGENT")
           cd .local
@@ -261,7 +308,7 @@ jobs:
           name: hosted-state
           path: ${{ runner.temp }}/out/journals.tar.age
           retention-days: 90
-      - name: Save evidence (owner and agent keys only)
+      - name: Save evidence (maintainers' keys only)
         if: always() && steps.state.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

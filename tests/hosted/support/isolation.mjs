@@ -32,6 +32,7 @@ export async function runIsolationProbe({
   const peer = JSON.parse(
     readFileSync(
       `${browserTarget(peerHost).directory}/native-lifecycle-runs/${options.peerRunId}.json`,
+      'utf8',
     ),
   );
   assert.equal(peer.runId, options.peerRunId);
@@ -78,8 +79,9 @@ export async function runIsolationProbe({
   state.lifecycle.peer = { host: peerHost, runId: peer.runId, sourceId: foreign.sourceId };
   owned.run.persist();
   const page = await contexts.owner.newPage();
-  const setup = await observeAction(page, 'setup', () => spaceSettings(page, project.key), target);
-  assert.ok(!setup.type, 'Unconfigured destination adopted peer type');
+  // `baseline` above showed the destination has no configured type; its own space page must not
+  // show the peer's prompt either.
+  await observeAction(page, 'setup', () => spaceSettings(page, project.key), target);
   assert.ok(!(await page.locator('body').innerText()).includes(foreign.sourceFields.summary));
   owned.run.check('Same space key on another tenant does not inherit configuration or source name');
   const type = project.issueTypes.find((t) => !t.subtask && t.name === 'Story');

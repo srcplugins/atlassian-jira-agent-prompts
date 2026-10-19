@@ -176,7 +176,7 @@
       "optIn": "NATIVE_ACCESS_TESTS",
       "command": "NATIVE_ACCESS_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-access.mjs run (runs in the full and release suites of forge-test.mjs)",
       "fixture": "One disposable marked space created by the run with its own permission and work item security schemes and screens; the app places the Agent Prompts field on the target work type's edit and view screens through Configure (checked through REST); pinned owner, member and restricted sessions; every write journaled by unique summary before it is sent",
-      "assertion": "Hidden sources and revoked edit access are refused at save time with exact Jira source and target unchanged; copies already made stay readable; an unknown write outcome is reconciled by search, never by a second create",
+      "assertion": "Hidden sources and revoked edit access are refused at save time with the exact target unchanged; copies already made stay readable; an unknown write outcome is reconciled by search, never by a second create",
       "cleanup": "Space, schemes and work items verified against the journal marker and deleted only when exactly journaled; explicit cleanup <run-uuid> after an interrupted run",
       "version": "Unattended in every hosted suite run",
       "lowerLevelTests": ["tests/service.test.mjs", "tests/boundary.test.mjs"]
@@ -189,7 +189,7 @@
       "optIn": "NATIVE_SCALE_TESTS",
       "command": "NATIVE_SCALE_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-scale.mjs run; resume, saves or cleanup <run-uuid>",
       "fixture": "Up to 1,000 journaled disposable prompts in the owned fixture space, created and verified in batches; fixtures remain journaled for supervised manual testing",
-      "assertion": "Indexed inventory matches the journal at 500 and 1,000 prompts; picker discovery stays bounded and every picker page is read in five browser sessions over three rounds; measured timings are observations, not production-scale claims",
+      "assertion": "Indexed inventory matches the journal at 500 and 1,000 prompts; in each of three rounds five browser sessions open the picker, load its second page and find the oldest prompt by exact key, then one session reads every picker page; measured timings are observations, not production-scale claims",
       "cleanup": "Exact journaled fixtures removed and independently confirmed absent; a prior save is never repeated",
       "version": "Supervised only; not part of any suite",
       "lowerLevelTests": ["tests/service.test.mjs", "tests/prompt-search.test.mjs"]

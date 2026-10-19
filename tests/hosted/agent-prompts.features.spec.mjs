@@ -137,23 +137,20 @@ test('NPL-11 details modal keeps focus, contrast and layout in dark theme and na
       has: page.getByRole('checkbox', { name: `Select ${owned.project.key}`, exact: true }),
     })
     .getByRole('button', { name: 'View details', exact: true });
-  for (const [name, viewport] of [
+  for (const [
+    name,
+    viewport,
+  ] of /** @type {Array<[string, { width: number, height: number }]>} */ ([
     ['Dark', { width: 1440, height: 1100 }],
     ['Dark', { width: 640, height: 900 }],
     ['Light', { width: 640, height: 900 }],
-  ]) {
+  ])) {
     // The theme menu is in the account menu, which narrow layouts collapse.
     await page.setViewportSize({ width: 1440, height: 1100 });
     await theme(name);
     await page.setViewportSize(viewport);
-    // Jira applies a new theme at once but saves it a moment later; a page loaded before the
-    // save still renders the old theme, so load the space settings again until it applies.
-    await expect(async () => {
-      await configuration(page, owned);
-      await expect(page.locator('html')).toHaveAttribute('data-color-mode', name.toLowerCase(), {
-        timeout: 5000,
-      });
-    }).toPass({ timeout: 90000 });
+    await configuration(page, owned);
+    await expect(page.locator('html')).toHaveAttribute('data-color-mode', name.toLowerCase());
     await viewDetails.click();
     await expect(
       dialog.getByRole('heading', { name: 'Jira configuration', exact: true }),
@@ -287,16 +284,11 @@ test('NPL-06 empty prompt save preserves unsaved selection during read-only reco
   page,
   owned,
 }, testInfo) => {
-  const setup = await observeAction(
-    page,
-    'setup',
-    () => spaceSettings(page, owned.project.key),
-    installation('agent-prompts'),
-  );
+  const health = await configuration(page, owned);
   const source = await owned.propertyIssue(
     `Empty prompt ${owned.run.state.runId.slice(0, 8)}`,
     'Ordinary prompt instructions.',
-    setup.type,
+    health.state.data.type,
   );
   source.expected.descriptionVariants = [
     source.expected.description,
@@ -387,11 +379,11 @@ test('NPL-10 an Agent Prompts section deleted in Jira is forgotten by a field-on
   owned,
 }) => {
   const t = installation('agent-prompts');
-  const setup = await observeAction(page, 'setup', () => spaceSettings(page, owned.project.key), t);
+  const health = await configuration(page, owned);
   const source = await owned.propertyIssue(
     `Deleted block ${owned.run.state.runId.slice(0, 8)}`,
     'Instructions copied before the block is deleted.',
-    setup.type,
+    health.state.data.type,
   );
   const target = await owned.issue('Prompt deleted block');
   const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,issuetype`);
@@ -688,15 +680,16 @@ test('NPL-09 newest prompts, server search and cursor pages preserve draft selec
   theme,
 }) => {
   const t = installation('agent-prompts');
-  const setup = await observeAction(page, 'setup', () => spaceSettings(page, owned.project.key), t);
+  const { type } = (await configuration(page, owned)).state.data;
   const term = `Paging${owned.run.state.runId.replaceAll('-', '')}`;
   const sources = [];
   for (let i = 0; i < 21; i++)
-    sources.push(await owned.propertyIssue(`${term} prompt ${i}`, `Instructions ${i}`, setup.type));
+    sources.push(await owned.propertyIssue(`${term} prompt ${i}`, `Instructions ${i}`, type));
   const target = await owned.issue('Prompt search destination');
   const before = await owned.api(`/issue/${target.id}?fields=description`);
-  const jql = `project = ${owned.project.id} AND issuetype = ${setup.type} AND summary ~ "${term}*" AND statusCategory != Done ORDER BY created DESC, key DESC`;
-  let expected;
+  const jql = `project = ${owned.project.id} AND issuetype = ${type} AND summary ~ "${term}*" AND statusCategory != Done ORDER BY created DESC, key DESC`;
+  /** @type {Array<{ id: string, key: string, fields: { summary: string } }>} */
+  let expected = [];
   await expect(async () => {
     const result = await owned.api('/search/jql', 'POST', {
       jql,

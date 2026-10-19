@@ -13,6 +13,8 @@ function fixture({
   firstLoadFails,
   failLoads = [],
   saveStatus = { pending: false },
+  // Scripted load answers, one per load (the last repeats); an Error is thrown.
+  script,
   prompts = [
     { id: '1', key: 'TEST-1', name: 'Saved' },
     { id: '2', key: 'TEST-2', name: 'Draft' },
@@ -49,6 +51,11 @@ function fixture({
     if (name === 'save-status') return saveStatus;
     assert.equal(name, 'load');
     loads++;
+    if (script) {
+      const answer = script[Math.min(loads, script.length) - 1];
+      if (answer instanceof Error) throw answer;
+      return { incomplete: false, cleanupOnly: false, refreshAfterSave: false, ...answer };
+    }
     if ((loadFails && loads === 2) || failLoads.includes(loads)) throw Error('Load failed');
     if (firstLoadFails && loads === 1) throw Error(firstLoadFails);
     return {
@@ -63,30 +70,48 @@ function fixture({
       refreshAfterSave,
     };
   };
+  // Keyboard focus: the picker's input, by its id, and the page that focus falls to.
+  const document = { body: {}, focused: [], getElementById: (id) => elements[id] };
+  const elements = {
+    'agent-prompts': { matches: () => false, focus: () => document.focused.push('picker') },
+  };
+  document.activeElement = document.body;
   const hooks = hookHost();
-  const { Field } = load('field.tsx', {
-    react: hooks.react,
-    '@atlaskit/button/new': defaultExport('Button'),
-    '@atlaskit/select': defaultExport('Select'),
-    '@atlaskit/spinner': defaultExport('Spinner'),
-    './prompt-search': { usePromptSearch: () => search },
-    './save-recovery-ui': { SaveRecovery: 'SaveRecovery' },
-    '@forge/bridge': {
-      router: {
-        reload: async () => {
-          calls.push({ name: 'reload' });
-          if (reloadFails) throw Error('Reload failed');
+  const { Field } = load(
+    'field.tsx',
+    {
+      react: hooks.react,
+      '@atlaskit/button/new': defaultExport('Button'),
+      '@atlaskit/select': defaultExport('Select'),
+      '@atlaskit/spinner': defaultExport('Spinner'),
+      './prompt-search': { usePromptSearch: () => search },
+      './save-recovery-ui': { SaveRecovery: 'SaveRecovery' },
+      '@forge/bridge': {
+        router: {
+          reload: async () => {
+            calls.push({ name: 'reload' });
+            if (reloadFails) throw Error('Reload failed');
+          },
         },
       },
+      './client': { call },
     },
-    './client': { call },
-  });
+    { document },
+  );
   const v = view(hooks, Field);
   return {
     ...v,
     calls,
+    document,
+    // The focus effect, run as React runs it after `busy`, `recovery` or the search changes.
+    refocus: () => hooks.rerun(1),
     results(items) {
       search.items = items;
+      v.render();
+    },
+    searching(busy, error = search.error) {
+      search.busy = busy;
+      search.error = error;
       v.render();
     },
     select(ids) {
@@ -244,7 +269,7 @@ test('the search status region is mounted empty before the first load answers', 
   assert.deepEqual(regions().map(said), ['Could not load prompt suggestions.', '']);
 });
 
-test('a retired prompt stays selected with its label and is not offered once a save removes it', async () => {
+test('a retired prompt stays selected with its label, and once deselected only Discard changes offers it again', async () => {
   const f = fixture({
     success: true,
     prompts: [
@@ -257,6 +282,14 @@ test('a retired prompt stays selected with its label and is not offered once a s
   assert.deepEqual(f.selected(), ['1']);
   assert.equal(f.nodes('Select')[0].props.value[0].label, 'TEST-1 — Saved (retired)');
   assert.deepEqual(offered(), ['1', '2']);
+  // Deselected, it is no longer offered before Save; only Discard changes brings it back.
+  f.select([]);
+  assert.deepEqual(offered(), ['2']);
+  await f.click('Discard changes');
+  assert.deepEqual(f.selected(), ['1']);
+  assert.deepEqual(offered(), ['1', '2']);
+  f.select(['2']);
+  assert.deepEqual(offered(), ['2']);
   f.select([]);
   await f.click('Save');
   assert.deepEqual(Array.from(f.calls.find((c) => c.name === 'save').payload.ids), []);
@@ -420,6 +453,8 @@ test('a load failure without an unresolved save offers Try again instead of save
   await f.mount();
   assert.equal(f.nodes('SaveRecovery').length, 0);
   assert.match(f.text(), /Agent Prompts field could not be identified/);
+  // The only control left starts with focus; once loaded, the picker does.
+  assert.equal(f.button('Try again').props.autoFocus, true);
   assert.deepEqual(
     f.calls.map((c) => c.name),
     ['load', 'save-status'],
@@ -475,4 +510,125 @@ test('the spinner says prompts are saving during a save', async () => {
   assert.equal(f.nodes('Spinner')[0]?.props.label, 'Saving prompts');
   await saving;
   assert.equal(f.nodes('Spinner').length, 0);
+});
+
+test('the picker starts with focus and a running Save keeps focus on its own button', async () => {
+  const f = fixture({ success: true });
+  await f.mount();
+  assert.equal(f.nodes('Select')[0].props.autoFocus, true);
+  f.select(['1', '2']);
+  const saving = f.click('Save');
+  f.render();
+  // Loading, not disabled, so the browser keeps focus on it; Sync shows nothing is running there.
+  assert.deepEqual(
+    ['Save', 'Sync'].map((text) => [
+      f.button(text).props.isLoading,
+      f.button(text).props.isDisabled,
+    ]),
+    [
+      [true, false],
+      [false, true],
+    ],
+  );
+  await saving;
+  assert.equal(f.button('Save').props.isLoading, false);
+  // Saved, so Save is disabled and focus fell to the page: it returns to the picker.
+  f.refocus();
+  assert.deepEqual(f.document.focused, ['picker']);
+});
+
+test('Sync keeps focus where it is when its button is still usable', async () => {
+  const f = fixture({ success: true });
+  await f.mount();
+  const syncing = f.click('Sync');
+  f.render();
+  assert.equal(f.button('Sync').props.isLoading, true);
+  assert.equal(f.button('Save').props.isLoading, false);
+  await syncing;
+  f.document.activeElement = { matches: (selector) => selector !== ':disabled' };
+  f.refocus();
+  assert.deepEqual(f.document.focused, []);
+});
+
+test('Discard changes and a finished search move focus to the picker, not the page', async () => {
+  const f = fixture({ searchError: 'Could not load prompt suggestions.' });
+  await f.mount();
+  f.select(['1', '2']);
+  await f.click('Discard changes');
+  assert.deepEqual(f.document.focused, ['picker']);
+  await f.click('Retry search');
+  f.searching(true);
+  assert.equal(f.button('Retry search').props.isLoading, true);
+  assert.equal(f.button('Retry search').props.isDisabled, false);
+  // Still searching: focus stays on the loading button.
+  f.refocus();
+  assert.deepEqual(f.document.focused, ['picker']);
+  // The search succeeded, so Retry search is gone.
+  f.searching(false, '');
+  assert.equal(f.button('Retry search'), undefined);
+  f.refocus();
+  assert.deepEqual(f.document.focused, ['picker', 'picker']);
+  // Only a pressed button moves focus; a later search alone does not.
+  f.searching(true);
+  f.searching(false);
+  f.refocus();
+  assert.equal(f.document.focused.length, 2);
+});
+const retired = { id: '1', key: 'TEST-1', name: 'Saved (retired)', selectedOnly: true };
+const plain = { id: '2', key: 'TEST-2', name: 'Draft' };
+test('a retired prompt kept in a draft keeps its chip after a failed save reads a newer saved state', async () => {
+  // Saved [1] (retired); the user adds 2; elsewhere the work item was saved with no prompts.
+  const f = fixture({
+    script: [
+      { ids: ['1'], prompts: [retired, plain], revision: 1, fingerprint: 'v1' },
+      { ids: [], prompts: [plain], revision: 2, fingerprint: 'v2' },
+    ],
+  });
+  await f.mount();
+  f.select(['1', '2']);
+  await f.click('Save');
+  assert.match(f.text(), /2\/5 selected · Unsaved changes/);
+  assert.deepEqual(f.selected(), ['1', '2']);
+  assert.equal(f.nodes('Select')[0].props.value[0].label, 'TEST-1 — Saved (retired)');
+  // Deselecting it still hides it for good (only Discard changes brings it back).
+  f.select(['2']);
+  assert.deepEqual(
+    Array.from(f.nodes('Select')[0].props.options, (o) => o.value),
+    ['2'],
+  );
+});
+test('a retired prompt kept in a draft keeps its chip after Check saved state reads a newer saved state', async () => {
+  const f = fixture({
+    script: [
+      { ids: ['1'], prompts: [retired, plain], revision: 1, fingerprint: 'v1' },
+      Error('Load failed'),
+      { ids: [], prompts: [plain], revision: 2, fingerprint: 'v2' },
+    ],
+  });
+  await f.mount();
+  f.select(['1', '2']);
+  await f.click('Save');
+  assert.equal(f.nodes('SaveRecovery').length, 1);
+  await f.recover();
+  assert.deepEqual(f.selected(), ['1', '2']);
+  assert.equal(f.nodes('Select')[0].props.value[0].label, 'TEST-1 — Saved (retired)');
+});
+test('on a prompt work item an empty menu does not suggest searching', async () => {
+  const f = fixture({
+    script: [
+      {
+        ids: ['1'],
+        prompts: [{ id: '1', key: 'TEST-1', name: 'Only' }],
+        revision: 1,
+        fingerprint: 'v1',
+        cleanupOnly: true,
+      },
+    ],
+  });
+  await f.mount();
+  assert.equal(f.nodes('Select')[0].props.isSearchable, false);
+  assert.equal(
+    f.nodes('Select')[0].props.noOptionsMessage(),
+    'All prompts on this work item are selected.',
+  );
 });

@@ -7,7 +7,7 @@ import {
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { activeTarget, markers } from '@srcplugins/atlassian-forge-test-framework/core';
 import { expect } from './expect.mjs';
-import { spaceSettings } from './space-settings.mjs';
+import { spaceHealth } from './space-settings.mjs';
 /** Searches for a retired prompt's exact key: the resolver must return no prompts. */
 async function searchHides(page, combo, key, id) {
   const found = await observeAction(
@@ -84,9 +84,13 @@ function requestShape(request) {
 }
 function watchAppEgress(page) {
   const { appId } = installation('agent-prompts');
-  const seen = [];
   // Positive control: the iframe's own assets must be observed, or zero telemetry proves nothing.
-  seen.appRequests = 0;
+  const seen = Object.assign(
+    /** @type {Array<{ host: string, status?: number, blocked?: string }>} */ ([]),
+    {
+      appRequests: 0,
+    },
+  );
   // The app's space page URL contains the app ID too, so exclude Jira's own main frame.
   const fromApp = (request) => {
     const frame = request.frame();
@@ -123,16 +127,11 @@ export async function snapshotJourney({
 }) {
   const egress = watchAppEgress(page);
   await dismissOnboarding(page);
-  const setup = await observeAction(
-    page,
-    'setup',
-    () => spaceSettings(page, owned.project.key),
-    installation('agent-prompts'),
-  );
+  const health = await spaceHealth(page, owned.project);
   const source = await owned.propertyIssue(
     `Error handling ${owned.run.state.runId.slice(0, 8)}`,
     `SNAPSHOT-PROMPT-${owned.run.state.runId}`,
-    setup.type,
+    health.state.data.type,
   );
   const marker = markers.runMarker(owned.run.state.runId, owned.run.state.resources.length);
   const target = blank

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import Button from '@atlaskit/button/new';
 import { call } from './client';
 import type { SaveStatus } from './service';
@@ -13,10 +13,20 @@ export function SaveRecovery({
   const [status, setStatus] = useState<SaveStatus | undefined>(initialStatus);
   const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  // Release and accept remove their own button, so focus moves to Check saved state afterwards.
+  const checkButton = useRef<HTMLButtonElement>(null);
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (busy || !refocus.current) return;
+    refocus.current = false;
+    checkButton.current?.focus();
+  }, [busy]);
   async function check() {
     setBusy(true);
+    setChecking(true);
     setError('');
     setNotice('');
     setAcknowledged(false);
@@ -29,6 +39,7 @@ export function SaveRecovery({
       setError(e instanceof Error ? e.message : 'Saved state could not be checked.');
     } finally {
       setBusy(false);
+      setChecking(false);
     }
   }
   // Release keeps the pre-save state; accept keeps Jira's version of the requested save.
@@ -37,6 +48,7 @@ export function SaveRecovery({
     if (!status?.pending || !status.administrator || status.waitSeconds !== 0 || !acknowledged)
       return;
     if (busy) return;
+    refocus.current = true;
     setBusy(true);
     setError('');
     try {
@@ -78,7 +90,14 @@ export function SaveRecovery({
   );
   return (
     <div>
-      <Button isDisabled={busy} onClick={() => void check()}>
+      {/* The field's controls are disabled while it is open, so it starts with focus. */}
+      <Button
+        ref={checkButton}
+        autoFocus
+        isLoading={checking}
+        isDisabled={busy && !checking}
+        onClick={() => void check()}
+      >
         Check saved state
       </Button>
       {status?.pending && (
@@ -126,10 +145,32 @@ export function SaveRecovery({
                 Accept saved work item
               </Button>
             </>
+          ) : status.sectionRemoved ? (
+            <>
+              <p>
+                The Agent Prompts section is no longer in the description, so this save’s outcome
+                can’t be proven. Releasing this record keeps the work item as it is now, writes
+                nothing to Jira and allows a new reviewed save. It does not cancel a delayed Jira
+                request.
+              </p>
+              {acknowledgement}
+              <Button
+                isDisabled={busy || !acknowledged || status.waitSeconds !== 0}
+                onClick={() =>
+                  void finish(
+                    'resolve-save',
+                    'Recovery record released. Check saved state again if prompts do not reload.',
+                  )
+                }
+              >
+                Release save
+              </Button>
+            </>
           ) : (
             <p>
-              The work item differs from both its pre-save state and the requested save. Investigate
-              in Jira before making further changes.
+              The work item differs from both its pre-save state and the requested save. To release
+              this save, delete the Agent Prompts section from the description in Jira, then check
+              saved state again.
             </p>
           )}
         </>

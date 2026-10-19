@@ -76,7 +76,7 @@ assert.match(id, /^[0-9a-f-]{36}$/);
 const path = `${directory}/${id}.json`;
 const lock = `${directory}/setup.lock`;
 if (existsSync(lock)) {
-  const holder = JSON.parse(readFileSync(lock));
+  const holder = JSON.parse(readFileSync(lock, 'utf8'));
   assert.equal(mode, 'cleanup', 'Resolve the previous setup run first');
   assert.equal(holder.id, id);
   let alive = true;
@@ -89,13 +89,13 @@ if (existsSync(lock)) {
   unlinkSync(lock);
 }
 for (const name of readdirSync(directory).filter((x) => x.endsWith('.json'))) {
-  const previous = JSON.parse(readFileSync(`${directory}/${name}`));
+  const previous = JSON.parse(readFileSync(`${directory}/${name}`, 'utf8'));
   assert.ok(previous.clean || previous.id === id, 'Resolve the previous setup journal first');
 }
 writeFileSync(lock, JSON.stringify({ id, pid: process.pid }), { flag: 'wx', mode: 0o600 });
 const j =
   mode === 'cleanup'
-    ? JSON.parse(readFileSync(path))
+    ? JSON.parse(readFileSync(path, 'utf8'))
     : {
         id,
         site: activeTarget().site,
@@ -163,12 +163,13 @@ async function applyWithFault(page, target) {
     pending.push(settled);
     try {
       const responses = await settled;
-      if (responses.some((x) => x.status !== 'fulfilled')) {
+      const [first] = responses;
+      if (responses.some((x) => x.status !== 'fulfilled') || first.status !== 'fulfilled') {
         failed = true;
         return await route.abort('failed');
       }
       if (fault === 'lost-response') await route.abort('failed');
-      else await route.fulfill({ response: responses[0].value });
+      else await route.fulfill({ response: first.value });
     } catch {
       failed = true;
       await route.abort('failed');

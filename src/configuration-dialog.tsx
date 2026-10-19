@@ -9,6 +9,7 @@ import {
   Inline,
   Spinner,
   Label,
+  LoadingButton,
   Lozenge,
   Modal,
   ModalBody,
@@ -136,6 +137,11 @@ export function ConfigurationDialog({
   const [plans, setPlans] = useState<Reviewed[]>([]);
   const [record, setRecord] = useState<BatchRecord | null>(null);
   const [busy, setBusy] = useState(false);
+  // The footer button whose action is running.
+  const [pressed, setPressed] = useState('');
+  // Back presses so far and the step the last one opened (0 once a step moves forward). autoFocus
+  // applies only on mount, so the button that takes focus after Back gets a key with the count.
+  const [back, setBack] = useState({ count: 0, to: 0 });
   const [uncertain, setUncertain] = useState(false);
   // Check saved progress only reads, so it never says changes are being applied.
   const [checking, setChecking] = useState(false);
@@ -251,9 +257,10 @@ export function ConfigurationDialog({
     return p?.key ? `${p.key}${p.name ? ` — ${p.name}` : ''}` : `Space ID ${id}`;
   };
 
-  function run(fn: () => Promise<void>) {
+  function run(fn: () => Promise<void>, key = '') {
     return latch.run(async () => {
       setBusy(true);
+      setPressed(key);
       onBusy(true);
       setMessage('');
       try {
@@ -264,6 +271,7 @@ export function ConfigurationDialog({
         );
       } finally {
         setBusy(false);
+        setPressed('');
         setProgress(null);
         onBusy(false);
       }
@@ -405,7 +413,8 @@ export function ConfigurationDialog({
    * dialog; the Review step reviews the spaces whose review a change dropped (all of them at
    * first), that were blocked or that couldn't be reviewed, and keeps the rest.
    */
-  const goTo = (next: number, m = mode) => {
+  const goTo = (next: number, m = mode, key = 'primary') => {
+    setBack((b) => ({ ...b, to: 0 }));
     void run(async () => {
       // A mode changed in the same click has not dropped the earlier review yet.
       const unreviewed =
@@ -418,7 +427,7 @@ export function ConfigurationDialog({
         setPage(0);
         setStep(next);
       }
-    });
+    }, key);
   };
   async function observe() {
     const current = await call<BatchRecord | null>('configuration-status', {});
@@ -497,6 +506,10 @@ export function ConfigurationDialog({
   // The spaces left after excluding the blocked and unreviewed ones.
   const kept = plans.filter((p) => p.value).map((p) => p.id);
   const ready = reviewed && (mode !== 'unlink' || plans.some((p) => removes(p.value!)));
+  // The pressed footer button shows that it is working and keeps keyboard focus, which a disabled
+  // button would drop to the page; the other buttons are disabled meanwhile.
+  const loading = (key: string) => busy && pressed === key;
+  const held = (key: string) => busy && pressed !== key;
   // Apply to all offers every work type of the selected spaces except the prompt type.
   const bulkOptions = [
     ...new Map(
@@ -705,7 +718,7 @@ export function ConfigurationDialog({
                     </Text>
                   )}
                   {mode !== 'unlink' && reloadPicker}
-                  <Heading as="h3" size="small">
+                  <Heading as="h2" size="small">
                     Selected spaces
                   </Heading>
                   <DynamicTable
@@ -721,7 +734,7 @@ export function ConfigurationDialog({
               )}
               {step === 2 && (
                 <>
-                  <Heading as="h3" size="small">
+                  <Heading as="h2" size="small">
                     Add Agent Prompts to screens
                   </Heading>
                   <Text>
@@ -831,7 +844,7 @@ export function ConfigurationDialog({
               {step === 3 && (
                 <>
                   {team ? (
-                    <Heading as="h3" size="small">
+                    <Heading as="h2" size="small">
                       {mode === 'unlink' ? 'Remove setup?' : 'Confirm changes'}
                     </Heading>
                   ) : mode === 'unlink' ? (
@@ -869,7 +882,7 @@ export function ConfigurationDialog({
                     </Inline>
                   )}
                   {!team && (
-                    <Heading as="h3" size="small">
+                    <Heading as="h2" size="small">
                       Changes
                     </Heading>
                   )}
@@ -904,7 +917,7 @@ export function ConfigurationDialog({
                   {plans.length > 0 && pager}
                   {shared.length > 0 && (
                     <>
-                      <Heading as="h3" size="small">
+                      <Heading as="h2" size="small">
                         Shared scheme changes
                       </Heading>
                       {shared.map((scheme) => (
@@ -959,7 +972,7 @@ export function ConfigurationDialog({
                   )}
                   {sharedScreens.length > 0 && (
                     <>
-                      <Heading as="h3" size="small">
+                      <Heading as="h2" size="small">
                         Shared screen impact
                       </Heading>
                       <Text>
@@ -1055,7 +1068,7 @@ export function ConfigurationDialog({
             <>
               {record && (
                 <>
-                  <Heading as="h3" size="small">
+                  <Heading as="h2" size="small">
                     {record.data.status === 'complete'
                       ? 'Configuration complete'
                       : record.data.status === 'stopped'
@@ -1190,8 +1203,9 @@ export function ConfigurationDialog({
               )}
             </>
           )}
-          {busy && (
-            <Stack space="space.100">
+          {/* Mounted empty, so progress and outcomes such as a lost response are announced. */}
+          <Box role="status">
+            {busy && (
               <Inline space="space.100" alignBlock="center">
                 <Spinner size="small" label="Configuration in progress" />
                 <Text>
@@ -1205,6 +1219,11 @@ export function ConfigurationDialog({
                     : ''}
                 </Text>
               </Inline>
+            )}
+            {message && <Text>{message}</Text>}
+          </Box>
+          {busy && (
+            <Stack space="space.100">
               {progress && progress.total > 1 && (
                 <ProgressBar
                   value={progress.done / progress.total}
@@ -1221,17 +1240,22 @@ export function ConfigurationDialog({
               )}
             </Stack>
           )}
-          {/* Mounted empty, so outcomes such as a lost response are announced. */}
-          <Box role="status">{message && <Text>{message}</Text>}</Box>
         </Stack>
       </ModalBody>
       <ModalFooter>
         {catalog && !active && !uncertain && !done && step > 1 && (
           <Button
+            // Mounted again once the Review step has loaded, so it starts there, never at Apply,
+            // and after a Back press that opens Work types, so focus stays on it.
+            key={`${step === 3 && !busy ? 'back-review' : 'back'}-${back.count}`}
+            autoFocus={(step === 3 && !busy) || (step === 2 && back.to === 2)}
             isDisabled={busy}
             onClick={() => {
+              const to = step === 3 && mode !== 'unlink' && !team ? 2 : 1;
               setPage(0);
-              setStep(step === 3 && mode !== 'unlink' && !team ? 2 : 1);
+              setStep(to);
+              // Prompt type has no Back, so focus moves to its primary button there.
+              setBack((b) => ({ count: b.count + 1, to }));
               // A team-managed space's removal review is not its configuration review.
               if (team && mode === 'unlink') {
                 setMode('existing');
@@ -1249,18 +1273,25 @@ export function ConfigurationDialog({
           !done &&
           step === 1 &&
           ids.some((id) => savedPrompt[id]) && (
-            <Button
+            <LoadingButton
               appearance="subtle"
-              isDisabled={busy}
+              isLoading={loading('remove-setup')}
+              isDisabled={held('remove-setup')}
               onClick={() => {
                 setMode('unlink');
-                goTo(3, 'unlink');
+                goTo(3, 'unlink', 'remove-setup');
               }}
             >
               Remove setup…
-            </Button>
+            </LoadingButton>
           )}
-        <Button isDisabled={busy} onClick={() => onClose(attempted)}>
+        <Button
+          // Applying hides the pressed button, so focus moves here once the run has finished.
+          key={done && !busy ? 'done' : 'close'}
+          autoFocus={done && !busy}
+          isDisabled={busy}
+          onClick={() => onClose(attempted)}
+        >
           {done ? 'Done' : active || uncertain ? 'Close' : 'Cancel'}
         </Button>
         {catalog &&
@@ -1269,41 +1300,54 @@ export function ConfigurationDialog({
           !done &&
           (team ? (
             step === 1 && optionsFailed ? (
-              <Button
+              <LoadingButton
+                key={`primary-${back.count}`}
+                autoFocus={step === 1 && back.to === 1}
                 appearance="primary"
-                isDisabled={busy}
+                isLoading={loading('primary')}
+                isDisabled={held('primary')}
                 onClick={() =>
                   void run(async () => {
                     await readOptions(ids.filter((id) => !promptOptions[id]));
-                  })
+                  }, 'primary')
                 }
               >
                 Read work types again
-              </Button>
+              </LoadingButton>
             ) : step === 1 || !reviewed ? (
-              <Button
+              <LoadingButton
+                key={`primary-${back.count}`}
+                autoFocus={step === 1 && back.to === 1}
                 appearance="primary"
-                isDisabled={busy || missingPrompt || ids.some((id) => !promptOptions[id])}
+                isLoading={loading('primary')}
+                isDisabled={
+                  held('primary') || missingPrompt || ids.some((id) => !promptOptions[id])
+                }
                 onClick={() => goTo(3)}
               >
                 Review changes
-              </Button>
+              </LoadingButton>
             ) : (
               ready && (
-                <Button
+                <LoadingButton
+                  key="apply"
                   appearance={mode === 'unlink' ? 'danger' : 'primary'}
-                  isDisabled={busy}
-                  onClick={() => void run(apply)}
+                  isLoading={loading('apply')}
+                  isDisabled={held('apply')}
+                  onClick={() => void run(apply, 'apply')}
                 >
                   {mode === 'unlink' ? 'Remove setup' : 'Save changes'}
-                </Button>
+                </LoadingButton>
               )
             )
           ) : step === 1 ? (
-            <Button
+            <LoadingButton
+              key={`primary-${back.count}`}
+              autoFocus={step === 1 && back.to === 1}
               appearance="primary"
+              isLoading={loading('primary')}
               isDisabled={
-                busy ||
+                held('primary') ||
                 !ids.length ||
                 (mode !== 'unlink' &&
                   (!catalog.typesAvailable ||
@@ -1312,25 +1356,33 @@ export function ConfigurationDialog({
               onClick={() => goTo(mode === 'unlink' ? 3 : 2)}
             >
               {mode === 'unlink' ? 'Review changes' : 'Next'}
-            </Button>
+            </LoadingButton>
           ) : step === 2 || !reviewed ? (
             // On the Review step it reviews again the spaces that were blocked or not reviewed.
-            <Button appearance="primary" isDisabled={busy || missingPrompt} onClick={() => goTo(3)}>
+            <LoadingButton
+              key={`primary-${back.count}`}
+              appearance="primary"
+              isLoading={loading('primary')}
+              isDisabled={held('primary') || missingPrompt}
+              onClick={() => goTo(3)}
+            >
               Review changes
-            </Button>
+            </LoadingButton>
           ) : (
             ready && (
-              <Button
+              <LoadingButton
+                key="apply"
                 appearance="primary"
+                isLoading={loading('apply')}
                 isDisabled={
-                  busy ||
+                  held('apply') ||
                   (shared.length > 0 && !sharedAck) ||
                   (sharedScreens.length > 0 && !screenAck)
                 }
-                onClick={() => void run(apply)}
+                onClick={() => void run(apply, 'apply')}
               >
                 Apply changes
-              </Button>
+              </LoadingButton>
             )
           ))}
       </ModalFooter>

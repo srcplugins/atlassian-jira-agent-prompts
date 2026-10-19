@@ -7,3 +7,6 @@ static/
 coverage/
 package-lock.json
 tsconfig.base.json
+# Markdown is never formatted, even when Prettier is run on a file by hand: it would realign
+# every table and rewrite the starter's double-underscore placeholders as bold.
+*.md

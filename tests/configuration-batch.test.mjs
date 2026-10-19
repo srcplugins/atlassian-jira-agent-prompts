@@ -950,6 +950,54 @@ test('a large setup removal keeps the space set up until its last screen change'
   assert.equal(f.configs.get('1').data.type, undefined);
   assert.deepEqual(f.configs.get('1').data.previousTypes, ['5']);
 });
+test('slow screen writes stop the step early and leave the exact unstarted changes', async () => {
+  const { f, ids } = manyScreensFixture();
+  f.screens.clock.left = 22_000;
+  // Each Jira screen write takes five seconds, far more than the second fitted for it.
+  const sentAt = [];
+  for (const name of ['addScreenField', 'removeScreenField']) {
+    const write = f.s[name];
+    f.s[name] = async (...args) => {
+      sentAt.push(f.screens.clock.left);
+      await write(...args);
+      f.screens.clock.left -= 5_000;
+    };
+  }
+  const order = ids.flatMap((_, i) => [String(300 + 2 * i), String(301 + 2 * i)]);
+  const left = (r) => r.data.entries[0].remaining.map((ch) => ch.screen.id);
+  let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ids });
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  // Writes start at 22, 17, 12 and 7 seconds left; at 2 seconds the rest wait for a new step.
+  assert.deepEqual(sentAt, [22_000, 17_000, 12_000, 7_000]);
+  assert.equal(r.data.entries[0].applied, 4);
+  assert.deepEqual(left(r), order.slice(4));
+  assert.deepEqual(f.configs.get('1').data.screens, order.slice(0, 4));
+  while (r.data.status === 'ready') {
+    f.screens.clock.left = 22_000;
+    r = await f.api.advance('admin', r.data.id, r.revision);
+  }
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.equal(added(f), 14);
+  assert.equal(new Set(f.writes).size, f.writes.length);
+  // Removal stops the same way and keeps the space set up until its last change.
+  sentAt.length = 0;
+  f.screens.clock.left = 22_000;
+  r = await f.start({ unlink: true }, ['1']);
+  r = await f.api.advance('admin', r.data.id, r.revision);
+  assert.equal(r.data.status, 'ready', r.data.message);
+  assert.equal(sentAt.length, 4);
+  assert.deepEqual(left(r), order.slice(4));
+  assert.equal(f.configs.get('1').data.type, '5');
+  assert.deepEqual(f.configs.get('1').data.screens, order.slice(4));
+  while (r.data.status === 'ready') {
+    f.screens.clock.left = 22_000;
+    r = await f.api.advance('admin', r.data.id, r.revision);
+  }
+  assert.equal(r.data.status, 'complete', r.data.message);
+  assert.equal(f.writes.filter((w) => w.startsWith('remove')).length, 14);
+  assert.equal(f.configs.get('1').data.type, undefined);
+});
 
 test('the reload choice keeps each space’s preference or sets it for every selected space', async () => {
   // Space 1 reloads, space 2 does not, and space 7 has never chosen.
@@ -1109,4 +1157,30 @@ test('a team-managed space whose saved entry names another type stops the run un
   );
   await refused(f, r, /changed after review/);
   assert.equal(f.configs.has('7'), false);
+});
+test('a cancel landing during the final record of a configured space keeps it done and stops the run', async () => {
+  const f = fixture();
+  let r = await f.start({ name: 'Prompt' }, ['1', '2']);
+  const id = r.data.id;
+  // The administrator's other view cancels just before the step records its confirmed outcome.
+  const cas = f.w.cas;
+  let cancelled = false;
+  f.w.cas = async (revision, data) => {
+    if (!cancelled && f.state()?.data.status === 'running' && data.status !== 'running') {
+      cancelled = true;
+      await f.api.cancelInterrupted('admin', id);
+    }
+    return cas(revision, data);
+  };
+  r = await f.api.advance('admin', id, r.revision);
+  assert.ok(cancelled);
+  assert.deepEqual(f.writes, ['create', 'attach 91']);
+  assert.equal(f.configs.get('1').data.type, '5');
+  assert.equal(r.data.status, 'stopped');
+  assert.equal(r.data.cancelRequested, true);
+  assert.equal(r.data.entries[0].status, 'done');
+  assert.equal(r.data.entries[1].status, 'waiting');
+  assert.equal(r.data.inspectProject, undefined);
+  assert.equal(r.data.type, '5');
+  assert.match(r.data.message, /Interrupted configuration cancelled/);
 });

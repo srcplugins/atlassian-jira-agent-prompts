@@ -32,6 +32,7 @@ import {
 import { openField } from './support/snapshots.mjs';
 import { spaceSettings } from './support/space-settings.mjs';
 import { chooseScreenTypes, nextStep, reviewStep } from './support/configuration-dialog.mjs';
+import { spaceLeftovers } from './support/space-leftovers.mjs';
 
 const [mode, recoveryId] = process.argv.slice(2);
 assert.ok(mode === 'run' || (mode === 'cleanup' && /^[0-9a-f-]{36}$/.test(recoveryId)));
@@ -51,7 +52,7 @@ assert.match(id, /^[0-9a-f-]{36}$/);
 const path = `${directory}/${id}.json`;
 const lock = `${directory}/access.lock`;
 if (existsSync(lock)) {
-  const holder = JSON.parse(readFileSync(lock));
+  const holder = JSON.parse(readFileSync(lock, 'utf8'));
   assert.equal(mode, 'cleanup', 'Resolve the previous access run first');
   assert.equal(holder.id, id);
   let alive = true;
@@ -64,14 +65,14 @@ if (existsSync(lock)) {
   unlinkSync(lock);
 }
 for (const name of readdirSync(directory).filter((x) => x.endsWith('.json'))) {
-  const previous = JSON.parse(readFileSync(`${directory}/${name}`));
+  const previous = JSON.parse(readFileSync(`${directory}/${name}`, 'utf8'));
   assert.ok(previous.clean || previous.id === id, 'Resolve the previous access journal first');
 }
 writeFileSync(lock, JSON.stringify({ id, pid: process.pid }), { flag: 'wx', mode: 0o600 });
 const short = id.replaceAll('-', '').slice(0, 7).toUpperCase();
 const j =
   mode === 'cleanup'
-    ? JSON.parse(readFileSync(path))
+    ? JSON.parse(readFileSync(path, 'utf8'))
     : {
         id,
         site: activeTarget().site,
@@ -95,6 +96,7 @@ const stage = (value) => {
 persist();
 const r = await tokenRequest();
 const api = client(r);
+const leftovers = spaceLeftovers(api);
 let browser;
 
 async function pages(endpoint) {
@@ -213,6 +215,13 @@ async function cleanup() {
     j.typeSchemeDeleted = true;
     persist();
   }
+  // The rest of what Jira created with the space stays after it.
+  if (!j.leftovers) {
+    j.leftovers = await leftovers.find({ keys: j.project ? [j.key] : [] });
+    persist();
+  }
+  const stay = await leftovers.remove(j.leftovers, persist);
+  if (stay.length) console.log(`${stay.length} space leftovers stay; see the journal.`);
   j.clean = true;
   persist();
 }
@@ -220,7 +229,9 @@ async function cleanup() {
 // Each Jira work item write is journaled by its unique summary first, so an unknown outcome is
 // reconciled by search instead of a second create.
 async function createIssue(name, fields) {
-  const entry = (j.issues[name] = { summary: `Access ${name} ${short}` });
+  /** @type {{ summary: string, id?: string, key?: string }} */
+  const entry = { summary: `Access ${name} ${short}` };
+  j.issues[name] = entry;
   persist();
   const created = await api('/issue', 'POST', {
     fields: {

@@ -8,6 +8,7 @@ import {
   DynamicTable,
   Heading,
   Inline,
+  LoadingButton,
   Lozenge,
   SectionMessage,
   Modal,
@@ -30,23 +31,20 @@ import { createLatch } from './shared/latch.mjs';
 import { readSpaces } from './space-reads';
 import { finished } from './batch-status';
 import { Settings, type Health } from './settings-ui';
+import { appearance, configurationStatus, type Status } from './space-status';
 import { ConfigurationDialog } from './configuration-dialog';
 import type { InventoryProject, BatchRecord } from './configuration-batch';
 type Result = { id: string; value?: Health; error?: string };
 /** A listed space. A stand-in added before its first check has no known style yet. */
 type Listed = Omit<InventoryProject, 'teamManaged'> & { teamManaged?: boolean };
-function projectStatus(row?: Result) {
+function projectStatus(row?: Result): Status {
   return !row
     ? 'Not checked'
     : row.error
       ? 'Check failed'
-      : row.value?.state.data.pending
-        ? 'Needs attention'
-        : !row.value?.state.data.type
-          ? 'Not configured'
-          : row.value.checks.every((c) => c.ok)
-            ? 'Healthy'
-            : 'Needs attention';
+      : !row.value
+        ? 'Not configured'
+        : configurationStatus(row.value);
 }
 const hiddenLabel = xcss({ width: '1px', height: '1px', overflow: 'hidden' });
 const selectionLabel = (id: string, text: string) => (
@@ -80,9 +78,13 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     [busy, setBusy] = useState(true),
     [error, setError] = useState(''),
     [incomplete, setIncomplete] = useState(false),
+    // How many spaces the inventory listed, without spaces this view added to keep them reachable.
+    [listed, setListed] = useState(0),
     [inventoryFailed, setInventoryFailed] = useState(false),
     [detail, setDetail] = useState<string>(),
     [configure, setConfigure] = useState<string[]>(),
+    // The button whose check or dialog is under way.
+    [pressed, setPressed] = useState(''),
     [progress, setProgress] = useState<BatchRecord | null>(null),
     [checked, setChecked] = useState(''),
     [cancelledRun, setCancelledRun] = useState<string>(),
@@ -116,6 +118,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           : inventory.projects,
       );
       setIncomplete(inventory.incomplete);
+      setListed(inventory.projects.length);
       setInventoryFailed(false);
     } catch (e) {
       if (mounted.current) {
@@ -187,6 +190,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
   async function openDetails(id: string) {
     return latch.run(async () => {
       if (busy) return;
+      setPressed(`details-${id}`);
       setDetail(id);
       if (results.some((row) => row.id === id && row.value)) return;
       working(true);
@@ -206,6 +210,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     return latch.run(async () => {
       if (busy || !chosen.length) return;
       const ids = [...chosen];
+      setPressed('check');
       working(true);
       setChecking(ids);
       setCompleted(0);
@@ -218,6 +223,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       } finally {
         if (mounted.current) {
           setChecking([]);
+          setPressed('');
           working(false);
         }
       }
@@ -283,9 +289,14 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     active = progress && !finished(progress.data.status);
   const picked = projects.find((p) => p.id === detail);
   const disabled = busy || !!configure;
-  async function openConfigure(ids: string[]) {
+  // The button that started a check or opened a dialog stays focusable meanwhile, so focus
+  // returns to it when the dialog closes; a disabled button drops focus to the start of the page.
+  const keeps = (key: string) => pressed === key && (busy || !!configure || detail !== undefined);
+  const loading = (key: string) => pressed === key && busy && !configure;
+  async function openConfigure(ids: string[], key: string) {
     return latch.run(async () => {
       if (busy) return;
+      setPressed(key);
       const unchecked = ids.filter((id) => !results.some((row) => row.id === id && row.value));
       if (!unchecked.length) {
         setConfigure(ids);
@@ -294,6 +305,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       working(true);
       setChecking(unchecked);
       setCompleted(0);
+      let opened = false;
       try {
         // A space whose kind was unknown can turn out to be the other kind; the check takes it
         // out of the selection, and the administrator reviews what is left before configuring.
@@ -304,15 +316,17 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           return;
         }
         setConfigure(ids);
+        opened = true;
       } finally {
         if (mounted.current) {
           setChecking([]);
+          if (!opened) setPressed('');
           working(false);
         }
       }
     });
   }
-  const configureSelected = () => openConfigure([...chosen]);
+  const configureSelected = () => openConfigure([...chosen], 'configure');
   async function checkAffected(id: string) {
     return latch.run(async () => {
       if (busy) return;
@@ -358,20 +372,8 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     await refreshProgress();
     if (mounted.current) working(false);
   }
-  const badge = (status: string) => (
-    <Lozenge
-      appearance={
-        status === 'Healthy'
-          ? 'success'
-          : status === 'Needs attention'
-            ? 'moved'
-            : status === 'Check failed'
-              ? 'removed'
-              : 'default'
-      }
-    >
-      {status}
-    </Lozenge>
+  const badge = (status: keyof typeof appearance) => (
+    <Lozenge appearance={appearance[status]}>{status}</Lozenge>
   );
   return (
     <Stack space="space.200">
@@ -387,7 +389,9 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         >
           <Text>
             {!progress.data.cancelRequested
-              ? 'Another administrator has an unfinished configuration. Review its progress before starting a new one.'
+              ? progress.data.actor === accountId
+                ? 'Your configuration is unfinished. Review its progress to continue or cancel it.'
+                : 'Another administrator has an unfinished configuration. Review its progress before starting a new one.'
               : progress.data.actor === accountId
                 ? 'The current request may still finish. Remaining spaces will not be configured. This page will unlock automatically.'
                 : 'Another administrator’s configuration is being cancelled. If it does not finish, review it and release the abandoned configuration.'}
@@ -396,8 +400,12 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
               only the dialog's acknowledged release can end it. */}
           {(!progress.data.cancelRequested || progress.data.actor !== accountId) && (
             <Button
-              isDisabled={disabled}
-              onClick={() => setConfigure(progress.data.entries.map((e) => e.projectId))}
+              isDisabled={disabled && !keeps('review')}
+              onClick={() => {
+                if (disabled) return;
+                setPressed('review');
+                setConfigure(progress.data.entries.map((e) => e.projectId));
+              }}
             >
               Review saved configuration
             </Button>
@@ -428,10 +436,12 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
                 again.
               </Text>
               <Button
-                isDisabled={disabled}
+                isDisabled={disabled && !keeps('inspect')}
                 onClick={() => {
                   const id = progress.data.inspectProject;
-                  if (id) void checkAffected(id);
+                  if (disabled || !id) return;
+                  setPressed('inspect');
+                  void checkAffected(id);
                 }}
               >
                 Check affected space
@@ -475,7 +485,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           (label) => (
             <Button
               key={label}
-              appearance={filter === label ? 'primary' : 'default'}
+              isSelected={filter === label}
               isDisabled={disabled}
               onClick={() => {
                 setFilter(label);
@@ -535,25 +545,27 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
       </Box>
       {incomplete && (
         <Text>
-          Showing the first {projects.length} supported spaces. Selection applies only to this
-          loaded inventory.
+          Showing the first {listed} supported spaces. Selection applies only to this loaded
+          inventory.
         </Text>
       )}
       <Inline space="space.100" shouldWrap>
         <Text>{chosen.length} selected</Text>
-        <Button
+        <LoadingButton
           appearance="primary"
-          isDisabled={disabled || !chosen.length}
+          isLoading={loading('check')}
+          isDisabled={(disabled && !keeps('check')) || !chosen.length}
           onClick={() => void checkSelected()}
         >
           Check selected
-        </Button>
-        <Button
-          isDisabled={disabled || !chosen.length || !!error || !!active}
+        </LoadingButton>
+        <LoadingButton
+          isLoading={loading('configure')}
+          isDisabled={(disabled && !keeps('configure')) || !chosen.length || !!error || !!active}
           onClick={() => void configureSelected()}
         >
           Configure selected
-        </Button>
+        </LoadingButton>
         <Button isDisabled={disabled || !chosen.length} onClick={() => setSelected([])}>
           Clear selection
         </Button>
@@ -640,7 +652,10 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
             ...(shown === 'team' ? [{ content: <Text>{layoutCell(p.result?.value)}</Text> }] : []),
             {
               content: (
-                <Button isDisabled={disabled} onClick={() => void openDetails(p.id)}>
+                <Button
+                  isDisabled={disabled && !keeps(`details-${p.id}`)}
+                  onClick={() => void openDetails(p.id)}
+                >
                   View details
                 </Button>
               ),
@@ -654,7 +669,9 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         <Modal
           width="large"
           onClose={() => {
-            if (!busy) setDetail(undefined);
+            if (busy) return;
+            setDetail(undefined);
+            setPressed('');
           }}
         >
           <ModalHeader>
@@ -677,8 +694,8 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
                   initialHealth={current.value}
                   configurationAction={
                     <Button
-                      isDisabled={disabled || !!error || !!active}
-                      onClick={() => void openConfigure([picked.id])}
+                      isDisabled={(disabled && !keeps('configure-space')) || !!error || !!active}
+                      onClick={() => void openConfigure([picked.id], 'configure-space')}
                     >
                       {current.value.state.data.type ? 'Reconfigure space' : 'Configure space'}
                     </Button>
@@ -716,14 +733,22 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
                 <Text>
                   {progress.data.cancelRequested
                     ? 'The interrupted configuration is being cancelled. Configuration will unlock automatically when its current request finishes.'
-                    : 'Another administrator has an unfinished configuration. Close these details to review its progress.'}
+                    : progress.data.actor === accountId
+                      ? 'Your configuration is unfinished. Close these details to review its progress.'
+                      : 'Another administrator has an unfinished configuration. Close these details to review its progress.'}
                 </Text>
               )}
               {error && <Text>{error}</Text>}
             </Stack>
           </ModalBody>
           <ModalFooter>
-            <Button isDisabled={busy} onClick={() => setDetail(undefined)}>
+            <Button
+              isDisabled={busy}
+              onClick={() => {
+                setDetail(undefined);
+                setPressed('');
+              }}
+            >
               Close
             </Button>
           </ModalFooter>
@@ -748,6 +773,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           onBusy={working}
           onClose={(mutated) => {
             setConfigure(undefined);
+            setPressed('');
             if (mutated) void changed();
           }}
         />
