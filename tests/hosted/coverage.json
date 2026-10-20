@@ -52,7 +52,7 @@
       "behavior": "Jira's Create form shows the field as a note to add prompts after creating the work item, not Jira's label editor",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "The persistent marked team-managed space (the field on the Task layout, which is also its Create form); a Task created through Jira's Create form, journaled by the run marker in its summary",
-      "assertion": "The field is in Task's create metadata; the Create form shows the app's note and no \"Select label\"; Create closes within 8 seconds; the created work item is a Task with the field empty",
+      "assertion": "In dark theme, the field is in Task's create metadata; the Create form shows the app's note and no \"Select label\"; Create closes within 8 seconds; Jira's Create outcome flag is no error, such as \"with exceptions\" (the test framework's page guard); the created work item is a Task with the field empty; Create opened over that work item shows the note again and closes unsaved",
       "cleanup": "journal-verified",
       "lowerLevelTests": ["tests/field-ui.test.mjs"]
     },
@@ -280,6 +280,18 @@
       "cleanup": "Persistent prepared space, never deleted; an unresolved creation journal stops a rerun until inspected",
       "version": "Run when the space is missing or its manual setup changed; not part of any suite",
       "lowerLevelTests": ["tests/hosted-coverage.test.mjs"]
+    },
+    {
+      "id": "AP-PRODUCTION-SMOKE",
+      "method": "production-smoke",
+      "unattended": false,
+      "script": "tests/hosted/production-smoke.mjs",
+      "command": "node config/production-smoke.mjs <result.json>, run by Publish after each production deploy with the acceptance configuration (EXPECT_BUILD: the deployed build stamp)",
+      "fixture": "The production installation on the primary site and one existing work item, named by the production target, in a configured fixture space whose description carries its marker and whose screens carry the production field; the admin session",
+      "assertion": "The Configure page loads its space list and shows the deployed build stamp; the field's editor frame opens on the work item with its actions and no load error; the Create form for the work item's space and type shows the app's note within 15 seconds of opening, no \"Select label\", and no Jira error flag or frame error until 15 seconds have passed",
+      "cleanup": "None needed: reads only; the editor is left with Escape and the Create form closed unsaved; without a production target the smoke reports skipped",
+      "version": "Every Publish run that deploys production",
+      "lowerLevelTests": ["tests/field-ui.test.mjs", "tests/hosted-coverage.test.mjs"]
     }
   ]
 }

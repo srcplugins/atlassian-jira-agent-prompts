@@ -55,6 +55,8 @@ const notAppText = new Map([
   ["'Type: Task'", "Jira's Create form work type button"],
   ['/^Type: /', "Jira's Create form work type button"],
   ["'Select label'", "Jira's default editor for a list field, which the app replaces"],
+  ['/^Agent Prompts/', "the field's name as Jira labels it on the work item"],
+  ['/^Close/', "Jira's Create form close button"],
 ]);
 const locator =
   /(?:getByText|\bline|getByLabel|getByPlaceholder|toContainText|toHaveText|hasText:|name:)\s*\(?\s*('(?:[^'\\]|\\.)*'|\/(?:[^/\\\n]|\\.)+\/[a-z]*)/g;

@@ -8,7 +8,9 @@ name: Publish
 # notes. By default it rehearses: set `production` to deploy. Uploading a build needs a Forge
 # role that can deploy production (the Developer role gets "Permission denied"), so the build
 # job uses the `production` environment's deploy account too: every run waits for the owner's
-# approval before building, and a production run waits again before deploying.
+# approval before building, and a production run waits again before deploying. After the deploy,
+# a read-only smoke checks the production installation on the primary owned site and adds its
+# outcome to the release notes; without a production target it reports skipped, never passed.
 
 on:
   workflow_dispatch:
@@ -202,3 +204,100 @@ jobs:
             gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes"
           fi
           echo "$TAG deployed to production as build $BUILD." >> "$GITHUB_STEP_SUMMARY"
+
+  smoke:
+    name: Production smoke on an owned site
+    needs: [build, production]
+    if: inputs.production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Read-only checks with the acceptance sessions; no production credentials, and no site lease
+    # (taking it would write). Forge upgrades every installation at once, so this is detection
+    # within minutes, not a staged rollout.
+    environment: acceptance
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+      SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: GitHub dependencies over HTTPS
+        env:
+          TOKEN: ${{ secrets.SRCPLUGINS_READ_TOKEN }}
+          OWNER: ${{ vars.SRCPLUGINS_REPO_OWNER }}
+          PREFIX: ${{ vars.SRCPLUGINS_REPO_PREFIX }}
+        run: |
+          base="https://${TOKEN:+x-access-token:$TOKEN@}github.com/"
+          git config --global url."$base".insteadOf ssh://git@github.com/
+          # A development copy sets these repository variables to read its sibling copies:
+          # srcplugins/<name> then resolves to <owner>/<prefix><name>.
+          [ -n "$OWNER$PREFIX" ] || exit 0
+          [[ "${OWNER:-srcplugins}" =~ ^[A-Za-z0-9-]+$ && "$PREFIX" =~ ^[A-Za-z0-9._-]*$ ]] ||
+            { echo "::error::SRCPLUGINS_REPO_OWNER or SRCPLUGINS_REPO_PREFIX is not part of a repository name"; exit 1; }
+          for from in ssh://git@github.com/srcplugins/ https://github.com/srcplugins/; do
+            git config --global --add url."$base${OWNER:-srcplugins}/$PREFIX".insteadOf "$from"
+          done
+          echo "srcplugins repositories resolve to ${OWNER:-srcplugins}/$PREFIX<name>"
+      - name: Install
+        run: |
+          node config/prepare-forge-cli.mjs
+          npm ci --no-audit --no-fund
+          sudo apt-get update > /dev/null
+          sudo apt-get install -y --no-install-recommends age > /dev/null
+          command -v google-chrome > /dev/null || npx playwright install --with-deps chrome > /dev/null
+      - name: Restore the admin session and mask private values
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_SESSION_ADMIN: ${{ secrets.JIRA_SESSION_ADMIN }}
+        run: |
+          npx forge-test mask
+          npx forge-test restore
+          npx forge-test mask
+      - name: Read-only checks of the production installation
+        env:
+          FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: EXPECT_BUILD="${SHA::12}" node config/production-smoke.mjs "$RUNNER_TEMP/production-smoke.json"
+      # Always, so a failed or crashed smoke is in the release notes too.
+      - name: Smoke result in the release notes
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          result="$RUNNER_TEMP/production-smoke.json"
+          line="Production smoke (read-only, owned site): FAILED: the smoke did not complete."
+          [ -s "$result" ] && line=$(jq -r .notes "$result")
+          body=$(gh release view "$TAG" --json body --jq .body)
+          gh release edit "$TAG" --notes "$body"$'\n\n'"$line"
+          echo "$line"
+      - name: Encrypt failure screenshots (maintainers' keys only)
+        id: evidence
+        if: failure()
+        env:
+          OWNER: ${{ vars.OWNER_AGE_RECIPIENT }}
+          AGENT: ${{ vars.AGENT_AGE_RECIPIENT }}
+        run: |
+          list="$RUNNER_TEMP/screenshots.txt"
+          find .local/sites -path '*/e2e/production-smoke/*.png' -type f > "$list" 2> /dev/null || true
+          [ -s "$list" ] || { echo "No screenshots."; exit 0; }
+          readers=(-r "$OWNER")
+          [ -z "$AGENT" ] || readers+=(-r "$AGENT")
+          mkdir -p "$RUNNER_TEMP/out"
+          tar -czf - -T "$list" | age "${readers[@]}" > "$RUNNER_TEMP/out/production-smoke.tar.age"
+      - name: Save failure screenshots
+        if: failure() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-smoke-evidence
+          path: ${{ runner.temp }}/out/production-smoke.tar.age
+          retention-days: 14
+          if-no-files-found: ignore

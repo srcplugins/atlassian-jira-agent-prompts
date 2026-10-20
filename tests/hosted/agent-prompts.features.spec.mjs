@@ -826,9 +826,10 @@ test.describe('team-managed space', () => {
     expect(health.state.data.previousTypes).toContain(prompt);
     expect(await jira()).toEqual(before);
   });
-  test('AP-14 Create form: a note instead of a picker, and the work item is created empty and promptly', async ({
+  test('AP-14 Create form: a note instead of a picker, and the work item is created empty, promptly and without exceptions', async ({
     page,
     owned,
+    theme,
   }, testInfo) => {
     const t = installation('agent-prompts');
     const key = owned.project.key;
@@ -846,6 +847,7 @@ test.describe('team-managed space', () => {
     expect(meta.fields.map((f) => f.fieldId)).toContain(field.id);
 
     await dismissOnboarding(page);
+    await theme('Dark');
     await page.goto(`${activeTarget().site}/browse/${key}`);
     // The page's Create button opens the form on this space; the board has Create buttons too.
     const dialog = page.getByRole('dialog', { name: /^Create/ });
@@ -882,8 +884,28 @@ test.describe('team-managed space', () => {
     testInfo.annotations.push({ type: 'create-ms', description: String(createMs) });
     // Jira waits up to 10 seconds for a field that never answers before creating without it.
     expect(createMs).toBeLessThan(8000);
+    // browserIssue returned after Jira's Create outcome flag, which the page guard fails on if it
+    // is "Created <type> with exceptions": a field that Jira couldn't save after the create.
     const x = await owned.api(`/issue/${created.id}?fields=issuetype,${field.id}`);
     expect(x.fields.issuetype.id).toBe(task.id);
     expect(x.fields[field.id] ?? null).toBeNull();
+
+    // Create opened over a work item that shows the field renders the note too. Closed unsaved.
+    await page.goto(`${activeTarget().site}/browse/${x.key}`);
+    // Development labels the field "Agent Prompts" with a DEV badge.
+    await expect(page.getByText(/^Agent Prompts/).first()).toBeVisible({ timeout: 30000 });
+    await page.getByRole('banner').getByRole('button', { name: 'Create', exact: true }).click();
+    await expect(
+      dialog
+        .frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`)
+        .getByText('Add prompts after you create the work item.', { exact: true }),
+    ).toBeVisible({ timeout: 30000 });
+    await dialog
+      .getByRole('button', { name: /^Close/ })
+      .first()
+      .click();
+    const discard = page.getByRole('button', { name: 'Discard', exact: true });
+    if (await discard.isVisible().catch(() => false)) await discard.click();
+    await expect(dialog).toBeHidden();
   });
 });
