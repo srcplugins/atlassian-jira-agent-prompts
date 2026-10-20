@@ -5,8 +5,10 @@ name: Publish
 # on main: it checks the tag and source, uploads one Forge build tagged with the commit (stamped
 # into the app's settings page), attests that bundle, runs the release suite against exactly that
 # build on development, then deploys the same build to production and writes the GitHub release
-# notes. By default it rehearses: set `production` to deploy, which then waits for the owner's
-# approval of the `production` environment.
+# notes. By default it rehearses: set `production` to deploy. Uploading a build needs a Forge
+# role that can deploy production (the Developer role gets "Permission denied"), so the build
+# job uses the `production` environment's deploy account too: every run waits for the owner's
+# approval before building, and a production run waits again before deploying.
 
 on:
   workflow_dispatch:
@@ -40,7 +42,7 @@ jobs:
     name: Check, build and attest
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: acceptance
+    environment: production
     permissions:
       contents: read
       id-token: write
