@@ -9,7 +9,7 @@ Stop repeating the same instructions across Jira work items. Create reusable pro
 ## Features
 
 - **Manage prompts directly in Jira.** Create reusable prompts as ordinary Jira work items, using Jira's editor, permissions and history.
-- **Give every work item the right context.** Add up to five prompts to a work item, with their instructions saved directly in the description. Each prompt holds up to 4,000 characters of text.
+- **Give every work item the right context.** Add up to five prompts to a work item, with their instructions saved directly in the description. Each prompt holds up to 4,000 characters of text. Add prompts once the work item exists: on Jira's Create form, the field says so.
 - **Update instructions.** After editing a prompt, Sync a work item that uses it to copy the new instructions.
 - **Retire prompts.** Move a prompt to any status in Jira's Done category and the field and the Rovo assistant stop suggesting it; work items that use it keep it. Don't use a Done-category status to mean approved.
 - **Ask Rovo.** Find prompts and read their instructions with the read-only Agent Prompts Assistant.

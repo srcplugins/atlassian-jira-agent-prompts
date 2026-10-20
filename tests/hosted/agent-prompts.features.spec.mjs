@@ -6,6 +6,7 @@ import {
   textContrast,
   observeAction,
   client,
+  dismissOnboarding,
 } from '@srcplugins/atlassian-forge-test-framework/jira';
 import {
   activeTarget,
@@ -824,5 +825,65 @@ test.describe('team-managed space', () => {
     expect(health.state.data.type).toBeUndefined();
     expect(health.state.data.previousTypes).toContain(prompt);
     expect(await jira()).toEqual(before);
+  });
+  test('AP-14 Create form: a note instead of a picker, and the work item is created empty and promptly', async ({
+    page,
+    owned,
+  }, testInfo) => {
+    const t = installation('agent-prompts');
+    const key = owned.project.key;
+    const task = owned.project.issueTypes.find((x) => !x.subtask && x.name === 'Task');
+    expect(task).toBeTruthy();
+    const field = (await owned.api('/field')).find(
+      (f) =>
+        f.schema?.custom?.includes(`/${t.appId}/`) &&
+        f.schema.custom.includes(t.environmentId) &&
+        f.name === 'Agent Prompts',
+    );
+    expect(field).toBeTruthy();
+    // A team-managed layout is also the Create form: the prepared space has the field on Task's.
+    const meta = await owned.api(`/issue/createmeta/${owned.project.id}/issuetypes/${task.id}`);
+    expect(meta.fields.map((f) => f.fieldId)).toContain(field.id);
+
+    await dismissOnboarding(page);
+    await page.goto(`${activeTarget().site}/browse/${key}`);
+    // The page's Create button opens the form on this space; the board has Create buttons too.
+    const dialog = page.getByRole('dialog', { name: /^Create/ });
+    let createMs;
+    const created = await owned.browserIssue('Create form note', task.id, {
+      async fill(summary) {
+        await page.getByRole('banner').getByRole('button', { name: 'Create', exact: true }).click();
+        await expect(
+          dialog.getByRole('button', { name: new RegExp(`^Space: .*\\(${key}\\)$`) }),
+        ).toBeVisible({ timeout: 30000 });
+        const type = dialog.getByRole('button', { name: 'Type: Task', exact: true });
+        if (!(await type.isVisible())) {
+          await dialog.getByRole('button', { name: /^Type: / }).click();
+          await page.getByRole('option', { name: 'Task', exact: true }).click();
+        }
+        await expect(type).toBeVisible();
+        const frame = dialog.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
+        await expect(
+          frame.getByText('Add prompts after you create the work item.', { exact: true }),
+        ).toBeVisible({ timeout: 30000 });
+        await expect(dialog.getByText('Select label', { exact: true })).toHaveCount(0);
+        await dialog.getByRole('textbox', { name: 'Summary', exact: true }).fill(summary);
+        await page.screenshot({
+          path: `${activeTarget().runs}/${owned.run.state.runId}-create-form.png`,
+        });
+      },
+      async submit() {
+        const started = Date.now();
+        await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+        await expect(dialog).toBeHidden({ timeout: 30000 });
+        createMs = Date.now() - started;
+      },
+    });
+    testInfo.annotations.push({ type: 'create-ms', description: String(createMs) });
+    // Jira waits up to 10 seconds for a field that never answers before creating without it.
+    expect(createMs).toBeLessThan(8000);
+    const x = await owned.api(`/issue/${created.id}?fields=issuetype,${field.id}`);
+    expect(x.fields.issuetype.id).toBe(task.id);
+    expect(x.fields[field.id] ?? null).toBeNull();
   });
 });

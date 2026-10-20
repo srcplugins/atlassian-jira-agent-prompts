@@ -632,3 +632,33 @@ test('on a prompt work item an empty menu does not suggest searching', async () 
     'All prompts on this work item are selected.',
   );
 });
+// Jira's Create form renders the field before the work item exists, so it shows a note there.
+async function root(getContext) {
+  const hooks = hookHost();
+  const { FieldRoot } = load('field-root.tsx', {
+    react: hooks.react,
+    '@forge/bridge': { view: { getContext } },
+    './field': { Field: 'Field' },
+  });
+  const v = view(hooks, FieldRoot);
+  await v.mount();
+  return v;
+}
+test('on the Create form the field only says to add prompts after creating the work item', async () => {
+  const v = await root(async () => ({ extension: { renderContext: 'issue-create' } }));
+  assert.equal(v.text('p'), 'Add prompts after you create the work item.');
+  assert.equal(v.nodes('Field').length, 0);
+});
+test('on the work item, or when Jira gives no context, the field shows the prompt picker', async () => {
+  for (const getContext of [
+    async () => ({ extension: { renderContext: 'issue-view' } }),
+    async () => ({ extension: {} }),
+    async () => {
+      throw Error('No context');
+    },
+  ]) {
+    const v = await root(getContext);
+    assert.equal(v.nodes('Field').length, 1);
+    assert.equal(v.text('p'), '');
+  }
+});

@@ -12,6 +12,7 @@ modules:
         isInline: true
         experience:
           - issue-view
+          - issue-create
         validation:
           expression: value == null || value.length <= 5
           errorMessage: Choose up to five prompts.

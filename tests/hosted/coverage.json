@@ -48,6 +48,15 @@
       ]
     },
     {
+      "id": "AP-14",
+      "behavior": "Jira's Create form shows the field as a note to add prompts after creating the work item, not Jira's label editor",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "The persistent marked team-managed space (the field on the Task layout, which is also its Create form); a Task created through Jira's Create form, journaled by the run marker in its summary",
+      "assertion": "The field is in Task's create metadata; the Create form shows the app's note and no \"Select label\"; Create closes within 8 seconds; the created work item is a Task with the field empty",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/field-ui.test.mjs"]
+    },
+    {
       "id": "AP-13",
       "behavior": "Retired prompt: a prompt moved to a Done-category status is no longer offered, while a work item that uses it keeps it and Sync still copies its text",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",

@@ -1,8 +1,8 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { view } from '@forge/bridge';
-import { Field } from './field';
+import { FieldRoot } from './field-root';
 import './field.css';
 
 void view.theme.enable().catch(() => {});
-createRoot(document.getElementById('root')!).render(<Field />);
+createRoot(document.getElementById('root')!).render(<FieldRoot />);
