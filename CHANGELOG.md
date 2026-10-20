@@ -2,7 +2,7 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
-## 1.0.1 (unreleased)
+## 1.0.1
 
 - **Jira's Create form.** Where the Agent Prompts field is on a Create form, it now says to add prompts after you create the work item, instead of showing Jira's own list editor, and the work item is created with the field empty.
 
