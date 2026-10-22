@@ -10,7 +10,7 @@ Stop repeating the same instructions across Jira work items. Create reusable pro
 
 - **Manage prompts directly in Jira.** Create reusable prompts as ordinary Jira work items, using Jira's editor, permissions and history.
 - **Give every work item the right context.** Add up to five prompts to a work item, with their instructions saved directly in the description. Each prompt holds up to 4,000 characters of text. Add prompts once the work item exists: the field isn't on Jira's Create form.
-- **Update instructions.** After editing a prompt, Sync a work item that uses it to copy the new instructions.
+- **Update instructions.** After editing a prompt, Sync a work item that uses it to copy the new instructions. Sync also puts the description's Agent Prompts section right after anyone edits, moves, copies or deletes it in Jira.
 - **Retire prompts.** Move a prompt to any status in Jira's Done category and the field and the Rovo assistant stop suggesting it; work items that use it keep it. Don't use a Done-category status to mean approved.
 - **Ask Rovo.** Find prompts and read their instructions with the read-only Agent Prompts Assistant.
 
@@ -29,7 +29,7 @@ For installation, configuration, usage and troubleshooting, see the [website doc
   - Adds summary and description to the prompt type's create screen where they're missing.
   - Shared schemes and screens change for every space that uses them; the review lists them before anything changes. A screen may also be used on workflow transitions, which the review can't list.
 - **When an administrator sets up a team-managed space,** nothing changes in Jira: the app stores which of the space's own work types holds prompts.
-- **In everyday use:** **Save** and **Sync** edit the work item's description and Agent Prompts field as the current user.
+- **In everyday use:** **Save** and **Sync** edit the work item's description and Agent Prompts field as the current user. They replace every collapsible section titled Agent Prompts in the description with one section copied from the prompts the field links, whatever anyone wrote in them, and leave the rest of the description as it is. A linked prompt that was deleted or is no longer a prompt in the space is removed from the field.
 - **Removing setup** clears the space's setup and preferences and removes the field from the screens the app added it to, except screens another set-up space still uses with the field. Work types, scheme changes, field configuration, layouts, prompts and copied instructions stay. When one removal covers every space that shares such a screen, it stops at the last of them, which would now take the field off that screen; review that space again to approve it. The app keeps the space's earlier prompt types, so prompts already on work items stay removable and syncable.
 - **Limits:** one review covers up to 50 screens per space; when one request cannot make all of a space's screen changes, **Apply changes** continues with the rest in further steps of the same run. A screen used by more than 1,000 spaces is changed in Jira settings instead.
 - The app never changes workflows, boards or permission schemes, and never deletes work items or work types.
@@ -38,17 +38,17 @@ For installation, configuration, usage and troubleshooting, see the [website doc
 
 Everything runs as the current user, so Jira's normal visibility rules apply. Saving needs **Edit work items**, creating prompts needs **Create work items** and setup needs **Administer Jira**. A space's health checks also need **Create work items** in that space: to check the prompt type's create fields, and in a team-managed space to show which layouts have the field. Resolving an unconfirmed save as an administrator needs both **Administer Jira** and **Edit work items**.
 
-| Scope                       | Purpose                                                                                                                                        |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read:jira-work`            | Find visible prompts and read the source and destination work items.                                                                           |
-| `write:jira-work`           | Save the destination description and Agent Prompts field as the current user.                                                                  |
-| `manage:jira-configuration` | Inspect work type schemes and create or attach a prompt type after administrator review.                                                       |
-| `manage:jira-project`       | Read screens and screen schemes, add or remove the Agent Prompts field, and add summary and description to screens after administrator review. |
-| `storage:app`               | Store space configuration, records of screens the app changed and save-recovery records.                                                       |
+| Scope                       | Purpose                                                                                                                                                                          |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read:jira-work`            | Find visible prompts and read the source and destination work items.                                                                                                             |
+| `write:jira-work`           | Save the destination description and Agent Prompts field as the current user.                                                                                                    |
+| `manage:jira-configuration` | Inspect work type schemes and create or attach a prompt type after administrator review.                                                                                         |
+| `manage:jira-project`       | Read screens and screen schemes, add or remove the Agent Prompts field, and add summary and description to screens after administrator review.                                   |
+| `storage:app`               | Store space settings, selected prompt IDs and content fingerprints, the latest space configuration, records of screens where the app added the field, and save-recovery records. |
 
 ## Data
 
-Prompts and their copied instructions stay in Jira. Atlassian Forge stores the app's configuration, save-recovery data, each work item's selected prompt IDs and content fingerprints, a record of the latest space configuration (without any account) and which screens the app added the Agent Prompts field to; removing setup removes the field only from those screens. The app does not send data outside Atlassian or log prompt content. After uninstalling, work items and copies remain; Forge keeps app data for 28 days, and reinstalling doesn't restore it automatically.
+Prompts, their copied instructions and each work item's Agent Prompts field, which lists the prompts selected on it, stay in Jira. Atlassian Forge stores the app's configuration, save-recovery data, each work item's selected prompt IDs and content fingerprints, a record of the latest space configuration (without any account) and which screens the app added the Agent Prompts field to; removing setup removes the field only from those screens. The app does not send data outside Atlassian or log prompt content. After uninstalling, work items and copies remain; Forge keeps app data for 28 days, and reinstalling doesn't restore it automatically.
 
 **Note:** Copied instructions follow the destination work item's permissions, even if the original prompt is later restricted or deleted. Rovo features are subject to [Atlassian's Rovo data policies](https://support.atlassian.com/rovo/docs/rovo-data-privacy-and-usage-guidelines/), which may include third-party models.
 

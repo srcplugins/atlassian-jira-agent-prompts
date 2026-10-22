@@ -414,6 +414,55 @@ export function publicRepositoryFindings(appDir) {
   );
 }
 
+const semver = (text) => text.split('.').map(Number);
+const newer = (a, b) => {
+  const [x, y] = [semver(a), semver(b)];
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return false;
+};
+/**
+ * A user-visible change since the last release needs its CHANGELOG entry: when src/, manifest.yml
+ * or README.md differ from the newest vX.Y.Z tag, CHANGELOG.md must have a newer
+ * "## X.Y.Z (unreleased)" section (or, in the release commit, the package's newer version).
+ * `changed` is the list of those files that differ, or null when there's no tag to compare with
+ * (a shallow CI checkout); the check is then skipped.
+ */
+export function changelogFindingsIn({ tag, changed, changelog, version }) {
+  if (!tag || !changed?.length) return [];
+  const last = tag.slice(1);
+  const unreleased = [...changelog.matchAll(/^## (\d+\.\d+\.\d+) \(unreleased\)$/gm)];
+  if (unreleased.some(([, next]) => newer(next, last))) return [];
+  if (
+    newer(version, last) &&
+    new RegExp(`^## ${version.replaceAll('.', '\\.')}$`, 'm').test(changelog)
+  )
+    return [];
+  return [
+    `CHANGELOG.md: ${changed.slice(0, 3).join(', ')}${changed.length > 3 ? ' and more' : ''} changed since ${tag}; add a "## <next version> (unreleased)" section saying what users will notice`,
+  ];
+}
+export function changelogFindings(appDir) {
+  const git = (...args) => spawnSync('git', args, { cwd: appDir, encoding: 'utf8' });
+  const tag = git('describe', '--tags', '--abbrev=0', '--match', 'v[0-9]*.[0-9]*.[0-9]*');
+  if (tag.status !== 0 || !existsSync(join(appDir, 'CHANGELOG.md'))) return [];
+  const diff = git(
+    'diff',
+    '--name-only',
+    tag.stdout.trim(),
+    '--',
+    'src',
+    'manifest.yml',
+    'README.md',
+  );
+  if (diff.status !== 0) return [];
+  return changelogFindingsIn({
+    tag: tag.stdout.trim(),
+    changed: diff.stdout.split('\n').filter(Boolean),
+    changelog: readFileSync(join(appDir, 'CHANGELOG.md'), 'utf8'),
+    version: JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')).version,
+  });
+}
+
 export function pluginFindings(appDir, { release = false } = {}) {
   return [
     ...manifestFindings(readFileSync(join(appDir, 'manifest.yml'), 'utf8'), nodeMajor(appDir)).map(
@@ -429,6 +478,7 @@ export function pluginFindings(appDir, { release = false } = {}) {
     ...handlerFindings(appDir),
     ...bundleHostFindings(appDir),
     ...publicRepositoryFindings(appDir),
+    ...changelogFindings(appDir),
   ];
 }
 
@@ -443,6 +493,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (findings.length) process.exitCode = 1;
   else
     console.log(
-      `Manifest defaults and handlers, ${release ? 'release' : 'dependency'} pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts and public-repository rules passed.`,
+      `Manifest defaults and handlers, ${release ? 'release' : 'dependency'} pins, README structure, host terms, pre-release compatibility, theme rules, bundle hosts, public-repository rules and the CHANGELOG passed.`,
     );
 }

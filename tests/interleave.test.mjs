@@ -177,41 +177,37 @@ async function explore(seed, now) {
 
   // Delayed requests land after their invocations failed.
   for (const land of w.late.splice(0)) land();
-  // Two minutes later an administrator inspects the ticket and releases or accepts.
+  // Two minutes later an administrator inspects the work item and releases the save.
   now.value += 130_000;
   const putsBefore = w.stats.puts;
   let outcome = successes.length ? 'saved' : 'unsaved';
   const [status] = await w.drive([w.service.saveStatus({ ...c, accountId: 'admin' })]);
   if (status.value?.pending) {
-    // The server must refuse whatever the UI would not offer, so try both regardless.
-    const input = { ...status.value, acknowledged: true };
-    // Judge each action by its effect on storage: a committed write may lose its response.
-    const settled = () => !w.stored()?.data.pending;
-    await w.drive([w.service.acceptSave(c, input)]);
-    const accepted = settled();
-    if (!accepted) await w.drive([w.service.resolveSave(c, input)]);
-    const released = !accepted && settled();
-    assert.equal(accepted, !!status.value.adoptable, `${label}: accept disagrees with status`);
-    assert.equal(
-      released,
-      !!(status.value.unchanged || status.value.sectionRemoved),
-      `${label}: release disagrees with status`,
-    );
-    outcome = accepted ? 'accepted' : released ? 'released' : 'pending';
+    // Judged by its effect on storage: a committed write may lose its response. A save Jira shows
+    // landed settles on its own, so every save still pending here can be released.
+    await w.drive([w.service.resolveSave(c, { ...status.value, acknowledged: true })]);
+    outcome = w.stored()?.data.pending ? 'pending' : 'released';
+    if (outcome === 'pending' && !features.lostStorage)
+      assert.fail(`${label}: release refused a pending save`);
   } else if (status.value && !successes.length && w.stats.puts) outcome = 'observed';
   assert.equal(w.stats.puts, putsBefore, `${label}: recovery wrote Jira`);
 
-  // A quiet read settles or reports pending; settled storage must describe Jira exactly.
+  // A quiet read settles or reports pending; settled storage must describe Jira's field exactly.
   const [quiet] = await w.drive([w.service.saveStatus(c)]);
   const st = w.stored();
   if (quiet.value && !quiet.value.pending) {
+    const ids = st?.data.ids ?? [];
     assert.deepEqual(
-      (st?.data.ids ?? []).map((id) => `TEST-${id}`),
+      ids.map((id) => `TEST-${id}`),
       w.jira.fields[FIELD] ?? [],
       `${label}: settled ids disagree with the field`,
     );
-    assert.equal(block(w.jira.fields.description).length, st?.data.managed ? 1 : 0, label);
-    // With no fault other than normalization, the ticket stays usable: deselect removes the block.
+    // Whatever a lost save left in the description, Sync then writes exactly one section.
+    const [synced] = await w.drive([w.service.save(c, { sync: true })]);
+    if (synced.value)
+      assert.equal(block(w.jira.fields.description).length, ids.length ? 1 : 0, label);
+    else if (!faulty) assert.fail(`${label}: Sync failed: ${synced.error?.message}`);
+    // And the work item stays usable: deselect removes the field and the section.
     const [cleared] = await w.drive([
       (async () => w.service.save(c, { ...(await w.service.load(c)), ids: [] }))(),
     ]);
@@ -232,9 +228,7 @@ test('the save protocol stays safe and recoverable across seeded interleavings a
     const outcome = await explore(seed, now);
     outcomes[outcome] = (outcomes[outcome] ?? 0) + 1;
   }
-  // Coverage guard: each recovery path is actually exercised, so the test cannot go vacuous. The
-  // native edits here append outside the block, so no fault leaves a save pending for good.
-  assert.equal(outcomes.pending, undefined, JSON.stringify(outcomes));
-  for (const outcome of ['saved', 'released', 'accepted'])
+  // Coverage guard: each recovery path is actually exercised, so the test cannot go vacuous.
+  for (const outcome of ['saved', 'released', 'observed'])
     assert.ok(outcomes[outcome] > 0, `no ${outcome} outcome in ${JSON.stringify(outcomes)}`);
 });

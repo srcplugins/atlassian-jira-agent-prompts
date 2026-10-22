@@ -116,7 +116,7 @@
       "lowerLevelTests": [
         "tests/field-ui.test.mjs",
         "tests/service.test.mjs",
-        "tests/save-accept.test.mjs",
+        "tests/save-outcome.test.mjs",
         "tests/interleave.test.mjs"
       ]
     },
@@ -153,34 +153,39 @@
     },
     {
       "id": "AP-10",
-      "behavior": "An Agent Prompts section deleted in Jira refuses Sync with guidance and is forgotten by a field-only save",
+      "behavior": "An Agent Prompts section deleted in Jira is written again by Sync, and removing the prompt clears it",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Owned synthetic Prompt and target work items in the Agent Prompts fixture space; the section is deleted through REST",
-      "assertion": "Sync rejected with the remove-all-first message and no Jira change; removing the prompt clears only the field; Description identical to the user's edit",
+      "assertion": "After Save and a REST write that deletes the section and adds the user's text, Sync writes exactly the user's description with the app's section last and the field unchanged; removing the prompt leaves exactly the user's description and clears the field",
       "cleanup": "journal-verified",
-      "lowerLevelTests": ["tests/save-accept.test.mjs", "tests/snapshots.test.mjs"]
+      "lowerLevelTests": [
+        "tests/handler-save.test.mjs",
+        "tests/save-outcome.test.mjs",
+        "tests/snapshots.test.mjs"
+      ]
     },
     {
       "id": "AP-16",
-      "behavior": "An Agent Prompts section the field does not track is listed with links to its prompts, refused beside a new section and replaced when the user chooses Use its prompts",
+      "behavior": "An Agent Prompts section copied from another work item is replaced by the app's own when the prompt is saved",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Owned synthetic Prompt and target work items in the Agent Prompts fixture space; another work item's section is written into the target's Description through REST",
-      "assertion": "Load reports the section and its prompt; Save of the prompt alone is refused with no Jira change; Use its prompts and Save leave exactly the app's own section, built independently, in its place; removal restores the original Description and clears the field",
+      "assertion": "Load reports nothing about the copied section; Save of the prompt leaves exactly the app's own section, built independently, in its place; removal restores the original Description and clears the field",
       "cleanup": "journal-verified",
       "lowerLevelTests": [
+        "tests/handler-save.test.mjs",
         "tests/snapshots.test.mjs",
-        "tests/service.test.mjs",
-        "tests/field-ui.test.mjs"
+        "tests/service.test.mjs"
       ]
     },
     {
       "id": "AP-17",
-      "behavior": "An Agent Prompts section changed in Jira (typed in with Jira's own editor, retitled, or copied with its identifier) is refused with the recovery message, and both ways out the message gives bring the field back",
+      "behavior": "An Agent Prompts section changed in Jira (retitled, copied with its identifier, typed in or deleted with Jira's own editor) is rewritten by Sync from the linked prompt",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
       "fixture": "Disposable prompt and Task in the owned Agent Prompts fixture space",
-      "assertion": "After Save, a retitled section and a copy carrying its identifier (REST) and text typed inside the section in Jira's Description editor each refuse Sync with the exact message and leave the description and field unchanged; undoing the change (REST, or deleting the typing in Jira's editor) lets Sync succeed with the description exactly as saved; deleting the section in Jira's editor, removing the prompt and saving clears only the field, and adding it again writes exactly the original description plus the app's section",
+      "assertion": "After Save, Sync over a retitled section and over a copy carrying its identifier (REST) each leave exactly one section of the app's own, built independently, in the first one's place; after text typed inside the section in Jira's Description editor, Sync puts the prompt's text back and keeps everything outside exactly as Jira saved it; after the section is deleted in Jira's editor, Sync writes it again last; removing the prompt then leaves the editor-saved description and clears the field",
       "cleanup": "journal-verified",
       "lowerLevelTests": [
+        "tests/handler-save.test.mjs",
         "tests/description-mutations.test.mjs",
         "tests/snapshots.test.mjs",
         "tests/service.test.mjs"

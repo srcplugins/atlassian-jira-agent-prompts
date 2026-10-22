@@ -44,7 +44,7 @@ const pending = {
   revision: 7,
   fingerprint: 'reviewed-target',
   administrator: true,
-  unchanged: true,
+  keys: ['TEST-20'],
   waitSeconds: 0,
 };
 test('checking a reconciled save immediately reloads the field without a write', async () => {
@@ -56,39 +56,38 @@ test('checking a reconciled save immediately reloads the field without a write',
     ['save-status'],
   );
 });
-test('ordinary users and changed outcomes never receive the release control', async () => {
-  for (const status of [
-    { ...pending, administrator: false },
-    { ...pending, unchanged: false },
-  ]) {
-    const f = fixture([status]);
-    await f.click('Check saved state');
-    assert.equal(f.button('Release unchanged save'), undefined);
-    assert.equal(f.nodes('input').length, 0);
-  }
+test('ordinary users never receive the release control', async () => {
+  const f = fixture([{ ...pending, administrator: false, keys: undefined }]);
+  await f.click('Check saved state');
+  assert.equal(f.button('Release save'), undefined);
+  assert.equal(f.nodes('input').length, 0);
+  assert.match(f.text('p'), /A Jira administrator with Edit work items permission/);
 });
 test('administrator release requires elapsed guard and explicit acknowledgment of current state', async () => {
   const f = fixture([{ ...pending, waitSeconds: 30 }, pending, { resolved: true }]);
   await f.click('Check saved state');
-  assert.equal(f.button('Release unchanged save').props.isDisabled, true);
+  assert.match(f.text('p'), /Wait 30 seconds/);
+  assert.equal(f.button('Release save').props.isDisabled, true);
   assert.equal(f.nodes('input')[0].props.disabled, true);
   await f.click('Check saved state');
-  assert.equal(f.button('Release unchanged save').props.isDisabled, true);
+  assert.match(f.text('p'), /keeps the last saved prompts and writes nothing to Jira/);
+  assert.match(f.text('p'), /The save was writing TEST-20/);
+  assert.equal(f.button('Release save').props.isDisabled, true);
   f.acknowledge();
-  await f.click('Release unchanged save');
+  await f.click('Release save');
   assert.deepEqual(JSON.parse(JSON.stringify(f.calls[2])), {
     name: 'resolve-save',
     payload: { revision: 7, fingerprint: 'reviewed-target', acknowledged: true },
   });
   assert.equal(f.recovered(), 1);
-  assert.equal(f.button('Release unchanged save'), undefined);
+  assert.equal(f.button('Release save'), undefined);
 });
 test('lost recovery response requires a fresh check and never repeats release automatically', async () => {
   const f = fixture([pending, Error('Lost response'), { pending: false }]);
   await f.click('Check saved state');
   f.acknowledge();
-  await f.click('Release unchanged save');
-  assert.equal(f.button('Release unchanged save'), undefined);
+  await f.click('Release save');
+  assert.equal(f.button('Release save'), undefined);
   assert.equal(f.recovered(), 0);
   // The pressed button is gone, so keyboard focus moves to the check that comes next.
   let focused = 0;
@@ -101,66 +100,6 @@ test('lost recovery response requires a fresh check and never repeats release au
     f.calls.map((c) => c.name),
     ['save-status', 'resolve-save', 'save-status'],
   );
-});
-
-const normalized = { ...pending, unchanged: false, adoptable: true, keys: ['TEST-20'] };
-test('accepting a normalized save needs an administrator, the elapsed guard and acknowledgement', async () => {
-  for (const status of [
-    { ...normalized, administrator: false },
-    { ...normalized, adoptable: false },
-  ]) {
-    const f = fixture([status]);
-    await f.click('Check saved state');
-    assert.equal(f.button('Accept saved work item'), undefined);
-    assert.equal(f.button('Release unchanged save'), undefined);
-  }
-  const waiting = fixture([{ ...normalized, waitSeconds: 30 }]);
-  await waiting.click('Check saved state');
-  assert.equal(waiting.button('Accept saved work item').props.isDisabled, true);
-  assert.match(waiting.text('p'), /Wait 30 seconds/);
-  const f = fixture([normalized, { accepted: true }]);
-  await f.click('Check saved state');
-  assert.match(f.text('p'), /TEST-20/);
-  assert.equal(f.button('Accept saved work item').props.isDisabled, true);
-  f.acknowledge();
-  await f.click('Accept saved work item');
-  assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1))), {
-    name: 'accept-save',
-    payload: { revision: 7, fingerprint: 'reviewed-target', acknowledged: true },
-  });
-  assert.equal(f.recovered(), 1);
-  assert.equal(f.button('Accept saved work item'), undefined);
-  assert.match(f.text('p'), /Saved work item accepted/);
-});
-
-const removed = { ...pending, unchanged: false, sectionRemoved: true };
-test('with the section deleted, an administrator can release a save whose outcome is unknown', async () => {
-  for (const status of [
-    { ...removed, administrator: false },
-    { ...removed, sectionRemoved: false },
-  ]) {
-    const f = fixture([status]);
-    await f.click('Check saved state');
-    assert.equal(f.button('Release save'), undefined);
-    assert.equal(f.nodes('input').length, 0);
-  }
-  const edited = fixture([{ ...removed, sectionRemoved: false }]);
-  await edited.click('Check saved state');
-  assert.match(edited.text('p'), /delete the Agent Prompts section/);
-  const f = fixture([{ ...removed, waitSeconds: 30 }, removed, { resolved: true }]);
-  await f.click('Check saved state');
-  assert.equal(f.button('Release save').props.isDisabled, true);
-  await f.click('Check saved state');
-  assert.match(f.text('p'), /no longer in the description/);
-  assert.equal(f.button('Release save').props.isDisabled, true);
-  f.acknowledge();
-  await f.click('Release save');
-  assert.deepEqual(JSON.parse(JSON.stringify(f.calls[2])), {
-    name: 'resolve-save',
-    payload: { revision: 7, fingerprint: 'reviewed-target', acknowledged: true },
-  });
-  assert.equal(f.recovered(), 1);
-  assert.equal(f.button('Release save'), undefined);
 });
 
 test('Check saved state starts with focus and keeps it while it checks', async () => {

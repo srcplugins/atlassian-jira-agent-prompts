@@ -1,8 +1,7 @@
 import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { snapshotContent, synchronizeDescription, otherSections, hash } =
-  await import('../src/description.ts');
+const { snapshotContent, synchronizeDescription } = await import('../src/description.ts');
 const paragraph = (text) => ({ type: 'paragraph', content: [{ type: 'text', text }] });
 const doc = (...content) => ({ type: 'doc', version: 1, content });
 const p = { id: '20', name: 'TEST-20: Review', content: [paragraph('Check errors')] };
@@ -17,49 +16,152 @@ test('ordinary source instructions are copied; empty and embedded content fail',
   ])
     assert.throws(() => snapshotContent(d));
 });
+const own = (...prompts) => ({
+  type: 'expand',
+  attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' },
+  content: prompts.flatMap((prompt) => [
+    { type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: prompt.name }] },
+    ...prompt.content,
+  ]),
+});
+const heading = (text) => ({
+  type: 'heading',
+  attrs: { level: 2 },
+  content: [{ type: 'text', text }],
+});
+const sync = (d, prompts = [p]) => synchronizeDescription(d, prompts, 'agent-prompts-10');
 test('save, ordered Sync and removal preserve unrelated rich ADF and input objects', () => {
   const original = doc(
     { type: 'table', attrs: { layout: 'wide' }, content: [] },
-    { type: 'expand', attrs: { title: 'Agent Prompts' }, content: [paragraph('User-owned')] },
+    { type: 'expand', attrs: { title: 'My notes' }, content: [paragraph('User-owned')] },
     { type: 'extension', attrs: { custom: 'untouched' } },
   );
   const baseline = structuredClone(original);
-  const added = synchronizeDescription(original, [p], null, 'agent-prompts-10');
+  const added = sync(original);
   assert.deepEqual(original, baseline);
-  assert.deepEqual(added.description.content.slice(0, 3), original.content);
+  assert.deepEqual(added, doc(...original.content, own(p)));
   const second = { id: '21', name: 'Second', content: [paragraph('Different instructions')] };
-  const refreshed = synchronizeDescription(
-    added.description,
-    [second, p],
-    added.managed,
-    'agent-prompts-10',
-  );
-  assert.equal(refreshed.description.content[3].content[0].content[0].text, 'Second');
-  assert.equal(refreshed.description.content[3].content[2].content[0].text, p.name);
-  assert.deepEqual(
-    synchronizeDescription(refreshed.description, [], refreshed.managed, 'agent-prompts-10')
-      .description,
-    original,
-  );
+  const refreshed = sync(added, [second, p]);
+  assert.deepEqual(refreshed, doc(...original.content, own(second, p)));
+  assert.deepEqual(sync(refreshed, []), original);
+  // Nothing to write and nothing to remove: an empty description stays empty.
+  assert.equal(sync(null, []), null);
+  assert.deepEqual(sync(null), doc(own(p)));
+  assert.deepEqual(sync(doc(), []), doc());
 });
-test('changed, missing, duplicate, nested and untracked expanders stop writes', () => {
-  const added = synchronizeDescription(doc(), [p], null, 'agent-prompts-10');
-  for (const mode of ['changed', 'missing', 'duplicate', 'nested', 'untracked']) {
-    const d = structuredClone(added.description);
-    const n = d.content[0];
-    if (mode === 'changed') n.content[1] = paragraph('Manual override');
-    if (mode === 'missing') d.content = [];
-    if (mode === 'duplicate') d.content.push(structuredClone(n));
-    if (mode === 'nested') d.content = [{ type: 'expand', content: [n] }];
-    assert.throws(() =>
-      synchronizeDescription(
-        d,
-        [p],
-        mode === 'untracked' ? null : added.managed,
-        'agent-prompts-10',
-      ),
+// Owner decisions 2026-10-22 (agent-prompts#bsqx): whatever anyone did to the section, or however
+// many Agent Prompts blocks the description holds, Save and Sync remove them all and write one
+// section from the linked prompts. Everything else stays exactly as it is.
+test('every Agent Prompts block is removed and one current section is written', () => {
+  const intro = paragraph('Intro');
+  const outro = paragraph('Outro');
+  const saved = sync(doc(intro, outro));
+  assert.deepEqual(saved, doc(intro, outro, own(p)));
+  const section = saved.content[2];
+  const edit = (change) => {
+    const d = structuredClone(saved);
+    change(d, d.content[2]);
+    return d;
+  };
+  const cases = {
+    'edited text': edit((_, n) => (n.content[1].content[0].text = 'Poopteam name')),
+    'a paragraph typed inside': edit((_, n) => n.content.push(paragraph('Typed in Jira'))),
+    retitled: edit((_, n) => (n.attrs.title = 'Prompts for agents')),
+    "Jira's editor ids": edit((_, n) =>
+      n.content.forEach((child, i) => (child.attrs = { ...child.attrs, localId: `e${i}` })),
+    ),
+    'its identifier dropped': edit((_, n) => (n.attrs = { title: 'Agent Prompts' })),
+    duplicated: edit((d) => d.content.unshift(structuredClone(section))),
+    'fake keys': edit((_, n) => (n.content = [heading('NOPE-404: Never existed'), paragraph('x')])),
+    'a hand-added prompt': edit((_, n) =>
+      n.content.push(heading('TEST-99: Added by hand'), paragraph('Do this too')),
+    ),
+    'pasted from another work item': edit((d) =>
+      d.content.push({
+        ...structuredClone(section),
+        attrs: { localId: 'agent-prompts-77', title: 'Agent Prompts' },
+      }),
+    ),
+    "a user's own block with the title": edit((d) =>
+      d.content.push({
+        type: 'expand',
+        attrs: { title: ' agent  PROMPTS ' },
+        content: [paragraph('Mine')],
+      }),
+    ),
+    '100 blocks': edit((d) => {
+      for (let i = 0; i < 99; i++)
+        d.content.push({
+          type: 'expand',
+          attrs: { title: 'Agent Prompts' },
+          content: [paragraph(`${i}`)],
+        });
+    }),
+  };
+  for (const [name, d] of Object.entries(cases)) {
+    const before = structuredClone(d);
+    const result = sync(d);
+    assert.deepEqual(d, before, name);
+    assert.deepEqual(
+      result,
+      doc(...(name === 'duplicated' ? [own(p), intro, outro] : [intro, outro, own(p)])),
+      name,
     );
   }
+  // Removing the prompts removes every block too.
+  for (const [name, d] of Object.entries(cases))
+    assert.deepEqual(sync(d, []), doc(intro, outro), name);
+});
+test('the section takes the place of the first block, or of the node that held it, or goes last', () => {
+  const block = (text) => ({
+    type: 'expand',
+    attrs: { title: 'Agent Prompts' },
+    content: [paragraph(text)],
+  });
+  const a = paragraph('A');
+  const b = paragraph('B');
+  assert.deepEqual(sync(doc(a, block('old'), b, block('older'))), doc(a, own(p), b));
+  assert.deepEqual(sync(doc(a, b)), doc(a, b, own(p)));
+  // Nested: the nested block goes, its container stays and gets an empty paragraph if nothing is
+  // left in it, and the section goes before that container at the top level.
+  const nested = {
+    type: 'nestedExpand',
+    attrs: { title: 'Agent Prompts' },
+    content: [paragraph('n')],
+  };
+  const cell = (...content) => ({ type: 'tableCell', content });
+  const table = (...cells) => ({ type: 'table', content: [{ type: 'tableRow', content: cells }] });
+  assert.deepEqual(
+    sync(doc(a, table(cell(nested), cell(b)), block('later'))),
+    doc(a, own(p), table(cell({ type: 'paragraph' }), cell(b))),
+  );
+  const users = (...content) => ({ type: 'expand', attrs: { title: 'Mine' }, content });
+  assert.deepEqual(sync(doc(users(a, nested))), doc(own(p), users(a)));
+  // A block with the app's identifier counts wherever it is and whatever its type.
+  const moved = {
+    type: 'panel',
+    attrs: { localId: 'agent-prompts-10' },
+    content: [paragraph('m')],
+  };
+  assert.deepEqual(
+    sync(doc(a, { type: 'layoutColumn', content: [moved] })),
+    doc(a, own(p), { type: 'layoutColumn', content: [{ type: 'paragraph' }] }),
+  );
+  // Other titles are the user's.
+  const notOurs = { type: 'expand', attrs: { title: 'Agent Prompts (old)' }, content: [b] };
+  assert.deepEqual(sync(doc(notOurs)), doc(notOurs, own(p)));
+});
+test('a whole description rewritten in Jira still syncs to one current section', () => {
+  const rewritten = doc(
+    heading('Rewritten'),
+    {
+      type: 'expand',
+      attrs: { localId: 'ab12', title: 'Agent Prompts' },
+      content: [paragraph('Pasted over')],
+    },
+    paragraph('All new text'),
+  );
+  assert.deepEqual(sync(rewritten), doc(heading('Rewritten'), own(p), paragraph('All new text')));
 });
 test('snapshot copies preserve meaningful formatting but remove copied editor identifiers', () => {
   const source = doc({
@@ -123,48 +225,6 @@ test('copied formatting is limited to reviewed marks; comment anchors are droppe
   );
 });
 
-// Jira's editors, the mobile one included, stamp their own localId on every node of a description
-// they save (seen on a real work item, 2026-10-21). That is not an edit to the section: Sync,
-// replacement and removal keep working. Instructions edited in Jira still refuse.
-test("Jira's editor identifiers inside the section don't make it changed", () => {
-  const list = {
-    type: 'bulletList',
-    content: [{ type: 'listItem', content: [paragraph('team name')] }],
-  };
-  const source = { id: '21', name: 'TEST-21: Intake', content: [paragraph('Validate'), list] };
-  const saved = synchronizeDescription(
-    doc(paragraph('Intro')),
-    [p, source],
-    null,
-    'agent-prompts-10',
-  );
-  let n = 0;
-  const stamp = (node, top) => {
-    if (!top) node.attrs = { ...node.attrs, localId: `e${(n++).toString(16).padStart(11, '0')}` };
-    node.content?.forEach((child) => stamp(child, false));
-  };
-  const stamped = structuredClone(saved.description);
-  stamp(stamped.content[1], true);
-  // Sync with the same prompts, a replacement and removal all accept the stamped section.
-  const synced = synchronizeDescription(stamped, [p, source], saved.managed, 'agent-prompts-10');
-  assert.deepEqual(synced.description.content[0], paragraph('Intro'));
-  assert.equal(synced.description.content.length, 2);
-  assert.doesNotThrow(() =>
-    synchronizeDescription(stamped, [source], saved.managed, 'agent-prompts-10'),
-  );
-  assert.deepEqual(
-    synchronizeDescription(stamped, [], saved.managed, 'agent-prompts-10').description,
-    doc(paragraph('Intro')),
-  );
-  // Stamped and then edited is still an edit.
-  const edited = structuredClone(stamped);
-  edited.content[1].content[1].content[0].text = 'Edited';
-  assert.throws(
-    () => synchronizeDescription(edited, [p, source], saved.managed, 'agent-prompts-10'),
-    /changed, moved or duplicated/,
-  );
-});
-
 test('prompt text is bounded at 4,000 characters inclusive', () => {
   assert.doesNotThrow(() => snapshotContent(doc(paragraph('x'.repeat(4000)))));
   assert.throws(() => snapshotContent(doc(paragraph('x'.repeat(4001)))), /1–4000/);
@@ -174,114 +234,5 @@ test('prompt text is bounded at 4,000 characters inclusive', () => {
   assert.throws(
     () => snapshotContent(doc(paragraph('x'.repeat(2000)), paragraph('y'.repeat(2001)))),
     /1–4000/,
-  );
-});
-
-test('a deleted tracked block is forgotten only for an empty selection', () => {
-  const saved = synchronizeDescription(doc(paragraph('Intro')), [p], null, 'agent-prompts-10');
-  const removed = doc(paragraph('Intro'));
-  assert.deepEqual(synchronizeDescription(removed, [], saved.managed, 'agent-prompts-10'), {
-    description: removed,
-    managed: null,
-    shape: null,
-    forgotten: true,
-  });
-  assert.throws(
-    () => synchronizeDescription(removed, [p], saved.managed, 'agent-prompts-10'),
-    /section was removed in Jira/,
-  );
-  // An untracked container with our identifier still blocks, even when forgetting.
-  const lookalike = doc({
-    type: 'expand',
-    attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' },
-    content: [paragraph('Mine')],
-  });
-  const moved = doc(paragraph('Intro'), { type: 'blockquote', content: [lookalike.content[0]] });
-  assert.throws(
-    () => synchronizeDescription(moved, [], saved.managed, 'agent-prompts-10'),
-    /changed, moved or duplicated|untracked/,
-  );
-  // A changed block is not "deleted": empty selection still refuses.
-  const changed = structuredClone(saved.description);
-  changed.content[1].content[1].content[0].text = 'Edited';
-  assert.throws(
-    () => synchronizeDescription(changed, [], saved.managed, 'agent-prompts-10'),
-    /changed, moved or duplicated in Jira\. Undo that change, or delete the section/,
-  );
-  // The way out the message names: delete the section, save no prompts, then add them again.
-  const deleted = structuredClone(changed);
-  deleted.content.splice(1, 1);
-  const forgotten = synchronizeDescription(deleted, [], saved.managed, 'agent-prompts-10');
-  assert.equal(forgotten.forgotten, true);
-  const again = synchronizeDescription(deleted, [p], forgotten.managed, 'agent-prompts-10');
-  assert.deepEqual(again.description, saved.description);
-});
-
-test('an untracked Agent Prompts section is found, kept, refused beside a new one, or replaced when named', () => {
-  const heading = (text) => ({
-    type: 'heading',
-    attrs: { level: 2 },
-    content: [{ type: 'text', text }],
-  });
-  // Saved for another work item (a clone), and one pasted without its identifier.
-  const cloned = {
-    type: 'expand',
-    attrs: { localId: 'agent-prompts-77', title: 'Agent Prompts' },
-    content: [heading('TEST-7: Old prompt'), paragraph('Old text'), heading('TEST-8: Other')],
-  };
-  const pasted = { ...cloned, attrs: { title: 'Agent Prompts ' } };
-  const users = { type: 'expand', attrs: { title: 'Agent Prompts' }, content: [paragraph('Mine')] };
-  const d = doc(paragraph('Intro'), cloned, paragraph('Outro'));
-  assert.deepEqual(otherSections(d, null), [
-    { index: 1, fingerprint: hash(cloned), keys: ['TEST-7', 'TEST-8'] },
-  ]);
-  assert.deepEqual(otherSections(doc(pasted), null)[0].keys, ['TEST-7', 'TEST-8']);
-  // A user's own expand with that title and no prompt heading is theirs.
-  assert.deepEqual(otherSections(doc(users), null), []);
-  assert.deepEqual(otherSections(doc({ type: 'panel', content: [cloned] }), null)[0].index, null);
-  // A new section is never written beside it.
-  assert.throws(
-    () => synchronizeDescription(d, [p], null, 'agent-prompts-10'),
-    /section the app didn't save\. Delete it from the description, or use its prompts here/,
-  );
-  // Named by its hash, it is replaced in place.
-  const replaced = synchronizeDescription(d, [p], null, 'agent-prompts-10', hash(cloned));
-  const own = synchronizeDescription(doc(), [p], null, 'agent-prompts-10').description.content[0];
-  assert.deepEqual(replaced.description, doc(paragraph('Intro'), own, paragraph('Outro')));
-  assert.deepEqual(otherSections(replaced.description, replaced.managed), []);
-  // With the app's own section too, the other one goes and the app's stays where it is.
-  const both = doc(cloned, paragraph('Intro'), own);
-  const tracked = synchronizeDescription(doc(paragraph('Intro')), [p], null, 'agent-prompts-10');
-  assert.deepEqual(
-    synchronizeDescription(both, [p], tracked.managed, 'agent-prompts-10', hash(cloned))
-      .description,
-    doc(paragraph('Intro'), own),
-  );
-  // Removal leaves the other section as it is.
-  assert.deepEqual(
-    synchronizeDescription(both, [], tracked.managed, 'agent-prompts-10').description,
-    doc(cloned, paragraph('Intro')),
-  );
-  // A changed, nested or second section, or nothing to replace it with, is refused.
-  const changed = hash({ ...cloned, content: [heading('TEST-7: Edited')] });
-  for (const [description, prompts, replace] of [
-    [d, [p], changed],
-    [doc({ type: 'panel', content: [cloned] }), [p], hash(cloned)],
-    [doc(cloned, pasted), [p], hash(cloned)],
-  ])
-    assert.throws(
-      () => synchronizeDescription(description, prompts, null, 'agent-prompts-10', replace),
-      /other Agent Prompts section changed/,
-    );
-  assert.throws(
-    () => synchronizeDescription(d, [], null, 'agent-prompts-10', hash(cloned)),
-    /Choose at least one prompt/,
-  );
-  // This work item's own identifier on an untracked section is replaced the same way.
-  const leftover = { ...cloned, attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' } };
-  assert.deepEqual(
-    synchronizeDescription(doc(leftover), [p], null, 'agent-prompts-10', hash(leftover))
-      .description,
-    doc(own),
   );
 });

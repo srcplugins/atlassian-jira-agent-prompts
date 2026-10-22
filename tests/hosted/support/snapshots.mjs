@@ -200,7 +200,8 @@ export async function snapshotJourney({
   await expect(combo).toBeEnabled();
   owned.run.state.pickerMs = Date.now() - started;
   await expect(editor(page).getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
-  await expect(editor(page).getByRole('button', { name: 'Sync', exact: true })).toBeDisabled();
+  // With no prompts saved, Sync is still offered: it removes any Agent Prompts section added by hand.
+  await expect(editor(page).getByRole('button', { name: 'Sync', exact: true })).toBeEnabled();
 
   await observeAction(
     page,

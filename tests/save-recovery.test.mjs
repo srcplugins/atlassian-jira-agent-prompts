@@ -70,17 +70,12 @@ function fixture() {
 async function pending(f, { phase = 'submitted', age = 120001 } = {}) {
   await f.p.cas('10', f.stored()?.revision ?? 0, {
     ids: [],
-    managed: null,
     pending: {
       before: hash([f.target.fields.description, []]),
       after: 'unobserved',
       ids: ['20'],
-      managed: null,
       keys: ['TEST-20'],
-      shape: 'unobserved',
       beforeField: hash(['field', []]),
-      beforeBlock: hash([]),
-      afterBlock: 'unobserved',
       attemptId: 'original',
       phase,
       started: Date.now() - age,
@@ -259,40 +254,13 @@ test('a read fences a paused sender and its late cleanup preserves a replacement
   assert.equal(f.stored().data.pending, undefined);
 });
 
-test('release is refused when Jira no longer holds the pre-save state, even with a current fingerprint', async () => {
+test('a save Jira shows landed settles as saved and is never released', async () => {
   const f = fixture();
-  // A changed section is still present; with no section at all, release is allowed.
-  f.target.fields.description.content.push({
-    type: 'expand',
-    attrs: { localId: 'agent-prompts-10', title: 'Agent Prompts' },
-    content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Edited copy' }] }],
-  });
-  await f.p.cas('10', 0, {
-    ids: [],
-    managed: null,
-    pending: {
-      before: hash([doc('Something else'), []]),
-      after: 'unobserved',
-      ids: ['20'],
-      managed: null,
-      keys: ['TEST-20'],
-      shape: 'unobserved',
-      beforeField: hash(['field', []]),
-      beforeBlock: 'a block Jira no longer holds',
-      afterBlock: 'unobserved',
-      attemptId: 'original',
-      phase: 'submitted',
-      started: Date.now() - 120_001,
-    },
-  });
-  const status = await f.service.saveStatus(c);
-  assert.equal(status.unchanged, false);
-  assert.equal(status.sectionRemoved, false);
-  const before = structuredClone(f.stored());
-  await assert.rejects(
-    f.service.resolveSave(c, { ...status, acknowledged: true }),
-    /differs from the pre-save state/,
-  );
-  assert.deepEqual(f.stored(), before);
+  await pending(f);
+  // Jira applied the PUT and its response was lost: the field holds the keys it sent.
+  f.target.fields.customfield_1 = ['TEST-20'];
+  f.target.fields.updated += 'l';
+  assert.deepEqual(await f.service.saveStatus(c), { pending: false });
+  assert.deepEqual(f.stored().data, { ids: ['20'], keys: ['TEST-20'] });
   assert.equal(f.writes(), 0);
 });

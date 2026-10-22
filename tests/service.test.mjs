@@ -1,7 +1,8 @@
 import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { createService, JiraRejected, UserError, limited, hash } = await import('../src/service.ts');
+const { createService, JiraRejected, UserError, limited } = await import('../src/service.ts');
+const { JiraHttpError } = await import('../src/shared/jira.mjs');
 const { sourceContent } = await import('../src/prompt-text.ts');
 const { createSettings } = await import('../src/settings.ts');
 const { screenFixture } = await import('./screen-fixture.mjs');
@@ -91,20 +92,39 @@ test('saved snapshots stay unchanged until an explicit Sync, then removal preser
   await f.service.save(c, { ...saved, ids: [] });
   assert.deepEqual(f.target.fields.description, original);
 });
-test('stale work item, modified managed content and moved source stop writes', async () => {
-  for (const mode of ['stale', 'managed', 'moved']) {
+test('only a stale selection stops a save; description edits and a changed section do not', async () => {
+  for (const mode of ['stale', 'edited', 'managed', 'moved']) {
     const f = fixture();
     let loaded = await f.service.load(c);
-    if (mode === 'stale') f.target.fields.updated = '2';
+    if (mode === 'stale') {
+      await f.service.save(c, { ...loaded, ids: ['20'] });
+      await assert.rejects(f.service.save(c, { ...loaded, ids: [] }), /work item changed/);
+      assert.equal(f.calls(), 1);
+      continue;
+    }
+    if (mode === 'edited') {
+      f.target.fields.description.content.push(doc('Typed while the field was open').content[0]);
+      f.target.fields.updated = '2';
+    }
     if (mode === 'moved') f.source.fields.project.id = '2';
     if (mode === 'managed') {
       await f.service.save(c, { ...loaded, ids: ['20'] });
       f.target.fields.description.content[1].attrs.resourceId = 'Manual edit';
+      f.target.fields.description.content[1].content.push(doc('Typed inside').content[0]);
       loaded = await f.service.load(c);
     }
-    const before = f.calls();
-    await assert.rejects(f.service.save(c, { ...loaded, ids: ['20'] }));
-    assert.equal(f.calls(), before);
+    const saved = await f.service.save(c, { ...loaded, ids: ['20'] });
+    const text = JSON.stringify(f.target.fields.description);
+    if (mode === 'moved') {
+      assert.deepEqual(saved.dropped, ['TEST-20']);
+      assert.deepEqual(f.target.fields.customfield_1 ?? [], []);
+      assert.doesNotMatch(text, /agent-prompts-10/);
+      continue;
+    }
+    assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
+    assert.doesNotMatch(text, /Manual edit|Typed inside/);
+    assert.match(text, /Check errors/);
+    if (mode === 'edited') assert.match(text, /Typed while the field was open/);
   }
 });
 test('lost successful response recovers by observation without repeating mutation', async () => {
@@ -228,7 +248,9 @@ test('type replacement preserves existing selected sources but rejects new selec
   current = await f.service.load(c);
   await f.service.save(c, { ...current, ids: [] });
   current = await f.service.load(c);
-  await assert.rejects(f.service.save(c, { ...current, ids: ['20'] }), /changed type/);
+  // Chosen again, a prompt of the previous type is no longer a prompt: it is dropped.
+  assert.deepEqual((await f.service.save(c, { ...current, ids: ['20'] })).dropped, ['TEST-20']);
+  assert.deepEqual(f.target.fields.customfield_1, []);
 });
 
 test('selected current-type prompts outside search results retain their visible metadata', async () => {
@@ -381,7 +403,7 @@ test('prompt targets without selected prompts still reject loading and forged sa
   assert.equal(f.calls(), 0);
 });
 
-test('cleanup after a target becomes a prompt preserves permission and block-ownership guards', async () => {
+test('cleanup after a target becomes a prompt needs Edit work items and rewrites a changed section', async () => {
   for (const mode of ['denied', 'modified']) {
     const f = fixture();
     await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
@@ -389,16 +411,19 @@ test('cleanup after a target becomes a prompt preserves permission and block-own
     f.ports.retainedTypes = async () => ['3'];
     if (mode === 'modified') f.target.fields.description.content[1].attrs.resourceId = 'Changed';
     const loaded = await f.service.load(c);
-    if (mode === 'denied')
+    if (mode === 'denied') {
       f.ports.allowed = async () => {
         throw new UserError('Missing Edit work items');
       };
-    await assert.rejects(
-      f.service.save(c, { ...loaded, ids: [] }),
-      /Missing Edit work items|changed, moved or duplicated/,
-    );
-    assert.equal(f.calls(), 1);
-    assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
+      await assert.rejects(f.service.save(c, { ...loaded, ids: [] }), /Missing Edit work items/);
+      assert.equal(f.calls(), 1);
+      assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
+    } else {
+      await f.service.save(c, { ...loaded, ids: [] });
+      assert.equal(f.calls(), 2);
+      assert.deepEqual(f.target.fields.customfield_1, []);
+      assert.deepEqual(f.target.fields.description, doc('Keep this'));
+    }
   }
 });
 
@@ -574,62 +599,73 @@ test('the Space settings page opens in company-managed and team-managed Software
   }
 });
 
-test('an Agent Prompts section the field does not track is reported with its prompts and replaced only when named', async () => {
+test('Save and Sync drop prompts that are gone and stop only for one the user may not see', async () => {
   const f = fixture();
-  const heading = (text) => ({
-    type: 'heading',
-    attrs: { level: 2 },
-    content: [{ type: 'text', text }],
+  const prompt = (id, extra = {}) => {
+    const p = structuredClone(f.source);
+    Object.assign(p, { id, key: `TEST-${id}` });
+    Object.assign(
+      p.fields,
+      { summary: `Prompt ${id}`, description: sourceDoc(`Text ${id}`) },
+      extra,
+    );
+    return p;
+  };
+  const prompts = { 20: f.source, 21: prompt('21'), 22: prompt('22'), 23: prompt('23') };
+  f.ports.issue = async (id) => {
+    if (id === '10') return structuredClone(f.target);
+    if (!prompts[id]) throw new JiraHttpError(404);
+    return structuredClone(prompts[id]);
+  };
+  // 23 has an issue security level when it is copied.
+  prompts[23].fields.security = { id: '10100' };
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20', '21', '22', '23'] });
+  assert.deepEqual(f.target.fields.customfield_1, ['TEST-20', 'TEST-21', 'TEST-22', 'TEST-23']);
+  // Jira now finds neither 21 (deleted) nor 23 (it has a security level the user isn't in): the
+  // user may not see 23, so nothing is written, and the message names it.
+  delete prompts[21];
+  delete prompts[23];
+  const before = structuredClone(f.target.fields);
+  const calls = f.calls();
+  await assert.rejects(f.service.save(c, { sync: true }), {
+    name: 'Error',
+    message:
+      "Nothing was synced: you can't see TEST-23 in Jira. A Jira administrator manages who can see it.",
   });
-  const leftover = {
-    type: 'expand',
-    attrs: { localId: 'agent-prompts-99', title: 'Agent Prompts' },
-    content: [
-      heading('TEST-20: Review'),
-      doc('Old copy').content[0],
-      heading('TEST-30: Deleted'),
-      heading('TEST-10: Itself'),
-      heading('TEST-40: Retired'),
-    ],
-  };
-  f.target.fields.description.content.push(leftover);
-  const original = structuredClone(f.target.fields.description);
-  const issue = f.ports.issue;
-  const retired = structuredClone(f.source);
-  Object.assign(retired, { id: '40', key: 'TEST-40' });
-  retired.fields.status = { statusCategory: { key: 'done' } };
-  f.ports.issue = async (id, field) => {
-    if (id === 'TEST-30') throw new UserError('Not found.');
-    if (id === 'TEST-40') return structuredClone(retired);
-    return issue(id === 'TEST-10' ? '10' : id === 'TEST-20' ? '20' : id, field);
-  };
+  assert.equal(f.calls(), calls);
+  assert.deepEqual(f.target.fields, before);
+  // Without 23, Sync drops 21 and moves on; 22 moved to another space and is dropped too.
   const loaded = await f.service.load(c);
-  assert.deepEqual(loaded.otherSection, {
-    count: 1,
-    replace: hash(leftover),
-    prompts: [{ id: '20', key: 'TEST-20', name: 'Review' }],
-    unavailable: ['TEST-30', 'TEST-10', 'TEST-40'],
-  });
-  const input = { ...loaded };
-  delete input.otherSection;
-  // Without naming it, a save that writes a section is refused and Jira is untouched.
-  await assert.rejects(
-    f.service.save(c, { ...input, ids: ['20'] }),
-    /section the app didn't save\. Delete it from the description, or use its prompts here/,
-  );
-  for (const replace of ['', 'x'.repeat(64), 42])
-    await assert.rejects(f.service.save(c, { ...input, ids: ['20'], replace }), /Invalid section/);
-  assert.equal(f.calls(), 0);
-  assert.deepEqual(f.target.fields.description, original);
-  // Named, it is replaced by the app's own section in its place.
-  await f.service.save(c, { ...input, ids: ['20'], replace: hash(leftover) });
-  assert.equal(f.calls(), 1);
+  await f.service.save(c, { ids: ['20', '21', '22'], revision: loaded.revision });
+  prompts[22].fields.project = { id: '2' };
+  prompts[22].key = 'OTHER-1';
+  prompts[20].fields.description = sourceDoc('Check errors again');
+  const synced = await f.service.save(c, { sync: true });
+  assert.deepEqual(synced.ids, ['20']);
+  assert.deepEqual(synced.dropped, ['TEST-22']);
   assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
-  const [kept, section, ...rest] = f.target.fields.description.content;
-  assert.deepEqual(kept, original.content[0]);
-  assert.deepEqual(rest, []);
-  assert.equal(section.attrs.localId, 'agent-prompts-10');
-  assert.match(JSON.stringify(section), /Check errors/);
-  assert.doesNotMatch(JSON.stringify(section), /Old copy/);
-  assert.equal((await f.service.load(c)).otherSection, undefined);
+  const section = f.target.fields.description.content.at(-1);
+  assert.match(JSON.stringify(section), /Check errors again/);
+  assert.doesNotMatch(JSON.stringify(section), /Text 2[123]/);
+  // Every prompt gone: the section is removed and the field cleared.
+  delete prompts[20];
+  const emptied = await f.service.save(c, { sync: true });
+  assert.deepEqual(emptied, { revision: emptied.revision, ids: [], dropped: ['TEST-20'] });
+  assert.deepEqual(f.target.fields.description, doc('Keep this'));
+  assert.deepEqual(f.target.fields.customfield_1, []);
+  assert.deepEqual((await f.service.load(c)).ids, []);
+});
+test('Sync writes the saved prompts whatever the client last saw', async () => {
+  const f = fixture();
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
+  // Another tab removed the prompts, and someone edited the description since.
+  await f.service.save(c, { ids: [], revision: (await f.service.load(c)).revision });
+  f.target.fields.description.content.unshift(doc('Added in Jira').content[0]);
+  f.target.fields.updated = '9';
+  const synced = await f.service.save(c, { sync: true });
+  assert.deepEqual(synced.ids, []);
+  assert.deepEqual(
+    f.target.fields.description.content.map((n) => n.content[0].text),
+    ['Added in Jira', 'Keep this'],
+  );
 });
