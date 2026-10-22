@@ -1061,14 +1061,21 @@ test('AP-18 board side panel: a prompt saved there reloads the board with the pa
     owned.run.persist();
     await searchable(owned, initial.state.data.type, source.id);
     // The board shows the new work item once Jira has indexed it; open it from its card.
-    const card = page.getByText(targetIssue.fields.summary, { exact: true });
+    // By key: another run's leftover card can have the same summary on the same board.
+    const card = page
+      .locator(`#card-${targetIssue.key}`)
+      .getByText(targetIssue.fields.summary, { exact: true });
     await expect(async () => {
       await page.goto(board);
       await expect(card).toBeVisible({ timeout: 10000 });
     }).toPass({ timeout: 60000, intervals: [3000] });
-    await card.click();
+    // A board still settling can drop a click on a card (atlassian-forge-test-framework#vaf4: the
+    // URL stayed /boards/187), so click again until the work item opens.
     const panel = new RegExp(`/boards/\\d+\\?(.*&)?selectedIssue=${targetIssue.key}(&|$)`);
-    await expect(page).toHaveURL(panel);
+    await expect(async () => {
+      if (!panel.test(page.url())) await card.click({ timeout: 10000 });
+      await expect(page).toHaveURL(panel, { timeout: 5000 });
+    }).toPass({ timeout: 60000, intervals: [2000] });
     // A card opens Jira's modal over the board; its Switch to sidebar shows the work item in the
     // board's side panel instead. Jira keeps that choice until the page loads again.
     const toSidebar = page.getByRole('button', { name: 'Switch to sidebar', exact: true });
