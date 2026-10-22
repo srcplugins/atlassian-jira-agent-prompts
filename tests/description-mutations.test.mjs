@@ -1,18 +1,18 @@
 import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { createService, UserError, hash } = await import('../src/service.ts');
-const { DescriptionError } = await import('../src/description.ts');
+const { createService } = await import('../src/service.ts');
+const { JiraHttpError } = await import('../src/shared/jira.mjs');
 
 // Seeded sweep of the edits people make to a work item's description in Jira while it has an
 // Agent Prompts section: user content added, edited, moved and deleted around it; editor ids
 // stamped; the section edited inside, retitled, moved, nested, duplicated, deleted or stripped of
-// its id; and other work items' sections pasted in. After each round the user saves through the
-// real service. Every save must either keep everything the user wrote (dropping only the section
-// exactly as the app wrote it, or the one section the user chose to replace) or be refused without
-// a write, with a message from a known set whose steps, followed as a user would, lead back to a
-// working field. Expected results come from this file's own model of the description, not from the
-// service's checks.
+// its id; other work items' sections and blocks of the user's own with the same title pasted in;
+// the whole description rewritten; prompts deleted in Jira. After each round the user saves or
+// syncs through the real service. Owner rule (2026-10-22, agent-prompts#bsqx): every save
+// succeeds. It removes every Agent Prompts block, wherever it is and whatever it holds, writes one
+// section with the linked prompts that still exist, and keeps everything else exactly as it was.
+// Expected results come from this file's own model of the description, not from the service.
 const c = { accountId: 'u', projectId: '1', issueId: '10' };
 const FIELD = 'customfield_1';
 const OWN = 'agent-prompts-10';
@@ -30,61 +30,47 @@ function rng(seed) {
   return () => (s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32;
 }
 
-// The refusals a description edit may cause, and nothing else.
-const CHANGED =
-  /^The Agent Prompts section was changed, moved or duplicated in Jira\. Undo that change, or delete the section from the description, remove all prompts here and save, then add them again\.$/;
-const REMOVED =
-  /^The Agent Prompts section was removed in Jira\. Remove all prompts and save, then add them again\.$/;
-const OTHER =
-  /^The description has an Agent Prompts section the app didn't save\. Delete it from the description, or use its prompts here to replace it, then save again\.$/;
-const REOPEN =
-  /^The other Agent Prompts section changed in the description\. Reopen the field and try again\.$/;
-const REFUSALS = { changed: CHANGED, removed: REMOVED, other: OTHER, reopen: REOPEN };
-
-// An Agent Prompts section as the spec defines one: an expand carrying the app's identifier, or
-// titled Agent Prompts and listing prompts by their headings. Everything else in the description
-// is the user's, including a copy they both retitled and pasted without its identifier.
-const promptHeading = (n) =>
-  n.type === 'heading' && /^TEST-\d+: /.test((n.content ?? []).map((t) => t.text ?? '').join(''));
-const sectionLike = (n) =>
-  (n.type === 'expand' || n.type === 'nestedExpand') &&
-  (String(n.attrs?.localId ?? '').startsWith('agent-prompts-') ||
-    (String(n.attrs?.title ?? '')
-      .trim()
-      .toLowerCase() === 'agent prompts' &&
-      (n.content ?? []).some(promptHeading)));
-/** A copy without the ids editors stamp on nodes inside a section. */
-const unstamped = (n) => {
-  const copy = { ...n };
-  if (copy.attrs && 'localId' in copy.attrs) {
-    const rest = { ...copy.attrs };
-    delete rest.localId;
-    if (Object.keys(rest).length) copy.attrs = rest;
-    else delete copy.attrs;
+// An Agent Prompts block as the owner defined it: any expand titled Agent Prompts, whatever its
+// case and spacing, or anything carrying an app section's identifier.
+const block = (n) =>
+  String(n.attrs?.localId ?? '').startsWith('agent-prompts-') ||
+  ((n.type === 'expand' || n.type === 'nestedExpand') &&
+    String(n.attrs?.title ?? '')
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+      .join(' ') === 'agent prompts');
+/** The description with every block gone, and the top-level place of the first one (the place of
+ * the top-level node that held it, when it was nested). A container left empty holds an empty
+ * paragraph. */
+function userContent(d) {
+  let at;
+  const strip = (nodes) =>
+    nodes.flatMap((n) => {
+      if (block(n)) return [];
+      if (!n.content) return [n];
+      const content = strip(n.content);
+      return [
+        { ...n, content: content.length || !n.content.length ? content : [{ type: 'paragraph' }] },
+      ];
+    });
+  const content = [];
+  for (const n of d?.content ?? []) {
+    const kept = strip([n]);
+    if (JSON.stringify(kept) !== JSON.stringify([n])) at ??= content.length;
+    content.push(...kept);
   }
-  if (n.content) copy.content = n.content.map(unstamped);
-  return copy;
-};
-/** The section exactly as the app last wrote it, give or take editor ids inside. */
-const pristine = (n, last) =>
-  !!last &&
-  n.type === 'expand' &&
-  JSON.stringify(n.attrs) === JSON.stringify(last.attrs) &&
-  JSON.stringify((n.content ?? []).map(unstamped)) === JSON.stringify(last.content);
-const idCount = (d, id) => {
+  return { content, at: at ?? content.length };
+}
+const blocksIn = (d) => {
   let count = 0;
   const visit = (n) => {
-    if (n.attrs?.localId === id) count++;
+    if (block(n)) count++;
     n.content?.forEach(visit);
   };
   d?.content.forEach(visit);
   return count;
 };
-/** Removes nodes matching `drop` at any depth. */
-const without = (nodes, drop) =>
-  nodes
-    .filter((n) => !drop(n))
-    .map((n) => (n.content ? { ...n, content: without(n.content, drop) } : n));
 
 function world(seed) {
   const r = rng(seed);
@@ -117,12 +103,6 @@ function world(seed) {
         content: [{ type: 'listItem', content: [paragraph(`Step ${n}`)] }],
       }),
       () => ({ type: 'expand', attrs: { title: 'Notes' }, content: [paragraph(`Aside ${n}`)] }),
-      // A user's own expand with the app's title but no prompt headings is still theirs.
-      () => ({
-        type: 'expand',
-        attrs: { title: 'Agent Prompts' },
-        content: [paragraph(`My own list ${n}`)],
-      }),
       () => ({
         type: 'table',
         content: [
@@ -147,7 +127,8 @@ function world(seed) {
   const lookup = (id) => {
     if (id === '10' || id === 'TEST-10') return target;
     const source = sources[id] ?? Object.values(sources).find((s) => s.key === id);
-    if (!source) throw new UserError('Not found.');
+    // Jira's answer for a work item that was deleted or never existed.
+    if (!source) throw new JiraHttpError(404);
     return source;
   };
   const ports = {
@@ -157,10 +138,10 @@ function world(seed) {
     field: async () => FIELD,
     allowed: async () => {},
     search: async () => ({
-      prompts: SOURCES.map((id) => ({
-        id,
-        key: sources[id].key,
-        name: sources[id].fields.summary,
+      prompts: Object.values(sources).map((s) => ({
+        id: s.id,
+        key: s.key,
+        name: s.fields.summary,
       })),
       incomplete: false,
     }),
@@ -227,7 +208,7 @@ const nest = (w, node) =>
     }),
   ])();
 const ownIndex = (d) => d.content.findIndex((n) => n.attrs?.localId === OWN);
-const userIndexes = (d) => d.content.flatMap((n, i) => (sectionLike(n) ? [] : [i]));
+const userIndexes = (d) => d.content.flatMap((n, i) => (block(n) ? [] : [i]));
 const textsIn = (node) => {
   const found = [];
   const visit = (n) => {
@@ -348,6 +329,21 @@ const tampering = {
   'paste another section': (w, d) => {
     d.content.splice(Math.floor(w.r() * (d.content.length + 1)), 0, otherSection(w, w.r() < 0.3));
   },
+  "add a block of the user's own with the title": (w, d) => {
+    const block = {
+      type: 'expand',
+      attrs: { title: w.pick(['Agent Prompts', 'AGENT PROMPTS', ' agent  prompts ']) },
+      content: [paragraph(`My own list ${w.hex()}`)],
+    };
+    d.content.splice(
+      Math.floor(w.r() * (d.content.length + 1)),
+      0,
+      w.r() < 0.3 ? nest(w, block) : block,
+    );
+  },
+  'rewrite the whole description': (w, d) => {
+    d.content = [heading('Rewritten', 3), otherSection(w, false), paragraph('All new')];
+  },
 };
 
 async function sweep(seed, stats) {
@@ -355,219 +351,112 @@ async function sweep(seed, stats) {
   const trace = [`seed ${seed}`];
   const fail = (message) => assert.fail(`${message}\n${trace.join('\n')}`);
   const count = (key) => (stats[key] = (stats[key] ?? 0) + 1);
-  let last = null; // The section as the app last wrote it.
 
-  /** Opens the field and saves `choose(loaded)`, checking the outcome against the model. */
-  async function attempt(choose) {
+  /** Opens the field, then saves `ids` (or syncs, with `sync`), checking the outcome. */
+  async function save(ids, sync = false) {
     let loaded;
     try {
       loaded = await w.service.load(c);
     } catch (error) {
       fail(`The field did not open: ${error.message}`);
     }
-    const { ids, replace } = choose(loaded);
-    trace.push(`  save [${ids}]${replace ? ' replacing the other section' : ''}`);
+    const linked = sync ? loaded.ids : ids;
+    trace.push(`  ${sync ? 'sync' : 'save'} [${linked}]`);
     const before = structuredClone(w.target.fields.description);
-    const field = structuredClone(w.target.fields[FIELD]);
-    const stored = w.stored();
-    const writes = w.writes();
+    let result;
     try {
-      await w.service.save(c, {
-        ids,
-        revision: loaded.revision,
-        fingerprint: loaded.fingerprint,
-        ...(replace ? { replace } : {}),
-      });
+      result = await w.service.save(c, sync ? { sync: true } : { ids, revision: loaded.revision });
     } catch (error) {
-      // Both reach the user as the field's message (integration.ts).
-      if (!(error instanceof UserError || error instanceof DescriptionError)) throw error;
-      trace.push(`  refused: ${error.message}`);
-      const kind = Object.entries(REFUSALS).find(([, m]) => m.test(error.message))?.[0];
-      if (!kind) fail(`Unexpected refusal: ${error.message}`);
-      assert.equal(w.writes(), writes, `A refused save wrote to Jira.\n${trace.join('\n')}`);
-      assert.deepEqual(w.target.fields.description, before);
-      assert.deepEqual(w.target.fields[FIELD], field);
-      assert.deepEqual(w.stored(), stored, `A refused save changed storage.\n${trace.join('\n')}`);
-      count(`refused: ${kind}`);
-      return { ok: false, message: error.message, loaded };
+      fail(`A ${sync ? 'Sync' : 'save'} was refused: ${error.message}`);
     }
+    const existing = linked.filter((id) => w.sources[id]);
+    const gone = linked.filter((id) => !w.sources[id]);
+    assert.deepEqual(result.ids, existing, trace.join('\n'));
+    assert.deepEqual(
+      result.dropped ?? [],
+      // A prompt Jira can't find is named by the key it was saved with.
+      gone.map((id) => (loaded.ids.includes(id) ? `TEST-${id}` : `the prompt with ID ${id}`)),
+      trace.join('\n'),
+    );
+    if (gone.length) count('dropped deleted prompts');
     const after = w.target.fields.description;
-    // The app's own section holds exactly the chosen prompts, once, at the top level.
-    if (ids.length) {
-      if (idCount(after, OWN) !== 1)
-        fail('The saved description does not have exactly one section.');
-      assert.deepEqual(
-        after.content.find((n) => n.attrs?.localId === OWN),
-        expectedSection(w, ids),
-        trace.join('\n'),
-      );
-      // The app never writes its section beside another one.
-      const sections = [];
-      const visit = (n) => (sectionLike(n) ? sections.push(n) : n.content?.forEach(visit));
-      after.content.forEach(visit);
-      if (sections.length !== 1) fail('The app saved its section beside another one.');
-    } else if (idCount(after, OWN)) fail('A removal left a node with the section id.');
+    const expected = userContent(before);
+    if (existing.length) expected.content.splice(expected.at, 0, expectedSection(w, existing));
     assert.deepEqual(
-      w.target.fields[FIELD],
-      ids.map((id) => `TEST-${id}`),
+      after?.content ?? [],
+      expected.content,
+      `The save lost, changed or misplaced content.\n${trace.join('\n')}`,
     );
-    // Everything else is the user's and must be kept verbatim, in order. The save may drop only
-    // the app's section as it wrote it, and the one section the user named to replace.
-    let droppedOwn = false;
-    let droppedOther = false;
-    const kept = (before?.content ?? []).filter((n) => {
-      if (!droppedOwn && pristine(n, last)) return !(droppedOwn = true);
-      if (replace && !droppedOther && hash(n) === replace) {
-        if (!sectionLike(n)) fail('The save replaced user content.');
-        return !(droppedOther = true);
-      }
-      return true;
-    });
+    assert.equal(blocksIn(after), existing.length ? 1 : 0, trace.join('\n'));
     assert.deepEqual(
-      (after?.content ?? []).filter((n) => n.attrs?.localId !== OWN),
-      kept,
-      `The save lost or changed user content.\n${trace.join('\n')}`,
+      w.target.fields[FIELD] ?? [],
+      existing.map((id) => `TEST-${id}`),
     );
-    last = ids.length ? expectedSection(w, ids) : null;
-    count(ids.length ? 'saved' : 'removed');
-    return { ok: true };
+    count(existing.length ? (sync ? 'synced' : 'saved') : 'removed');
+    return existing;
   }
-  const save = (ids, replace) => attempt(() => ({ ids, replace }));
 
   // A work item that already uses some prompts.
   let selected = SOURCES.filter(() => w.r() < 0.5).slice(0, 3);
   if (!selected.length) selected = [w.pick(SOURCES)];
   trace.push('start');
-  if (!(await save(selected)).ok) fail('The first save was refused.');
+  selected = await save(selected);
 
   for (let round = 0; round < ROUNDS; round++) {
-    const start = structuredClone(w.target.fields.description);
-    // Only the app's own section, unchanged: every edit a user makes around it must save.
-    const clean = (() => {
-      const found = [];
-      const visit = (n) => {
-        if (sectionLike(n)) found.push(n);
-        else n.content?.forEach(visit);
-      };
-      start?.content.forEach(visit);
-      return found.every((n) => start.content.includes(n) && pristine(n, last));
-    })();
     const made = [];
     for (let k = 1 + Math.floor(w.r() * 3); k > 0; k--) {
-      const harmless = w.r() < 0.5;
-      const [name, change] = w.pick(Object.entries(harmless ? benign : tampering));
+      const [name, change] = w.pick(Object.entries(w.r() < 0.5 ? benign : tampering));
       let applied = true;
       w.edit((d) => {
         applied = change(w, d) !== false;
       });
-      if (applied) made.push({ name, harmless });
+      if (applied) made.push(name);
     }
     if (w.r() < 0.15) {
       // Bulk edit, automation or REST changes the field itself.
       w.target.fields[FIELD] = w.pick([[], ['TEST-21'], ['TEST-99', 'TEST-20']]);
       w.target.fields.updated += 'f';
-      made.push({ name: 'field edited in Jira', harmless: false });
+      made.push('field edited in Jira');
     }
     if (w.r() < 0.3) {
       const id = w.pick(SOURCES);
-      w.sources[id].fields.description = doc(paragraph(`Instructions ${id} v${round}`));
-      made.push({ name: `prompt ${id} rewritten`, harmless: true });
-    }
-    let desired = w.pick([
-      () => selected,
-      () => [],
-      () => SOURCES.filter(() => w.r() < 0.5).slice(0, 5),
-    ])();
-    trace.push(`round ${round}: ${made.map((m) => m.name).join(', ') || 'no edit'}`);
-    made.forEach((m) => count(`edit: ${m.name}`));
-
-    let result = await save(desired);
-    if (!result.ok && clean && made.every((m) => m.harmless))
-      fail('A save was refused after edits that leave the section as the app wrote it.');
-    // Follow the refusal's own steps, as a user would, until the field saves.
-    let undoable = true;
-    for (let steps = 0; !result.ok; steps++) {
-      if (steps > 8) fail('The steps in the messages did not lead back to a working field.');
-      const { message, loaded } = result;
-      if (CHANGED.test(message) && undoable && w.r() < 0.4) {
-        trace.push('  user undoes the edits');
-        count('recovery: undo');
-        w.edit((d) => Object.assign(d, structuredClone(start)));
-        result = await save(desired);
-      } else if (CHANGED.test(message) || REMOVED.test(message)) {
-        if (CHANGED.test(message)) {
-          // The user deletes what they see as the section: every copy, or just some of them.
-          const all = w.r() < 0.6;
-          trace.push(`  user deletes ${all ? 'every section' : 'some sections'}`);
-          count('recovery: delete sections');
-          w.edit((d) => {
-            d.content = without(d.content, (n) => sectionLike(n) && (all || w.r() < 0.5));
-          });
-        }
-        count('recovery: remove all, then add again');
-        result = await save([]);
-        if (result.ok) result = await save(desired);
-      } else if (OTHER.test(message)) {
-        const other = loaded.otherSection;
-        const use = [...new Set([...desired, ...(other?.prompts ?? []).map((p) => p.id)])].slice(
-          0,
-          5,
-        );
-        if (other?.replace && use.length && w.r() < 0.5) {
-          trace.push('  user uses its prompts');
-          count('recovery: replace');
-          desired = use;
-          result = await save(desired, other.replace);
-        } else {
-          trace.push('  user deletes the other sections');
-          count('recovery: delete other sections');
-          w.edit((d) => {
-            d.content = without(
-              d.content,
-              (n) => sectionLike(n) && !(d.content.includes(n) && pristine(n, last)),
-            );
-          });
-          result = await save(desired);
-        }
-      } else {
-        count('recovery: reopen');
-        result = await save(desired);
-      }
-      undoable = false;
-    }
-    selected = desired.length ? desired : [w.pick(SOURCES)];
-    if (!desired.length) {
-      // The field works again: adding prompts back must save too.
-      trace.push('  add prompts back');
-      const again = await save(selected);
-      if (!again.ok && !OTHER.test(again.message)) fail('Prompts could not be added back.');
-      if (!again.ok) {
-        w.edit((d) => {
-          d.content = without(d.content, sectionLike);
-        });
-        if (!(await save(selected)).ok) fail('Prompts could not be added back.');
+      if (w.sources[id]) {
+        w.sources[id].fields.description = doc(paragraph(`Instructions ${id} v${round}`));
+        made.push('a prompt rewritten');
       }
     }
+    if (w.r() < 0.15 && selected.length) {
+      delete w.sources[w.pick(selected)];
+      made.push('a linked prompt deleted');
+    }
+    trace.push(`round ${round}: ${made.join(', ') || 'no edit'}`);
+    made.forEach((m) => count(`edit: ${m}`));
+    const remaining = SOURCES.filter((id) => w.sources[id]);
+    const choice = w.r();
+    if (choice < 0.45 && selected.length) selected = await save([], true);
+    else
+      selected = await save(
+        choice < 0.6
+          ? []
+          : choice < 0.8
+            ? selected
+            : remaining.filter(() => w.r() < 0.5).slice(0, 5),
+      );
   }
 }
 
-test('every description edit either saves without losing user content or is refused with steps that work', async () => {
+test("every description edit is put right by the next Save or Sync, keeping the user's content", async () => {
   const stats = {};
   for (let seed = 1; seed <= SEEDS; seed++) await sweep(seed, stats);
-  // The sweep must keep reaching every edit, refusal and recovery path.
+  // The sweep must keep reaching every edit and outcome.
   for (const name of [...Object.keys(benign), ...Object.keys(tampering)])
     assert.ok(stats[`edit: ${name}`] >= 20, `${name}: ${stats[`edit: ${name}`] ?? 0}`);
-  for (const path of [
-    'recovery: undo',
-    'recovery: delete sections',
-    'recovery: remove all, then add again',
-    'recovery: replace',
-    'recovery: delete other sections',
+  for (const outcome of [
+    'saved',
+    'synced',
+    'removed',
+    'dropped deleted prompts',
+    'edit: a linked prompt deleted',
   ])
-    assert.ok(stats[path] >= 10, `${path}: ${stats[path] ?? 0}`);
-  for (const kind of ['changed', 'removed', 'other'])
-    assert.ok(
-      stats[`refused: ${kind}`] >= 10,
-      `refused ${kind}: ${stats[`refused: ${kind}`] ?? 0}`,
-    );
+    assert.ok(stats[outcome] >= 20, `${outcome}: ${stats[outcome] ?? 0}`);
 });

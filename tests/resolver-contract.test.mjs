@@ -26,7 +26,6 @@ const resolvers = Object.keys(registerResolvers(sdk()));
 const revisioned = new Set([
   'save',
   'resolve-save',
-  'accept-save',
   'configuration-start',
   'configuration-advance',
   'configuration-stop',
@@ -40,7 +39,6 @@ const context = {
 
 test('the resolver set is exactly the supported surface', () => {
   assert.deepEqual(resolvers.sort(), [
-    'accept-save',
     'configuration-advance',
     'configuration-catalog',
     'configuration-options',
@@ -90,10 +88,9 @@ const valid = {
   setup: {},
   search: { query: '' },
   load: {},
-  save: { ids: [], revision: 0, fingerprint: 'x' },
+  save: { ids: [], revision: 0 },
   'save-status': {},
   'resolve-save': { revision: 0, fingerprint: 'x', acknowledged: true },
-  'accept-save': { revision: 0, fingerprint: 'x', acknowledged: true },
   'settings-projects': {},
   'settings-health': { projectId: '1' },
   'settings-recover': { projectId: '1' },

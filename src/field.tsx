@@ -6,15 +6,13 @@ import { call } from './client';
 import { usePromptSearch } from './prompt-search';
 import { SaveRecovery } from './save-recovery-ui';
 import { router } from '@forge/bridge';
-import type { OtherSection, Prompt, PromptPage, SaveStatus } from './service';
+import type { Prompt, PromptPage, SaveStatus } from './service';
 interface Loaded extends PromptPage {
-  otherSection?: OtherSection;
   cleanupOnly: boolean;
   refreshAfterSave: boolean;
   loadWarning?: string;
   ids: string[];
   revision: number;
-  fingerprint: string;
 }
 // Keep pointer actions stable while the in-flow menu is open. Blurring on
 // mousedown collapses the menu and moves these buttons before mouseup/click.
@@ -27,6 +25,15 @@ function focusLost() {
   return !active || active === document.body || active.matches(':disabled');
 }
 const focusPicker = () => document.getElementById('agent-prompts')?.focus();
+/** What a save did with prompts that are gone: it says what happened, never asks for anything. */
+function droppedNote(dropped: string[]) {
+  if (!dropped.length) return '';
+  const named =
+    dropped.length > 1 ? `${dropped.slice(0, -1).join(', ')} and ${dropped.at(-1)}` : dropped[0];
+  return dropped.length > 1
+    ? ` Removed ${named}: they no longer exist or are no longer prompts in this space.`
+    : ` Removed ${named}: it no longer exists or is no longer a prompt in this space.`;
+}
 export function Field() {
   const search = usePromptSearch();
   // Nothing to show: with a query that means no match; without one, the space has no prompts.
@@ -36,8 +43,6 @@ export function Field() {
   const [ids, setIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
-  // The user chose to replace the description's other Agent Prompts section on the next save.
-  const [replacing, setReplacing] = useState(false);
   const [recovery, setRecovery] = useState(false);
   const [recoveryStatus, setRecoveryStatus] = useState<SaveStatus>();
   const [loadError, setLoadError] = useState('');
@@ -61,7 +66,6 @@ export function Field() {
       resetSearch(value);
       remember(value);
       setIds(value.ids);
-      setReplacing(false);
       setMessage('');
       setRecovery(false);
     } catch (e) {
@@ -108,8 +112,9 @@ export function Field() {
       setBusy(false);
     }
   }
-  async function saved(refresh: boolean, reload: boolean) {
-    setMessage(refresh ? '✓ Synced' : 'Saved.');
+  async function saved(refresh: boolean, reload: boolean, dropped: string[] = []) {
+    const note = droppedNote(dropped);
+    setMessage(`${refresh ? (note ? '✓ Synced.' : '✓ Synced') : 'Saved.'}${note}`);
     if (reload) {
       try {
         await router.reload();
@@ -120,26 +125,22 @@ export function Field() {
   }
   async function save(refresh = false) {
     if (!data || busy || recovery) return;
-    const replace = replacing && ids.length ? data.otherSection?.replace : undefined;
-    const dirty = JSON.stringify(ids) !== JSON.stringify(data.ids) || !!replace;
-    if (refresh ? dirty || !data.ids.length : !dirty) return;
+    const dirty = JSON.stringify(ids) !== JSON.stringify(data.ids);
+    if (refresh ? dirty : !dirty) return;
     refocus.current = true;
     setMessage('');
     setBusy(true);
     setSaving(refresh ? 'Sync' : 'Save');
     try {
-      const value = await call<Pick<Loaded, 'revision' | 'fingerprint' | 'ids'>>('save', {
-        ids,
-        revision: data.revision,
-        fingerprint: data.fingerprint,
-        ...(replace ? { replace } : {}),
-      });
-      // A replaced section is gone; any other stays until the next load.
-      const { otherSection, ...rest } = data;
-      setData({ ...rest, ...value, ...(replace || !otherSection ? {} : { otherSection }) });
-      setReplacing(false);
+      // Sync writes the saved prompts again, whatever the description holds now.
+      const value = await call<Pick<Loaded, 'revision' | 'ids'> & { dropped?: string[] }>(
+        'save',
+        refresh ? { sync: true } : { ids, revision: data.revision },
+      );
+      setData({ ...data, revision: value.revision, ids: value.ids });
+      setIds(value.ids);
       setRecovery(false);
-      await saved(refresh, data.refreshAfterSave);
+      await saved(refresh, data.refreshAfterSave, value.dropped);
     } catch (e) {
       // Reconcile once with a read; never repeat an uncertain Jira write.
       const error = e instanceof Error ? e.message : 'Could not save prompts.';
@@ -147,8 +148,6 @@ export function Field() {
         const current = await call<Loaded>('load');
         setData(current);
         remember(current);
-        // The choice to replace holds only while it names the same section.
-        if (current.otherSection?.replace !== data.otherSection?.replace) setReplacing(false);
         // Keep a real draft. Without one (every Sync), show the saved selection: keeping the old
         // list would turn it into a draft whose Save reverts someone else's newer save.
         if (!dirty) setIds(current.ids);
@@ -200,19 +199,7 @@ export function Field() {
           .map((id) => ({ label: `Unavailable prompt (${id})`, value: id })),
       ]
     : [];
-  const other = data?.otherSection;
-  const replacingNow = replacing && !!other?.replace && ids.length > 0;
-  const dirty = !!data && (JSON.stringify(ids) !== JSON.stringify(data.ids) || replacingNow);
-  // Adds the other section's prompts to the selection, up to five, and replaces it on save.
-  function useOther() {
-    if (!other) return;
-    for (const p of other.prompts) retained.current.set(p.id, p);
-    setIds(
-      [...ids, ...other.prompts.map((p) => p.id).filter((id) => !ids.includes(id))].slice(0, 5),
-    );
-    setReplacing(true);
-    setMessage('');
-  }
+  const dirty = !!data && JSON.stringify(ids) !== JSON.stringify(data.ids);
   return (
     <div className="prompt-field">
       {data && (
@@ -325,59 +312,6 @@ export function Field() {
           </p>
         </>
       )}
-      {data && other && (
-        <div className="other-section">
-          <p>
-            {other.count > 1
-              ? `This description has ${other.count} Agent Prompts sections the app didn't save.`
-              : "This description has an Agent Prompts section the app didn't save."}
-          </p>
-          {!other.replace ? (
-            <p>{other.count > 1 ? 'Delete them' : 'Delete it'} from the description in Jira.</p>
-          ) : (
-            <>
-              {!!other.prompts.length && (
-                <>
-                  <p>It lists:</p>
-                  <ul>
-                    {other.prompts.map((p) => (
-                      <li key={p.id}>
-                        <a
-                          href={`/browse/${p.key}`}
-                          onClick={(event) => {
-                            event.preventDefault();
-                            void router.open(`/browse/${p.key}`);
-                          }}
-                        >
-                          {`${p.key} — ${p.name}`}
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </>
-              )}
-              {!!other.unavailable.length && (
-                <p>{`Not prompts this work item can use: ${other.unavailable.join(', ')}.`}</p>
-              )}
-              {replacingNow ? (
-                <p>Saving replaces that section with the app&apos;s own.</p>
-              ) : replacing ? (
-                <p>Choose a prompt to replace that section with.</p>
-              ) : (
-                <>
-                  <p>
-                    Delete it from the description in Jira, or use its prompts here and save to
-                    replace it.
-                  </p>
-                  <Button onMouseDown={retainSearchFocus} isDisabled={busy} onClick={useOther}>
-                    {other.prompts.length ? 'Use its prompts' : 'Replace it when saving'}
-                  </Button>
-                </>
-              )}
-            </>
-          )}
-        </div>
-      )}
       {data?.loadWarning && <p>{data.loadWarning}</p>}
       {/* Present from the first render so assistive technology announces each outcome. */}
       <p role="status">{loadError || message}</p>
@@ -404,9 +338,8 @@ export function Field() {
           <Button
             onMouseDown={retainSearchFocus}
             isLoading={saving === 'Sync'}
-            isDisabled={
-              (busy && saving !== 'Sync') || dirty || !data.ids.length || data.cleanupOnly
-            }
+            // With no prompts saved, Sync still removes any Agent Prompts section someone added.
+            isDisabled={(busy && saving !== 'Sync') || dirty || data.cleanupOnly}
             onClick={() => void save(true)}
           >
             Sync
@@ -418,7 +351,6 @@ export function Field() {
               onClick={() => {
                 focusPicker();
                 setIds(data.ids);
-                setReplacing(false);
                 setMessage('');
               }}
             >

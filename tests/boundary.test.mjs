@@ -980,7 +980,7 @@ test('Rovo still reads a retired prompt by its exact key', async () => {
   const s = sdk(
     { body: project },
     {
-      expect: { path: /^\/rest\/api\/3\/issue\/TEST-2\?fields=.*%2Cstatus$/ },
+      expect: { path: /^\/rest\/api\/3\/issue\/TEST-2\?fields=.*%2Cstatus%2Csecurity$/ },
       body: {
         id: '2',
         key: 'TEST-2',

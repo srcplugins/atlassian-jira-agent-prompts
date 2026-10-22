@@ -13,6 +13,8 @@ function fixture({
   firstLoadFails,
   failLoads = [],
   saveStatus = { pending: false },
+  // Prompts a successful save reports it removed because they are gone.
+  dropped,
   // Scripted load answers, one per load (the last repeats); an Error is thrown.
   script,
   prompts = [
@@ -45,7 +47,12 @@ function fixture({
   const call = async (name, payload) => {
     calls.push({ name, payload });
     if (name === 'save') {
-      if (success) return { ids: payload.ids, revision: 3, fingerprint: 'v3' };
+      if (success)
+        return {
+          ids: (payload.ids ?? ['1']).filter((id) => !dropped?.includes(`TEST-${id}`)),
+          revision: 3,
+          ...(dropped ? { dropped } : {}),
+        };
       throw Error('TEST-2: This prompt is not ready to link.');
     }
     if (name === 'save-status') return saveStatus;
@@ -299,11 +306,14 @@ test('a retired prompt stays selected with its label, and once deselected only D
   assert.deepEqual(offered(), ['2']);
 });
 
-test('Sync sends saved IDs without changing selection; unsaved choices disable it', async () => {
+test('Sync asks for the saved prompts without changing selection; unsaved choices disable it', async () => {
   const f = fixture();
   await f.mount();
   await f.click('Sync');
-  assert.deepEqual(Array.from(f.calls[1].payload.ids), ['1']);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.calls[1])), {
+    name: 'save',
+    payload: { sync: true },
+  });
   assert.deepEqual(f.selected(), ['1']);
   assert.match(f.text(), /not ready to link/);
   assert.doesNotMatch(f.text(), /Synced/);
@@ -666,76 +676,31 @@ test('on the work item, or when Jira gives no context, the field shows the promp
   }
 });
 
-test('an Agent Prompts section the field does not track: Use its prompts adds them and Save replaces it', async () => {
-  const otherSection = {
-    count: 1,
-    replace: 'a'.repeat(64),
-    prompts: [{ id: '2', key: 'TEST-2', name: 'Draft' }],
-    unavailable: ['TEST-9'],
-  };
-  const prompts = [{ id: '1', key: 'TEST-1', name: 'Saved' }];
-  const f = fixture({
-    success: true,
-    script: [{ ids: ['1'], prompts, revision: 1, fingerprint: 'v1', otherSection }],
-  });
+test('a save names the prompts it removed because they are gone, and says nothing else is wrong', async () => {
+  const f = fixture({ success: true, dropped: ['TEST-1'] });
   await f.mount();
-  assert.match(f.text(), /This description has an Agent Prompts section the app didn't save\./);
-  assert.match(f.text(), /It lists:/);
-  assert.deepEqual(
-    f.nodes('a').map((a) => [a.props.href, a.props.children].flat().join(' ')),
-    ['/browse/TEST-2 TEST-2 — Draft'],
+  await f.click('Sync');
+  assert.match(
+    f.text(),
+    /✓ Synced\. Removed TEST-1: it no longer exists or is no longer a prompt in this space\./,
   );
-  assert.match(f.text(), /Not prompts this work item can use: TEST-9\./);
-  assert.match(f.text(), /Delete it from the description in Jira, or use its prompts here/);
-  // Each listed prompt links to its work item.
-  let prevented = false;
-  f.nodes('a')[0].props.onClick({ preventDefault: () => (prevented = true) });
-  await f.settle();
-  assert.ok(prevented);
-  assert.deepEqual(f.calls.at(-1), { name: 'open', url: '/browse/TEST-2' });
-  await f.click('Use its prompts');
-  assert.deepEqual(f.selected(), ['1', '2']);
-  assert.match(f.text(), /Saving replaces that section with the app's own\./);
-  // Discard changes also drops the choice to replace.
-  await f.click('Discard changes');
-  assert.deepEqual(f.selected(), ['1']);
-  assert.ok(f.button('Use its prompts'));
-  await f.click('Use its prompts');
-  await f.click('Save');
-  const save = f.calls.find((c) => c.name === 'save');
-  assert.deepEqual(Array.from(save.payload.ids), ['1', '2']);
-  assert.equal(save.payload.replace, otherSection.replace);
-  assert.doesNotMatch(f.text(), /didn't save/);
+  assert.deepEqual(f.selected(), []);
+  const g = fixture({ success: true, dropped: ['TEST-1', 'TEST-2'] });
+  await g.mount();
+  g.select(['1', '2']);
+  await g.click('Save');
+  assert.match(
+    g.text(),
+    /Saved\. Removed TEST-1 and TEST-2: they no longer exist or are no longer prompts in this space\./,
+  );
+  assert.deepEqual(g.selected(), []);
 });
 
-test('Use its prompts enables Save when the selection already holds them; several sections only say to delete them', async () => {
+test('with no prompts saved, Sync is still offered, to remove a section someone added', async () => {
   const prompts = [{ id: '1', key: 'TEST-1', name: 'Saved' }];
-  const one = { count: 1, replace: 'b'.repeat(64), prompts, unavailable: [] };
-  const f = fixture({
-    script: [{ ids: ['1'], prompts, revision: 1, fingerprint: 'v1', otherSection: one }],
-  });
+  const f = fixture({ success: true, script: [{ ids: [], prompts, revision: 1 }] });
   await f.mount();
-  assert.ok(f.button('Save').props.isDisabled);
-  await f.click('Use its prompts');
-  assert.deepEqual(f.selected(), ['1']);
-  assert.match(f.text(), /Unsaved changes/);
-  assert.ok(!f.button('Save').props.isDisabled);
-  // With nothing to adopt, the same choice is offered by name; with no prompts chosen it waits.
-  const none = { count: 1, replace: 'c'.repeat(64), prompts: [], unavailable: ['TEST-9'] };
-  const g = fixture({
-    script: [{ ids: [], prompts, revision: 1, fingerprint: 'v1', otherSection: none }],
-  });
-  await g.mount();
-  await g.click('Replace it when saving');
-  assert.match(g.text(), /Choose a prompt to replace that section with\./);
-  assert.ok(g.button('Save').props.isDisabled);
-  const many = { count: 2, prompts: [], unavailable: [] };
-  const h = fixture({
-    script: [{ ids: ['1'], prompts, revision: 1, fingerprint: 'v1', otherSection: many }],
-  });
-  await h.mount();
-  assert.match(h.text(), /This description has 2 Agent Prompts sections the app didn't save\./);
-  assert.match(h.text(), /Delete them from the description in Jira\./);
-  assert.equal(h.button('Use its prompts'), undefined);
-  assert.equal(h.button('Replace it when saving'), undefined);
+  assert.equal(f.button('Sync').props.isDisabled, false);
+  await f.click('Sync');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1).payload)), { sync: true });
 });

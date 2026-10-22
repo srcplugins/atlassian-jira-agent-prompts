@@ -387,7 +387,7 @@ test('AP-06 empty prompt save preserves unsaved selection during read-only recov
   );
 });
 
-test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-only save', async ({
+test('AP-10 an Agent Prompts section deleted in Jira is written again by Sync, and removal clears it', async ({
   page,
   owned,
 }) => {
@@ -419,11 +419,21 @@ test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-onl
     await expect(
       editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
     ).toBeEnabled();
+    return loaded;
   };
   const save = async () => {
     const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
     // With the space's reload preference on, navigation can discard the resolver body; the Jira
     // assertions after each save are the oracle.
+    if (loaded.refreshAfterSave)
+      await Promise.all([
+        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+        click(),
+      ]);
+    else await observeAction(page, 'save', click, t);
+  };
+  const sync = async () => {
+    const click = () => editor(page).getByRole('button', { name: 'Sync', exact: true }).click();
     if (loaded.refreshAfterSave)
       await Promise.all([
         page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
@@ -464,29 +474,24 @@ test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-onl
   await owned.api(`/issue/${target.id}`, 'PUT', { fields: { description: deletedDescription } });
   const afterEdit = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
 
-  await open();
-  // Refreshing copies needs the block: refused with guidance and no write.
-  await expect(
-    observeAction(
-      page,
-      'save',
-      () => editor(page).getByRole('button', { name: 'Sync', exact: true }).click(),
-      t,
-    ),
-  ).rejects.toMatchObject({ category: 'resolver-failed' });
-  await expect(
-    editor(page).getByText(
-      /Agent Prompts section was removed in Jira\. Remove all prompts and save/i,
-    ),
-  ).toBeVisible();
-  expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
-    afterEdit,
-  );
+  // Sync writes the section again from the linked prompt, after the user's text.
+  target.expected.descriptionVariants.push(linkedAgain(deletedDescription, linked.description));
+  owned.run.persist();
+  const reopened = await open();
+  await sync();
+  const synced = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  expect(synced).toEqual({
+    description: linkedAgain(deletedDescription, linked.description),
+    [field.id]: [sourceIssue.key],
+  });
 
-  // Removing every prompt forgets the deleted block by clearing only the field.
+  // Removing the prompt then removes the section and clears the field, keeping the user's text.
+  if (reopened.refreshAfterSave) await open();
   await editor(page)
     .getByRole('button', { name: new RegExp(`remove.*${source.expected.summary}`, 'i') })
     .click();
+  target.expected.descriptionVariants.push(afterEdit.description);
+  owned.run.persist();
   await save();
   const cleared = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
   expect(cleared.description).toEqual(afterEdit.description);
@@ -495,7 +500,13 @@ test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-onl
   owned.run.persist();
 });
 
-test('AP-16 an Agent Prompts section the field does not track is listed, refused beside a new one and replaced on request', async ({
+/** `description` with the app's section from `linked` appended, as Sync writes it when none is left. */
+function linkedAgain(description, linked) {
+  const own = linked.content.find((n) => n.attrs?.localId?.startsWith('agent-prompts-'));
+  return { ...description, content: [...description.content, own] };
+}
+
+test("AP-16 an Agent Prompts section copied from another work item is replaced by the app's own on Save", async ({
   page,
   owned,
 }) => {
@@ -554,25 +565,10 @@ test('AP-16 an Agent Prompts section the field does not track is listed, refused
     () => openField(page, fieldReadView(page, field.id)),
     t,
   );
-  expect(loaded.otherSection).toEqual({
-    count: 1,
-    replace: expect.any(String),
-    prompts: [{ id: source.id, key: sourceIssue.key, name: source.expected.summary }],
-    unavailable: [],
-  });
+  // Nothing is reported or asked about it: the field opens as usual.
+  expect(loaded.otherSection).toBeUndefined();
   const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
   await expect(combo).toBeEnabled();
-  await expect(
-    editor(page).getByText("This description has an Agent Prompts section the app didn't save.", {
-      exact: true,
-    }),
-  ).toBeVisible();
-  await expect(
-    editor(page).getByRole('link', {
-      name: `${sourceIssue.key} — ${source.expected.summary}`,
-      exact: true,
-    }),
-  ).toHaveAttribute('href', `/browse/${sourceIssue.key}`);
   const save = async () => {
     const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
     // With the space's reload preference on, navigation can discard the resolver body; the Jira
@@ -585,37 +581,12 @@ test('AP-16 an Agent Prompts section the field does not track is listed, refused
     else await observeAction(page, 'save', click, t);
   };
 
-  // Choosing the prompt alone would write a second section beside it: refused, Jira unchanged.
+  // Saving the prompt replaces that section with the app's own, in its place.
   await observeAction(page, 'search', () => combo.fill(sourceIssue.key), t);
   await combo.press('ArrowDown');
-  // The menu's option, not the warning's link with the same text.
   await editor(page)
     .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
-    .and(editor(page).locator(':not(a)'))
     .click();
-  await expect(
-    observeAction(
-      page,
-      'save',
-      () => editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
-      t,
-    ),
-  ).rejects.toMatchObject({ category: 'resolver-failed' });
-  await expect(
-    editor(page).getByText(
-      "The description has an Agent Prompts section the app didn't save. Delete it from the description, or use its prompts here to replace it, then save again.",
-      { exact: true },
-    ),
-  ).toBeVisible();
-  expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
-    before,
-  );
-
-  // Use its prompts: the save replaces that section with the app's own, in its place.
-  await editor(page).getByRole('button', { name: 'Use its prompts', exact: true }).click();
-  await expect(
-    editor(page).getByText("Saving replaces that section with the app's own.", { exact: true }),
-  ).toBeVisible();
   target.expected.descriptionVariants.push(replaced);
   owned.run.persist();
   await save();
@@ -641,7 +612,7 @@ test('AP-16 an Agent Prompts section the field does not track is listed, refused
   owned.run.persist();
 });
 
-test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the steps in the message restore the field', async ({
+test("AP-17 a section edited, retitled, duplicated or deleted in Jira is rewritten by Sync, the edit made in Jira's own editor", async ({
   page,
   owned,
 }, testInfo) => {
@@ -697,8 +668,6 @@ test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the
       ...sourceIssue.fields.description.content.map(unstamped),
     ],
   };
-  const changed =
-    'The Agent Prompts section was changed, moved or duplicated in Jira. Undo that change, or delete the section from the description, remove all prompts here and save, then add them again.';
   const read = async () =>
     (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
   /** A REST write of the Description, journaled first. */
@@ -765,15 +734,13 @@ test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the
       ]);
     else await observeAction(page, 'save', () => button(name).click(), t);
   };
-  /** Sync is refused with the recovery message, and Jira is unchanged. */
-  const syncRefused = async () => {
-    const before = await read();
+  /** Sync rewrites the section: `expected` is the whole description it leaves. */
+  const synced = async (expected) => {
+    target.expected.descriptionVariants.push(expected);
+    owned.run.persist();
     await open();
-    await expect(
-      observeAction(page, 'save', () => button('Sync').click(), t),
-    ).rejects.toMatchObject({ category: 'resolver-failed' });
-    await expect(editor(page).getByText(changed, { exact: true })).toBeVisible();
-    expect(await read()).toEqual(before);
+    await save('Sync');
+    expect(await read()).toEqual({ description: expected, [field.id]: [sourceIssue.key] });
   };
   const choose = async () => {
     const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
@@ -796,39 +763,43 @@ test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the
   await save();
   expect(await read()).toEqual({ description: linked, [field.id]: [sourceIssue.key] });
 
-  // Retitled, or copied with its identifier: Sync is refused until the change is undone.
-  for (const tampered of [
-    {
-      ...linked,
-      content: linked.content.map((n) =>
-        isOwn(n) ? { ...n, attrs: { ...n.attrs, title: 'Prompts for agents' } } : n,
-      ),
-    },
-    { ...linked, content: [structuredClone(own), ...linked.content] },
+  // Retitled, or copied with its identifier: Sync removes every copy and writes one section.
+  for (const [tampered, expected] of [
+    [
+      {
+        ...linked,
+        content: linked.content.map((n) =>
+          isOwn(n) ? { ...n, attrs: { ...n.attrs, title: 'Prompts for agents' } } : n,
+        ),
+      },
+      linked,
+    ],
+    // The one section takes the first copy's place, at the top.
+    [
+      { ...linked, content: [structuredClone(own), ...linked.content] },
+      { ...linked, content: [own, ...original.content] },
+    ],
   ]) {
     await write(tampered);
-    await syncRefused();
+    await synced(expected);
     await write(linked);
-    await open();
-    await save('Sync');
-    expect(await read()).toEqual({ description: linked, [field.id]: [sourceIssue.key] });
   }
 
   // Jira's editor may give its own ids to nodes it touches, inside the section or out. The app
-  // ignores them inside its section and keeps everything outside exactly as Jira saved it.
+  // replaces its section and keeps everything outside exactly as Jira saved it.
   const editorIdsOff = (d) => ({
     ...d,
     content: d.content.map((n) =>
       isOwn(n) ? { ...n, content: n.content.map(unstamped) } : unstamped(n),
     ),
   });
-  /** What a save of the prompt writes over `d`: the app's section in place of its own, or last. */
+  /** What Sync writes over `d`: the app's section in place of its own, or last. */
   const withSection = (d) =>
     d.content.some(isOwn)
       ? { ...d, content: d.content.map((n) => (isOwn(n) ? own : n)) }
       : { ...d, content: [...d.content, own] };
 
-  // Typed inside the section in Jira's editor: refused; deleting the typing in the editor undoes it.
+  // Text typed inside the section in Jira's editor: Sync puts the prompt's text back.
   const typing = ` (edited in Jira ${run})`;
   const typed = await jiraEdit(
     'typed',
@@ -840,35 +811,10 @@ test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the
     (d) => JSON.stringify(d).includes(typing),
   );
   expect(editorIdsOff(typed).content.filter((n) => !isOwn(n))).toEqual(original.content);
-  await syncRefused();
-  const undone = await jiraEdit(
-    'undone',
-    async ({ content }) => {
-      await content.getByText(typing.trim(), { exact: false }).click();
-      await page.keyboard.press('End');
-      for (let i = 0; i < typing.length; i++) await page.keyboard.press('Backspace');
-    },
-    (d) => !JSON.stringify(d).includes(typing),
-  );
-  expect(editorIdsOff(undone)).toEqual(linked);
-  target.expected.descriptionVariants.push(withSection(undone));
-  owned.run.persist();
-  await open();
-  await save('Sync');
-  expect(await read()).toEqual({ description: withSection(undone), [field.id]: [sourceIssue.key] });
+  await synced(withSection(typed));
+  expect(JSON.stringify(await read())).not.toContain(typing.trim());
 
-  // Typed again, then the other way out: delete the section in the editor, remove all prompts and
-  // save (the field alone is cleared), then add them again.
-  await jiraEdit(
-    'typed-again',
-    async ({ prompt }) => {
-      await prompt.click();
-      await page.keyboard.press('End');
-      await page.keyboard.type(typing);
-    },
-    (d) => JSON.stringify(d).includes(typing),
-  );
-  await syncRefused();
+  // The section deleted in Jira's editor: Sync writes it again, last.
   const deleted = await jiraEdit(
     'deleted',
     async ({ prompt }) => {
@@ -878,29 +824,23 @@ test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the
         .getByRole('button', { name: 'Remove', exact: true })
         .click();
     },
-    (d) => !d.content.some(isOwn) && !JSON.stringify(d).includes(typing),
+    (d) => !d.content.some(isOwn),
   );
   expect(editorIdsOff(deleted)).toEqual(original);
+  await synced(withSection(deleted));
+
+  // Removing the prompt removes the section and clears the field.
   await open();
   await editor(page)
     .getByRole('button', { name: new RegExp(`remove.*${source.expected.summary}`, 'i') })
     .click();
+  target.expected.descriptionVariants.push(deleted);
   target.expected.customField = { id: field.id, value: [] };
   owned.run.persist();
   await save();
   const cleared = await read();
   expect(cleared.description).toEqual(deleted);
   expect(cleared[field.id] ?? []).toEqual([]);
-  target.expected.descriptionVariants.push(withSection(deleted));
-  target.expected.customField = { id: field.id, value: [sourceIssue.key] };
-  owned.run.persist();
-  await open();
-  await choose();
-  await save();
-  expect(await read()).toEqual({
-    description: withSection(deleted),
-    [field.id]: [sourceIssue.key],
-  });
 });
 
 /**
@@ -1121,14 +1061,21 @@ test('AP-18 board side panel: a prompt saved there reloads the board with the pa
     owned.run.persist();
     await searchable(owned, initial.state.data.type, source.id);
     // The board shows the new work item once Jira has indexed it; open it from its card.
-    const card = page.getByText(targetIssue.fields.summary, { exact: true });
+    // By key: another run's leftover card can have the same summary on the same board.
+    const card = page
+      .locator(`#card-${targetIssue.key}`)
+      .getByText(targetIssue.fields.summary, { exact: true });
     await expect(async () => {
       await page.goto(board);
       await expect(card).toBeVisible({ timeout: 10000 });
     }).toPass({ timeout: 60000, intervals: [3000] });
-    await card.click();
+    // A board still settling can drop a click on a card (atlassian-forge-test-framework#vaf4: the
+    // URL stayed /boards/187), so click again until the work item opens.
     const panel = new RegExp(`/boards/\\d+\\?(.*&)?selectedIssue=${targetIssue.key}(&|$)`);
-    await expect(page).toHaveURL(panel);
+    await expect(async () => {
+      if (!panel.test(page.url())) await card.click({ timeout: 10000 });
+      await expect(page).toHaveURL(panel, { timeout: 5000 });
+    }).toPass({ timeout: 60000, intervals: [2000] });
     // A card opens Jira's modal over the board; its Switch to sidebar shows the work item in the
     // board's side panel instead. Jira keeps that choice until the page loads again.
     const toSidebar = page.getByRole('button', { name: 'Switch to sidebar', exact: true });

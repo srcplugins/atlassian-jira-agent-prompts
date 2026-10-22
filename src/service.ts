@@ -1,18 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { sourceContent } from './prompt-text';
-import {
-  snapshotContent,
-  observedManaged,
-  matchesShape,
-  trackedBlock,
-  DescriptionError,
-  synchronizeDescription,
-  otherSections,
-  hash,
-  type ManagedBlock,
-} from './description';
+import { snapshotContent, DescriptionError, synchronizeDescription, hash } from './description';
 export { hash };
-import { UserError, requireSoftwareSpace } from './shared/jira.mjs';
+import { JiraHttpError, UserError, requireSoftwareSpace } from './shared/jira.mjs';
 import { sectionLocalId } from './names';
 export { UserError };
 /** The request never got an HTTP response from Jira. */
@@ -66,51 +56,43 @@ export interface Issue {
     description: unknown;
     updated: string;
     status?: { statusCategory?: { key?: unknown } };
+    /** The work item's issue security level, when it has one. */
+    security?: unknown;
     [key: string]: unknown;
   };
 }
-interface State {
+/** The saved prompts. */
+interface Selection {
   ids: string[];
-  managed: ManagedBlock | null;
+  /** Their keys when they were saved, so a prompt Jira can no longer find is named by its key. */
+  keys?: string[];
+  /** Those that had an issue security level when they were last copied. Jira answers "not found"
+   * both for a deleted work item and for one the user may not see; for these, it means the user
+   * may not see it, so a save stops instead of dropping it. */
+  secured?: string[];
+}
+interface State extends Selection {
   pending?: Receipt & { attemptId: string; phase: 'prepared' | 'submitted'; started: number };
 }
 /** What a save is about to write, recorded before it is sent so recovery can compare. */
-type Receipt = {
+type Receipt = Selection & {
   before: string;
   after: string;
-  ids: string[];
-  managed: ManagedBlock | null;
 } & (
-  | {
-      /** Only the Agent Prompts field was written; hashes cover the field alone. */
-      scope: 'field';
-    }
-  | {
-      scope?: undefined;
-      /** Exact field value sent, and the requested block's skeleton (null when removed). */
-      keys: string[];
-      shape: string | null;
-      /** The field and the tracked block before the save, and the requested block (see
-       * `untouched`). */
-      beforeField: string;
-      beforeBlock: string;
-      afterBlock: string;
-    }
-);
+    | {
+        /** Only the Agent Prompts field was written; hashes cover the field alone. */
+        scope: 'field';
+      }
+    | {
+        scope?: undefined;
+        /** The exact field value sent, and the field's hash before the save. */
+        keys: string[];
+        beforeField: string;
+      }
+  );
 export interface Stored {
   revision: number;
   data: State;
-}
-/** An Agent Prompts section in the description that the field doesn't track. */
-export interface OtherSection {
-  /** How many there are; only a single top-level one can be replaced. */
-  count: number;
-  /** The section's hash, which a save sends to replace it. */
-  replace?: string;
-  /** The prompts its headings name that this work item can use now. */
-  prompts: Prompt[];
-  /** Keys its headings name that aren't prompts this work item can use. */
-  unavailable: string[];
 }
 export interface PromptPage {
   prompts: Prompt[];
@@ -169,72 +151,32 @@ type Pending = NonNullable<State['pending']>;
 const receiptHash = (issue: Issue, field: string, pending: Receipt) =>
   pending.scope === 'field' ? fieldHash(issue, field) : contentHash(issue, field);
 const recoveryDelay = 120_000;
-function withoutPending(data: State): State {
-  return { ids: data.ids, managed: data.managed };
+function selection({ ids, keys, secured }: Selection): State {
+  return { ids, ...(keys ? { keys } : {}), ...(secured?.length ? { secured } : {}) };
 }
-/** Jira applied the requested save but returned it in a different representation: the field is
- * exactly what was sent and the one tracked block has the requested text and structure. */
-function adoptable(issue: Issue, field: string, pending: Pending) {
-  if (
-    pending.scope === 'field' ||
-    pending.phase === 'prepared' ||
-    contentHash(issue, field) === pending.before
-  )
-    return false;
-  if (hash(issue.fields[field] ?? []) !== hash(pending.keys)) return false;
-  const localId = pending.managed?.localId ?? sectionLocalId(issue.id);
-  try {
-    // The block is still exactly the pre-save one: the save never landed (a Sync that changed
-    // only attributes, such as a link, has the same skeleton), so it is released, not accepted.
-    if (
-      pending.afterBlock !== pending.beforeBlock &&
-      trackedBlock(issue.fields.description, sectionLocalId(issue.id)) === pending.beforeBlock
-    )
-      return false;
-    return matchesShape(issue.fields.description, localId, pending.shape);
-  } catch {
-    return false;
-  }
+const withoutPending = selection;
+/** The save landed: Jira's field holds exactly the prompt keys it sent, which differ from the
+ * field before it. One PUT writes the field and the description together, so the description
+ * landed with it, in whatever form Jira stores it; the next Sync rewrites the section anyway. */
+function landed(issue: Issue, field: string, pending: Pending) {
+  if (pending.phase !== 'submitted') return false;
+  const [before, after] =
+    pending.scope === 'field'
+      ? [pending.before, pending.after]
+      : [pending.beforeField, hash(['field', pending.keys])];
+  return before !== after && fieldHash(issue, field) === after;
 }
-/** Jira provably never applied this save: the whole work item is as it was, or the field and the
- * tracked block are both still pre-save while the save would have changed at least one of them.
- * Other description edits made since then don't matter. */
-function untouched(issue: Issue, field: string, pending: Receipt) {
-  if (receiptHash(issue, field, pending) === pending.before) return true;
-  if (
-    pending.scope === 'field' ||
-    (pending.beforeField === hash(['field', pending.keys]) &&
-      pending.beforeBlock === pending.afterBlock)
-  )
-    return false;
-  try {
-    return (
-      fieldHash(issue, field) === pending.beforeField &&
-      trackedBlock(issue.fields.description, sectionLocalId(issue.id)) === pending.beforeBlock
-    );
-  } catch {
-    return false;
-  }
-}
-/** No node carries the work item's section identifier, so a later save cannot overwrite text the
- * app does not recognise. An administrator may then release a save whose outcome is unknown, for
- * example one whose section the user deleted after the response was lost. */
-function sectionRemoved(issue: Issue) {
-  try {
-    return trackedBlock(issue.fields.description, sectionLocalId(issue.id)) === hash([]);
-  } catch {
-    return false;
-  }
+const notFound = (error: unknown) => error instanceof JiraHttpError && error.status === 404;
+/** "PLS-1", "PLS-1 and PLS-2", "PLS-1, PLS-2 and PLS-3". */
+function list(labels: string[]) {
+  return labels.length < 2
+    ? (labels[0] ?? '')
+    : `${labels.slice(0, -1).join(', ')} and ${labels.at(-1)}`;
 }
 export interface SaveStatus {
   pending: boolean;
   revision?: number;
   fingerprint?: string;
-  unchanged?: boolean;
-  /** Jira holds the requested save in a different representation; an administrator may accept it. */
-  adoptable?: boolean;
-  /** The description has no Agent Prompts section; an administrator may release the save. */
-  sectionRemoved?: boolean;
   keys?: string[];
   administrator?: boolean;
   waitSeconds?: number;
@@ -243,6 +185,12 @@ interface RecoveryInput {
   revision: number;
   fingerprint: string;
   acknowledged: boolean;
+}
+/** Save sends the chosen `ids` and the `revision` they were chosen at; Sync sends `sync: true`. */
+interface SaveInput {
+  sync?: boolean;
+  ids?: string[];
+  revision?: number;
 }
 export function createService(p: Ports) {
   async function scope(c: Context) {
@@ -262,7 +210,7 @@ export function createService(p: Ports) {
     return issue;
   }
   async function state(issue: Issue, field: string, allowPending = false) {
-    let stored = (await p.get(issue.id)) ?? { revision: 0, data: { ids: [], managed: null } };
+    let stored = (await p.get(issue.id)) ?? { revision: 0, data: { ids: [] } };
     if (stored.data.pending?.phase === 'prepared') {
       // A sender must win another CAS before issuing its PUT. Cancelling a
       // prepared claim fences that sender, even if its original response arrives late.
@@ -272,96 +220,22 @@ export function createService(p: Ports) {
     }
     if (stored.data.pending) {
       const pending = stored.data.pending;
+      const settled = (i: Issue) =>
+        receiptHash(i, field, pending) === pending.after || landed(i, field, pending);
       // `issue` was read before the claim, so a match may be Jira's state before that save:
       // only a read made after the claim settles it.
-      const now =
-        receiptHash(issue, field, pending) === pending.after
-          ? await p.issue(issue.id, field)
-          : undefined;
-      if (!now || receiptHash(now, field, pending) !== pending.after) {
+      const now = settled(issue) ? await p.issue(issue.id, field) : undefined;
+      if (!now || !settled(now)) {
         if (allowPending) return stored;
         throw new UserError(
           'The previous save could not be verified. Check saved state; a Jira administrator can investigate an unchanged outcome.',
         );
       }
-      const managed =
-        pending.scope === 'field' ? null : observedManaged(now.fields.description, pending.managed);
-      await p.cas(issue.id, stored.revision, { ids: pending.ids, managed });
-      stored = {
-        revision: stored.revision + 1,
-        data: { ids: pending.ids, managed },
-      };
+      const data = selection(pending);
+      await p.cas(issue.id, stored.revision, data);
+      stored = { revision: stored.revision + 1, data };
     }
     return stored;
-  }
-  /** Shared guards for administrator recovery of an unresolved save: Administer Jira and Edit
-   * work items, explicit acknowledgement, the exact revision and work item the administrator
-   * inspected, a submitted record, and two minutes since the save started. */
-  async function recoveryTarget(c: Context, input: RecoveryInput, action: string) {
-    if (
-      !Number.isSafeInteger(input.revision) ||
-      input.revision < 0 ||
-      typeof input.fingerprint !== 'string' ||
-      input.acknowledged !== true
-    )
-      throw new UserError(`Inspect Jira and acknowledge the previous save before ${action} it.`);
-    await p.allowed(c.projectId, 'ADMINISTER');
-    const field = await p.field();
-    const issue = await target(c, field);
-    await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
-    const stored = await p.get(issue.id);
-    const pending = stored?.data.pending;
-    if (
-      !stored ||
-      !pending ||
-      pending.phase === 'prepared' ||
-      stored.revision !== input.revision ||
-      targetHash(issue, field) !== input.fingerprint
-    )
-      throw new UserError('Saved state changed. Check saved state again.');
-    if (Date.now() - pending.started < recoveryDelay)
-      throw new UserError(`Wait two minutes and check saved state before ${action} this save.`);
-    return { issue, field, stored, pending };
-  }
-  /** Describes the untracked sections in a work item's description, looking up the prompts a single
-   * one names as the user. Reading it never changes it. */
-  async function otherSection(
-    c: Context,
-    issue: Issue,
-    managed: ManagedBlock | null,
-    type: string,
-    cleanupOnly: boolean,
-  ): Promise<OtherSection | undefined> {
-    let others;
-    try {
-      others = otherSections(issue.fields.description, managed);
-    } catch {
-      return undefined;
-    }
-    const only = others[0];
-    if (!only) return undefined;
-    if (others.length > 1 || only.index === null || cleanupOnly)
-      return { count: others.length, prompts: [], unavailable: [] };
-    const keys = only.keys.slice(0, 10);
-    const found = await limited(keys, async (key): Promise<Prompt | null> => {
-      try {
-        const source = await p.issue(key);
-        return source.id !== issue.id &&
-          source.fields.project.id === c.projectId &&
-          source.fields.issuetype.id === type &&
-          source.fields.status?.statusCategory?.key !== 'done'
-          ? { id: source.id, key: source.key, name: source.fields.summary }
-          : null;
-      } catch {
-        return null;
-      }
-    });
-    return {
-      count: 1,
-      replace: only.fingerprint,
-      prompts: found.filter((prompt): prompt is Prompt => !!prompt),
-      unavailable: keys.filter((_, i) => !found[i]),
-    };
   }
   async function releaseUnsent(issueId: string, attemptId: string) {
     // A failed CAS can mean a concurrent writer won. Never release a claim by
@@ -389,40 +263,43 @@ export function createService(p: Ports) {
         pending: true,
         revision: stored.revision,
         fingerprint: targetHash(issue, field),
-        unchanged: untouched(issue, field, pending),
-        adoptable: adoptable(issue, field, pending),
-        sectionRemoved: sectionRemoved(issue),
         // The pending keys are for the administrator who inspects the save, not for every viewer.
         ...(administrator && pending.scope !== 'field' ? { keys: pending.keys } : {}),
         administrator,
         waitSeconds: Math.max(0, Math.ceil((pending.started + recoveryDelay - Date.now()) / 1000)),
       };
     },
+    /** Releases a save whose outcome Jira doesn't show (a landed one settles by itself), keeping
+     * the last saved selection. It writes only storage; the next Sync rewrites the description. */
     async resolveSave(c: Context, input: RecoveryInput) {
-      const { issue, field, stored, pending } = await recoveryTarget(c, input, 'releasing');
-      // Either outcome keeps the last confirmed selection. When a section the app saved is gone,
-      // the next save that copies prompts asks the user to remove them all first, which clears
-      // the field.
-      if (!untouched(issue, field, pending) && !sectionRemoved(issue))
-        throw new UserError(
-          'The work item differs from the pre-save state. Delete the Agent Prompts section from the description, then check saved state again; no recovery record was released.',
-        );
+      if (
+        !Number.isSafeInteger(input.revision) ||
+        input.revision < 0 ||
+        typeof input.fingerprint !== 'string' ||
+        input.acknowledged !== true
+      )
+        throw new UserError('Inspect Jira and acknowledge the previous save before releasing it.');
+      await p.allowed(c.projectId, 'ADMINISTER');
+      const field = await p.field();
+      const issue = await target(c, field);
+      await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
+      const stored = await p.get(issue.id);
+      const pending = stored?.data.pending;
+      if (
+        !stored ||
+        !pending ||
+        pending.phase === 'prepared' ||
+        stored.revision !== input.revision ||
+        targetHash(issue, field) !== input.fingerprint
+      )
+        throw new UserError('Saved state changed. Check saved state again.');
+      if (Date.now() - pending.started < recoveryDelay)
+        throw new UserError('Wait two minutes and check saved state before releasing this save.');
+      // Jira shows this save landed: it is settled as saved instead, never reverted.
+      if (landed(issue, field, pending))
+        throw new UserError('Saved state changed. Check saved state again.');
       await p.cas(issue.id, stored.revision, withoutPending(stored.data));
       return { resolved: true };
-    },
-    async acceptSave(c: Context, input: RecoveryInput) {
-      const { issue, field, stored, pending } = await recoveryTarget(c, input, 'accepting');
-      if (!adoptable(issue, field, pending))
-        throw new UserError(
-          'The work item no longer matches the requested save. Investigate in Jira; nothing was accepted.',
-        );
-      // Adopt Jira's representation of the requested block; never write Jira here.
-      const managed =
-        pending.scope !== 'field' && pending.shape
-          ? observedManaged(issue.fields.description, pending.managed)
-          : null;
-      await p.cas(issue.id, stored.revision, { ids: pending.ids, managed });
-      return { accepted: true };
     },
     async setup(c: Context) {
       const project = await p.project(c.projectId);
@@ -521,70 +398,97 @@ export function createService(p: Ports) {
       ]
         .filter(Boolean)
         .join(' ');
-      const other = await otherSection(c, issue, stored.data.managed, type, cleanupOnly);
       return {
         ...library,
-        ...(other ? { otherSection: other } : {}),
         cleanupOnly,
         refreshAfterSave,
         ...(loadWarning ? { loadWarning } : {}),
         ids: stored.data.ids,
         revision: stored.revision,
-        fingerprint: targetHash(issue, field),
       };
     },
-    async save(
-      c: Context,
-      input: { ids: string[]; revision: number; fingerprint: string; replace?: string },
-    ) {
+    /**
+     * Save writes the chosen prompts; Sync (`{ sync: true }`) writes the saved ones again. Both do
+     * the same thing: remove every Agent Prompts block in the description and write one section
+     * from the prompts' current text, leaving everything else as it is. A prompt that was
+     * deleted, never existed, left the space or is no longer a prompt is dropped from the field
+     * and the section, and named in `dropped`. Only a prompt the user may not see stops it.
+     */
+    async save(c: Context, input: SaveInput) {
+      const sync = input.sync === true;
+      const chosen = input.ids;
       if (
-        input.replace !== undefined &&
-        (typeof input.replace !== 'string' || !/^[0-9a-f]{64}$/.test(input.replace))
-      )
-        throw new UserError('Invalid section to replace. Reopen the field.');
-      if (
-        !Array.isArray(input.ids) ||
-        input.ids.length > 5 ||
-        new Set(input.ids).size !== input.ids.length ||
-        !Number.isInteger(input.revision) ||
-        typeof input.fingerprint !== 'string'
+        !sync &&
+        (!Array.isArray(chosen) ||
+          chosen.length > 5 ||
+          new Set(chosen).size !== chosen.length ||
+          !Number.isInteger(input.revision))
       )
         throw new UserError('Choose up to five distinct prompts.');
-      input.ids.forEach(numeric);
+      if (!sync) chosen!.forEach(numeric);
       const type = await scope(c);
       const field = await p.field();
       const issue = await target(c, field);
       await p.allowed(c.projectId, 'EDIT_ISSUES', issue.id);
-      if (input.ids.includes(issue.id)) throw new UserError('A prompt cannot use itself.');
       const stored = await state(issue, field);
-      if (
-        issue.fields.issuetype.id === type &&
-        (!stored.data.ids.length || input.ids.some((id) => !stored.data.ids.includes(id)))
-      )
-        throw new UserError(
-          'A prompt cannot use other prompts. It can only remove prompts it already has.',
-        );
-      if (stored.revision !== input.revision || targetHash(issue, field) !== input.fingerprint)
-        throw new UserError('The work item changed. Review your selection and save again.');
-      const sources = await Promise.all(input.ids.map((id) => p.issue(id)));
-      const needsRetainedType = sources.some(
-        (source) =>
-          source.fields.project.id === c.projectId &&
-          source.fields.issuetype.id !== type &&
-          stored.data.ids.includes(source.id),
-      );
-      const retained = needsRetainedType ? await p.retainedTypes(c.projectId) : [];
-      const prompts = sources.map((source) => {
+      const ids = sync ? stored.data.ids : chosen!;
+      if (!sync) {
+        if (ids.includes(issue.id)) throw new UserError('A prompt cannot use itself.');
         if (
-          source.fields.project.id !== c.projectId ||
-          (source.fields.issuetype.id !== type &&
-            !(stored.data.ids.includes(source.id) && retained.includes(source.fields.issuetype.id)))
+          issue.fields.issuetype.id === type &&
+          (!stored.data.ids.length || ids.some((id) => !stored.data.ids.includes(id)))
         )
           throw new UserError(
-            'A selected prompt moved or changed type. Remove it from your selection.',
+            'A prompt cannot use other prompts. It can only remove prompts it already has.',
           );
-        if (source.id !== input.ids[sources.indexOf(source)])
-          throw new UserError('Jira returned a different source. Reopen the field.');
+        if (stored.revision !== input.revision)
+          throw new UserError('The work item changed. Review your selection and save again.');
+      }
+      // A prompt Jira can no longer find, or finds under another key, is named by the key the
+      // user knew.
+      const label = (id: string, key?: string) =>
+        stored.data.keys?.[stored.data.ids.indexOf(id)] ?? key ?? `the prompt with ID ${id}`;
+      const reads = await Promise.all(
+        ids.map((id) =>
+          p.issue(id).then(
+            (source) => ({ id, source }),
+            (error: unknown) => {
+              if (!notFound(error)) throw error;
+              return { id, source: undefined };
+            },
+          ),
+        ),
+      );
+      const hidden = reads
+        .filter((r) => !r.source && stored.data.secured?.includes(r.id))
+        .map((r) => label(r.id));
+      if (hidden.length)
+        throw new UserError(
+          `${sync ? 'Nothing was synced' : 'Nothing was saved'}: you can't see ${list(hidden)} in Jira. A Jira administrator manages who can see ${hidden.length > 1 ? 'them' : 'it'}.`,
+        );
+      const found = reads.filter(
+        (r): r is { id: string; source: Issue } =>
+          !!r.source && r.source.fields.project.id === c.projectId,
+      );
+      if (found.some((r) => r.source.id !== r.id))
+        throw new UserError('Jira returned a different source. Reopen the field.');
+      // A prompt of a previous prompt type stays while it is saved; it can't be added again.
+      const retained = found.some(
+        (r) => r.source.fields.issuetype.id !== type && stored.data.ids.includes(r.id),
+      )
+        ? await p.retainedTypes(c.projectId)
+        : [];
+      const kept = found
+        .map((r) => r.source)
+        .filter(
+          (source) =>
+            source.fields.issuetype.id === type ||
+            (stored.data.ids.includes(source.id) && retained.includes(source.fields.issuetype.id)),
+        );
+      const dropped = reads
+        .filter((r) => !kept.some((source) => source.id === r.id))
+        .map((r) => label(r.id, r.source?.key));
+      const prompts = kept.map((source) => {
         try {
           return {
             id: source.id,
@@ -597,52 +501,50 @@ export function createService(p: Ports) {
           throw error;
         }
       });
-      const next = synchronizeDescription(
-        issue.fields.description,
-        prompts,
-        stored.data.managed,
-        sectionLocalId(issue.id),
-        input.replace,
-      );
-      const keys = sources.map((s) => s.key);
+      const keptIds = kept.map((source) => source.id);
+      const keys = kept.map((source) => source.key);
+      const secured = kept.filter((source) => !!source.fields.security).map((source) => source.id);
+      // Written over the description as it is now, read after the prompts, so a description edit
+      // made while the field was open is kept.
       const fresh = await target(c, field);
-      if (targetHash(fresh, field) !== input.fingerprint)
-        throw new UserError('The work item changed. Review your selection and save again.');
-      // A block the user already deleted is forgotten by clearing only the field: the
-      // Description is never rewritten on that path.
-      const fields = next.forgotten
-        ? { [field]: keys }
-        : { description: next.description, [field]: keys };
-      const pending: Receipt = next.forgotten
+      const description = synchronizeDescription(
+        fresh.fields.description,
+        prompts,
+        sectionLocalId(issue.id),
+      );
+      // When only the field changes, the description isn't sent, so a description edit made
+      // meanwhile can't be overwritten.
+      const fieldOnly = hash(description) === hash(fresh.fields.description ?? null);
+      const fields = fieldOnly ? { [field]: keys } : { description, [field]: keys };
+      const pending: Receipt = fieldOnly
         ? {
-            before: fieldHash(issue, field),
+            before: fieldHash(fresh, field),
             after: hash(['field', keys]),
-            ids: input.ids,
-            managed: null,
+            ids: keptIds,
+            keys,
+            secured,
             scope: 'field',
           }
         : {
-            before: contentHash(issue, field),
-            after: hash([next.description, keys]),
-            ids: input.ids,
-            managed: next.managed,
+            before: contentHash(fresh, field),
+            after: hash([description, keys]),
+            ids: keptIds,
+            secured,
             keys,
-            shape: next.shape,
-            beforeField: fieldHash(issue, field),
-            beforeBlock: trackedBlock(issue.fields.description, sectionLocalId(issue.id)),
-            afterBlock: trackedBlock(next.description, sectionLocalId(issue.id)),
+            beforeField: fieldHash(fresh, field),
           };
+      const result = (revision: number) => ({
+        revision,
+        ids: keptIds,
+        ...(dropped.length ? { dropped } : {}),
+      });
       // An unchanged write cannot be distinguished from an in-flight write by
       // recovery. Never publish such a claim or send a redundant Jira update.
       if (pending.before === pending.after) {
-        const data = { ids: input.ids, managed: next.managed };
+        const data = selection({ ids: keptIds, keys, secured });
         const changed = hash(data) !== hash(stored.data);
         if (changed) await p.cas(issue.id, stored.revision, data);
-        return {
-          revision: stored.revision + (changed ? 1 : 0),
-          fingerprint: targetHash(fresh, field),
-          ids: input.ids,
-        };
+        return result(stored.revision + (changed ? 1 : 0));
       }
       const attemptId = randomUUID();
       const prepared = { ...pending, attemptId, phase: 'prepared' as const, started: Date.now() };
@@ -677,19 +579,9 @@ export function createService(p: Ports) {
         }
         throw new UserError('The save could not be confirmed.');
       }
-      const observed = await target(c, field);
-      let managed = pending.managed;
-      if (receiptHash(observed, field, pending) !== pending.after) {
-        // Jira confirmed the write (2xx) but returned another representation. While this
-        // invocation still holds the claim, adopt it if the field and block skeleton match.
-        if (!adoptable(observed, field, { ...prepared, phase: 'submitted' }))
-          throw new UserError('The saved work item did not match the requested change.');
-        managed =
-          pending.scope !== 'field' && pending.shape
-            ? observedManaged(observed.fields.description, pending.managed)
-            : null;
-      }
-      const settled = { ids: input.ids, managed };
+      // Jira confirmed the write; it may store the description in its own form, which the next
+      // Sync rewrites anyway.
+      const settled = selection({ ids: keptIds, keys, secured });
       let revision = stored.revision + 3;
       try {
         await p.cas(issue.id, stored.revision + 2, settled);
@@ -699,7 +591,7 @@ export function createService(p: Ports) {
         if (!current || current.data.pending || hash(current.data) !== hash(settled)) throw error;
         revision = current.revision;
       }
-      return { revision, fingerprint: targetHash(observed, field), ids: input.ids };
+      return result(revision);
     },
   };
 }

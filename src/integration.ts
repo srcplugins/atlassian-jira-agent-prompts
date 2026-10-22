@@ -291,7 +291,7 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
     issue: async (id, field) => {
       if (!/^(?:[1-9]\d{0,19}|[A-Z][A-Z0-9_]{1,30}-[1-9]\d*)$/.test(id))
         throw new UserError('Invalid work item key.');
-      const fields = `project,issuetype,summary,description,updated,status${field ? `,${field}` : ''}`;
+      const fields = `project,issuetype,summary,description,updated,status,security${field ? `,${field}` : ''}`;
       const value = await request(route`/rest/api/3/issue/${id}?fields=${fields}`);
       if (
         !value ||
@@ -1122,15 +1122,7 @@ export function registerResolvers(sdk: Sdk) {
         (e) => e instanceof UserError,
       ),
     );
-  for (const name of [
-    'setup',
-    'search',
-    'load',
-    'save',
-    'save-status',
-    'resolve-save',
-    'accept-save',
-  ] as const) {
+  for (const name of ['setup', 'search', 'load', 'save', 'save-status', 'resolve-save'] as const) {
     resolver.define(name, (request) =>
       resolveSafely(
         async () => {
@@ -1140,8 +1132,8 @@ export function registerResolvers(sdk: Sdk) {
           if (!record(payload)) throw new UserError('Invalid request.');
           const allowed =
             name === 'save'
-              ? ['ids', 'revision', 'fingerprint', 'replace']
-              : name === 'resolve-save' || name === 'accept-save'
+              ? ['ids', 'revision', 'sync']
+              : name === 'resolve-save'
                 ? ['revision', 'fingerprint', 'acknowledged']
                 : name === 'search'
                   ? ['query', 'cursor']
@@ -1153,11 +1145,6 @@ export function registerResolvers(sdk: Sdk) {
             return service.resolveSave(
               c,
               payload as unknown as Parameters<typeof service.resolveSave>[1],
-            );
-          if (name === 'accept-save')
-            return service.acceptSave(
-              c,
-              payload as unknown as Parameters<typeof service.acceptSave>[1],
             );
           if (name === 'save')
             return service.save(c, payload as unknown as Parameters<typeof service.save>[1]);

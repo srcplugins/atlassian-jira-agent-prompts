@@ -2,6 +2,13 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
+## 1.0.3
+
+- **Sync always fixes the Agent Prompts section.** Save and Sync replace every collapsible section titled Agent Prompts in the description with one fresh section from the prompts the field links, wherever those sections are and whatever anyone edited, typed, moved, copied or deleted. They no longer refuse and ask you to undo a change in Jira first. The rest of the description stays as it is.
+- **Deleted prompts.** A linked prompt that was deleted, never existed or is no longer a prompt in the space is removed from the field and the section, and the field says which. Only a linked prompt you aren't allowed to see stops a save, with a message saying so; nothing is changed.
+- **Sync without saved prompts.** Sync is available even when the field links no prompts, so it can remove an Agent Prompts section someone added by hand.
+- **Unconfirmed saves.** A save whose response was lost settles by itself when Jira shows it landed: the field changed to exactly the prompts it saved, or the description and field are exactly what it wrote. An administrator can release any other after two minutes, keeping the last saved prompts; Sync then rewrites the section. The "Use its prompts" and accept choices from 1.0.2 are gone.
+
 ## 1.0.2
 
 - **Jira's Create form.** The Agent Prompts field is no longer on Jira's Create form, so the form never waits for it to load. Add prompts once the work item exists.
