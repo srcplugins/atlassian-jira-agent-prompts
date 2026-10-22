@@ -15,7 +15,6 @@ const app = files('src')
   .map((path) => readFileSync(path, 'utf8'))
   .join('\n');
 const notAppText = new Map([
-  ['/^(Agent Prompts, .*edit|Edit Agent Prompts)$/', 'Jira names the custom field editor'],
   ['/remove.*Error handling/i', 'the picker remove button for a fixture prompt'],
   ['/remove.*Unavailable prompt/i', 'the picker remove button; the label is a template literal'],
   ["'2/5 selected · Unsaved changes'", 'computed selection count'],
@@ -55,6 +54,11 @@ const notAppText = new Map([
   ["'Type: Task'", "Jira's Create form work type button"],
   ['/^Type: /', "Jira's Create form work type button"],
   ["'Select label'", "Jira's default editor for a list field, which the app replaces"],
+  ['/^Agent Prompts/', "the field's name as Jira labels it on the work item"],
+  ['/^Close/', "Jira's Create form close button"],
+  ['/expand content/i', "the expand toggle in Jira's Description editor"],
+  ["'Switch to sidebar'", "the button on Jira's work item modal over a board"],
+  ["'Jira work item'", "the heading of Jira's work item side panel on a board"],
 ]);
 const locator =
   /(?:getByText|\bline|getByLabel|getByPlaceholder|toContainText|toHaveText|hasText:|name:)\s*\(?\s*('(?:[^'\\]|\\.)*'|\/(?:[^/\\\n]|\\.)+\/[a-z]*)/g;
@@ -85,6 +89,21 @@ test('hosted text locators match text the app renders', () => {
       found.some((entry) => entry.literal === literal),
       `Unused exception ${literal}`,
     );
+});
+
+// A site can have a development and a production installation, each with its own field named
+// Agent Prompts, so a lookup or locator by name can find the other installation's field. Only
+// support/field.mjs finds the field (by this installation's app and environment) and its read view
+// (by field ID).
+test('hosted tests find the field through support/field.mjs', () => {
+  const helper = join('tests', 'hosted', 'support', 'field.mjs');
+  const direct = files('tests/hosted')
+    .filter((path) => path.endsWith('.mjs') && path !== helper)
+    .filter((path) =>
+      /\(\s*'\/field'\s*\)|inline-edit-read-view-container/.test(readFileSync(path, 'utf8')),
+    );
+  assert.deepEqual(direct, [], 'Use agentPromptsField and fieldReadView');
+  assert.match(readFileSync(helper, 'utf8'), /inline-edit-read-view-container/);
 });
 
 // Outside the Playwright test runner `expect` waits only 5 s, and hosted Jira often takes longer, so

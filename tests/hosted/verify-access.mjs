@@ -21,6 +21,7 @@ import {
   siteFor,
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
+import { agentPromptsField, fieldReadView } from './support/field.mjs';
 import {
   identityFixture,
   tokenRequest,
@@ -281,10 +282,7 @@ try {
       () => spaceSettings(page, fixtureProject(agentPromptsFixture)),
       t,
     );
-    const field = (await api('/field')).find(
-      (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
-    );
-    assert.ok(field, 'Agent Prompts field required');
+    const field = await agentPromptsField(api, t);
 
     stage('create-space');
     assert.equal(await api(`/project/${j.key}`), null);
@@ -506,13 +504,7 @@ try {
       )
       .toBe(2);
 
-    const readView = (p) =>
-      p
-        .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-        .locator('..')
-        .locator(
-          '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
-        );
+    const readView = (p) => fieldReadView(p, field.id);
     const editor = (p) => p.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
     const open = async (p) => {
       await p.goto(`${j.site}/browse/${target.key}`);

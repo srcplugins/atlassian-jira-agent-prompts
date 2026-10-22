@@ -1,7 +1,7 @@
 import './support/typescript-loader.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-const { createService, JiraRejected, UserError, limited } = await import('../src/service.ts');
+const { createService, JiraRejected, UserError, limited, hash } = await import('../src/service.ts');
 const { sourceContent } = await import('../src/prompt-text.ts');
 const { createSettings } = await import('../src/settings.ts');
 const { screenFixture } = await import('./screen-fixture.mjs');
@@ -572,4 +572,64 @@ test('the Space settings page opens in company-managed and team-managed Software
     if (ok) assert.deepEqual(Object.keys(await service.setup(c)), ['project']);
     else await assert.rejects(service.setup(c), /^Error: Jira software spaces only\.$/);
   }
+});
+
+test('an Agent Prompts section the field does not track is reported with its prompts and replaced only when named', async () => {
+  const f = fixture();
+  const heading = (text) => ({
+    type: 'heading',
+    attrs: { level: 2 },
+    content: [{ type: 'text', text }],
+  });
+  const leftover = {
+    type: 'expand',
+    attrs: { localId: 'agent-prompts-99', title: 'Agent Prompts' },
+    content: [
+      heading('TEST-20: Review'),
+      doc('Old copy').content[0],
+      heading('TEST-30: Deleted'),
+      heading('TEST-10: Itself'),
+      heading('TEST-40: Retired'),
+    ],
+  };
+  f.target.fields.description.content.push(leftover);
+  const original = structuredClone(f.target.fields.description);
+  const issue = f.ports.issue;
+  const retired = structuredClone(f.source);
+  Object.assign(retired, { id: '40', key: 'TEST-40' });
+  retired.fields.status = { statusCategory: { key: 'done' } };
+  f.ports.issue = async (id, field) => {
+    if (id === 'TEST-30') throw new UserError('Not found.');
+    if (id === 'TEST-40') return structuredClone(retired);
+    return issue(id === 'TEST-10' ? '10' : id === 'TEST-20' ? '20' : id, field);
+  };
+  const loaded = await f.service.load(c);
+  assert.deepEqual(loaded.otherSection, {
+    count: 1,
+    replace: hash(leftover),
+    prompts: [{ id: '20', key: 'TEST-20', name: 'Review' }],
+    unavailable: ['TEST-30', 'TEST-10', 'TEST-40'],
+  });
+  const input = { ...loaded };
+  delete input.otherSection;
+  // Without naming it, a save that writes a section is refused and Jira is untouched.
+  await assert.rejects(
+    f.service.save(c, { ...input, ids: ['20'] }),
+    /section the app didn't save\. Delete it from the description, or use its prompts here/,
+  );
+  for (const replace of ['', 'x'.repeat(64), 42])
+    await assert.rejects(f.service.save(c, { ...input, ids: ['20'], replace }), /Invalid section/);
+  assert.equal(f.calls(), 0);
+  assert.deepEqual(f.target.fields.description, original);
+  // Named, it is replaced by the app's own section in its place.
+  await f.service.save(c, { ...input, ids: ['20'], replace: hash(leftover) });
+  assert.equal(f.calls(), 1);
+  assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
+  const [kept, section, ...rest] = f.target.fields.description.content;
+  assert.deepEqual(kept, original.content[0]);
+  assert.deepEqual(rest, []);
+  assert.equal(section.attrs.localId, 'agent-prompts-10');
+  assert.match(JSON.stringify(section), /Check errors/);
+  assert.doesNotMatch(JSON.stringify(section), /Old copy/);
+  assert.equal((await f.service.load(c)).otherSection, undefined);
 });

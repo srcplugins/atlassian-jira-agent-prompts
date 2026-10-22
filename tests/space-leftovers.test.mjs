@@ -41,19 +41,34 @@ const order = [
   'DELETE /filter/',
 ];
 
-/** The helper over the fake; every write must follow a journal write made since the previous one. */
-function harness(world, options) {
+/**
+ * The helper over the fake; every write must follow a journal write made since the previous one.
+ * `stale: { path, id, reads }` keeps Jira listing that object for `reads` reads after its delete.
+ */
+function harness(world, { stale, ...options } = {}) {
   const jira = fakeJira(world, options);
   let journaled = false;
+  let staleLeft = 0;
+  let stalePage;
+  const pauses = [];
   const persist = () => (journaled = true);
-  const api = (path, method = 'GET', body) => {
+  const api = async (path, method = 'GET', body) => {
+    const read = stale && `${stale.path}?id=${stale.id}&`;
     if (method !== 'GET') {
       assert.ok(journaled, `${method} ${path} before its intent was journaled`);
       journaled = false;
+      if (stale && path === `${stale.path}/${stale.id}`) {
+        stalePage = await jira.api(`${read}startAt=0&maxResults=100`);
+        staleLeft = stale.reads;
+      }
+    } else if (staleLeft && path.startsWith(read)) {
+      staleLeft--;
+      return stalePage;
     }
     return jira.api(path, method, body);
   };
-  return { ...spaceLeftovers(api), ...jira, persist };
+  const readBack = { tries: 3, ms: 2000, pause: async (ms) => void pauses.push(ms) };
+  return { ...spaceLeftovers(api, readBack), ...jira, persist, pauses };
 }
 const kinds = (entries) => {
   const out = {};
@@ -154,6 +169,26 @@ test('a lost delete response is read back on the next run instead of repeated', 
   assert.deepEqual(await h.remove(entries, h.persist), []);
   assert.ok(!h.writes.slice(writes).includes('DELETE /screens/1021'));
   assert.equal(entries.find((x) => x.id === '1021').state, 'deleted');
+});
+
+test('a deleted object Jira still lists for a moment is read again, not deleted again', async () => {
+  const world = site();
+  const h = harness(world, { stale: { path: '/screens', id: '1021', reads: 3 } });
+  const entries = await h.find({ keys: [deleted[0]] });
+  assert.deepEqual(await h.remove(entries, h.persist), []);
+  assert.equal(h.writes.filter((w) => w === 'DELETE /screens/1021').length, 1);
+  assert.equal(entries.find((x) => x.id === '1021').state, 'deleted');
+  assert.deepEqual(h.pauses, [2000, 2000, 2000]);
+});
+
+test('a deleted object Jira lists after every read-back stops as intent', async () => {
+  const world = site();
+  const h = harness(world, { stale: { path: '/screens', id: '1021', reads: 4 } });
+  const entries = await h.find({ keys: [deleted[0]] });
+  await assert.rejects(h.remove(entries, h.persist), /The screen 1021 is still there/);
+  assert.equal(h.writes.filter((w) => w === 'DELETE /screens/1021').length, 1);
+  assert.equal(entries.find((x) => x.id === '1021').state, 'intent');
+  assert.equal(h.pauses.length, 3);
 });
 
 test('a delete Jira refuses is recorded and the rest go on', async () => {

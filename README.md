@@ -9,7 +9,7 @@ Stop repeating the same instructions across Jira work items. Create reusable pro
 ## Features
 
 - **Manage prompts directly in Jira.** Create reusable prompts as ordinary Jira work items, using Jira's editor, permissions and history.
-- **Give every work item the right context.** Add up to five prompts to a work item, with their instructions saved directly in the description. Each prompt holds up to 4,000 characters of text. Add prompts once the work item exists: on Jira's Create form, the field says so.
+- **Give every work item the right context.** Add up to five prompts to a work item, with their instructions saved directly in the description. Each prompt holds up to 4,000 characters of text. Add prompts once the work item exists: the field isn't on Jira's Create form.
 - **Update instructions.** After editing a prompt, Sync a work item that uses it to copy the new instructions.
 - **Retire prompts.** Move a prompt to any status in Jira's Done category and the field and the Rovo assistant stop suggesting it; work items that use it keep it. Don't use a Done-category status to mean approved.
 - **Ask Rovo.** Find prompts and read their instructions with the read-only Agent Prompts Assistant.
@@ -22,7 +22,7 @@ For installation, configuration, usage and troubleshooting, see the [website doc
 
 ## Changes to Jira
 
-- **On install:** adds the Agent Prompts field, a **Configure** page under **Manage apps**, an **Agent Prompts for Jira** page in each space's settings and, where Rovo is enabled, the read-only Agent Prompts Assistant. Spaces, screens and work types stay unchanged until an administrator sets up a space.
+- **On install:** adds the Agent Prompts field, a **Configure** page (in Atlassian Administration, **Connected apps → Installed apps**, then **Configure** in the app's row actions), an **Agent Prompts for Jira** page under **Apps** in each space's settings and, where Rovo is enabled, the read-only Agent Prompts Assistant. Spaces, screens and work types stay unchanged until an administrator sets up a space.
 - **When an administrator sets up a company-managed space,** after reviewing and approving each change:
   - Creates a site-wide prompt work type or reuses an existing one, and adds it to the space's work type scheme.
   - Adds the Agent Prompts field to the edit and view screens of the work types they choose. Jira also updates the field configuration so the field shows.

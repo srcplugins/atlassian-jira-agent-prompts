@@ -6,8 +6,9 @@ import { call } from './client';
 import { usePromptSearch } from './prompt-search';
 import { SaveRecovery } from './save-recovery-ui';
 import { router } from '@forge/bridge';
-import type { Prompt, PromptPage, SaveStatus } from './service';
+import type { OtherSection, Prompt, PromptPage, SaveStatus } from './service';
 interface Loaded extends PromptPage {
+  otherSection?: OtherSection;
   cleanupOnly: boolean;
   refreshAfterSave: boolean;
   loadWarning?: string;
@@ -35,6 +36,8 @@ export function Field() {
   const [ids, setIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  // The user chose to replace the description's other Agent Prompts section on the next save.
+  const [replacing, setReplacing] = useState(false);
   const [recovery, setRecovery] = useState(false);
   const [recoveryStatus, setRecoveryStatus] = useState<SaveStatus>();
   const [loadError, setLoadError] = useState('');
@@ -58,6 +61,7 @@ export function Field() {
       resetSearch(value);
       remember(value);
       setIds(value.ids);
+      setReplacing(false);
       setMessage('');
       setRecovery(false);
     } catch (e) {
@@ -116,7 +120,8 @@ export function Field() {
   }
   async function save(refresh = false) {
     if (!data || busy || recovery) return;
-    const dirty = JSON.stringify(ids) !== JSON.stringify(data.ids);
+    const replace = replacing && ids.length ? data.otherSection?.replace : undefined;
+    const dirty = JSON.stringify(ids) !== JSON.stringify(data.ids) || !!replace;
     if (refresh ? dirty || !data.ids.length : !dirty) return;
     refocus.current = true;
     setMessage('');
@@ -127,8 +132,12 @@ export function Field() {
         ids,
         revision: data.revision,
         fingerprint: data.fingerprint,
+        ...(replace ? { replace } : {}),
       });
-      setData({ ...data, ...value });
+      // A replaced section is gone; any other stays until the next load.
+      const { otherSection, ...rest } = data;
+      setData({ ...rest, ...value, ...(replace || !otherSection ? {} : { otherSection }) });
+      setReplacing(false);
       setRecovery(false);
       await saved(refresh, data.refreshAfterSave);
     } catch (e) {
@@ -138,6 +147,8 @@ export function Field() {
         const current = await call<Loaded>('load');
         setData(current);
         remember(current);
+        // The choice to replace holds only while it names the same section.
+        if (current.otherSection?.replace !== data.otherSection?.replace) setReplacing(false);
         // Keep a real draft. Without one (every Sync), show the saved selection: keeping the old
         // list would turn it into a draft whose Save reverts someone else's newer save.
         if (!dirty) setIds(current.ids);
@@ -189,7 +200,19 @@ export function Field() {
           .map((id) => ({ label: `Unavailable prompt (${id})`, value: id })),
       ]
     : [];
-  const dirty = !!data && JSON.stringify(ids) !== JSON.stringify(data.ids);
+  const other = data?.otherSection;
+  const replacingNow = replacing && !!other?.replace && ids.length > 0;
+  const dirty = !!data && (JSON.stringify(ids) !== JSON.stringify(data.ids) || replacingNow);
+  // Adds the other section's prompts to the selection, up to five, and replaces it on save.
+  function useOther() {
+    if (!other) return;
+    for (const p of other.prompts) retained.current.set(p.id, p);
+    setIds(
+      [...ids, ...other.prompts.map((p) => p.id).filter((id) => !ids.includes(id))].slice(0, 5),
+    );
+    setReplacing(true);
+    setMessage('');
+  }
   return (
     <div className="prompt-field">
       {data && (
@@ -302,6 +325,59 @@ export function Field() {
           </p>
         </>
       )}
+      {data && other && (
+        <div className="other-section">
+          <p>
+            {other.count > 1
+              ? `This description has ${other.count} Agent Prompts sections the app didn't save.`
+              : "This description has an Agent Prompts section the app didn't save."}
+          </p>
+          {!other.replace ? (
+            <p>{other.count > 1 ? 'Delete them' : 'Delete it'} from the description in Jira.</p>
+          ) : (
+            <>
+              {!!other.prompts.length && (
+                <>
+                  <p>It lists:</p>
+                  <ul>
+                    {other.prompts.map((p) => (
+                      <li key={p.id}>
+                        <a
+                          href={`/browse/${p.key}`}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            void router.open(`/browse/${p.key}`);
+                          }}
+                        >
+                          {`${p.key} — ${p.name}`}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+              {!!other.unavailable.length && (
+                <p>{`Not prompts this work item can use: ${other.unavailable.join(', ')}.`}</p>
+              )}
+              {replacingNow ? (
+                <p>Saving replaces that section with the app&apos;s own.</p>
+              ) : replacing ? (
+                <p>Choose a prompt to replace that section with.</p>
+              ) : (
+                <>
+                  <p>
+                    Delete it from the description in Jira, or use its prompts here and save to
+                    replace it.
+                  </p>
+                  <Button onMouseDown={retainSearchFocus} isDisabled={busy} onClick={useOther}>
+                    {other.prompts.length ? 'Use its prompts' : 'Replace it when saving'}
+                  </Button>
+                </>
+              )}
+            </>
+          )}
+        </div>
+      )}
       {data?.loadWarning && <p>{data.loadWarning}</p>}
       {/* Present from the first render so assistive technology announces each outcome. */}
       <p role="status">{loadError || message}</p>
@@ -342,6 +418,7 @@ export function Field() {
               onClick={() => {
                 focusPicker();
                 setIds(data.ids);
+                setReplacing(false);
                 setMessage('');
               }}
             >

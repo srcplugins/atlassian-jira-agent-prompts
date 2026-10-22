@@ -11,7 +11,11 @@ const prefixed = new RegExp(`^${runnerKey}: `);
 const settled = ['deleted', 'kept', 'refused'];
 
 /** Finds and deletes the leftovers of deleted runner spaces through the Jira client `api`. */
-export function spaceLeftovers(api) {
+/** `readBack` bounds the reads after a delete: up to `tries` more, `ms` apart. */
+export function spaceLeftovers(
+  api,
+  readBack = { tries: 15, ms: 2000, pause: (ms) => new Promise((r) => setTimeout(r, ms)) },
+) {
   async function list(path) {
     const out = [];
     for (let start = 0, n = 0; n < 200; n++) {
@@ -173,7 +177,13 @@ export function spaceLeftovers(api) {
           await settle(x, 'refused', error.message);
           continue;
         }
-        assert.equal(await k.read(x.id, x.name), null, `The ${k.kind} ${x.id} is still there`);
+        // Jira can still list an object for a few seconds after deleting it; only the read repeats.
+        let still = await k.read(x.id, x.name);
+        for (let n = 0; still && n < readBack.tries; n++) {
+          await readBack.pause(readBack.ms);
+          still = await k.read(x.id, x.name);
+        }
+        assert.equal(still, null, `The ${k.kind} ${x.id} is still there`);
         await settle(x, 'deleted');
       }
     return entries.filter((x) => x.state !== 'deleted');
