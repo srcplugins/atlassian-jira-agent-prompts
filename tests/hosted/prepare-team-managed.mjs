@@ -11,6 +11,7 @@ import {
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { expect } from './support/expect.mjs';
 import { teamManagedFixture } from './support/fixture.mjs';
+import { agentPromptsField } from './support/field.mjs';
 
 // Creates once, or verifies, the marked team-managed space the team-managed journey uses, then
 // does a space administrator's manual setup in it through Jira's own pages, as the website
@@ -67,10 +68,7 @@ try {
   const old = existsSync(journal) ? JSON.parse(readFileSync(journal, 'utf8')) : {};
   save({ ...old, key, id: project.id, status: 'verified' });
 
-  const field = (await api('/field')).find((f) =>
-    String(f.schema?.custom ?? '').endsWith('/agent-prompts-field'),
-  )?.id;
-  assert.ok(field, 'The Agent Prompts field is missing; install the app first');
+  const field = (await agentPromptsField(api)).id;
   const types = async () =>
     (await api(`/issuetype/project?projectId=${project.id}`)).filter(
       (t) => t.scope?.project?.id === project.id,

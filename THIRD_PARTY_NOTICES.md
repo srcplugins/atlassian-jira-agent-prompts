@@ -213,7 +213,7 @@ Production dependencies included in this app and its UI bundles.
 | lodash | 4.18.1 | MIT |
 | loose-envify | 1.4.0 | MIT |
 | lru-cache | 11.5.3 | BlueOak-1.0.0 |
-| markdown-it | 14.3.2 | MIT |
+| markdown-it | 14.3.3 | MIT |
 | mdurl | 2.1.0 | MIT |
 | memoize-one | 6.0.0 | MIT |
 | mime-db | 1.52.0 | MIT |

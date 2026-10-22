@@ -15,6 +15,7 @@ import {
 import { spaceHealth } from './support/space-settings.mjs';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
+import { agentPromptsField, fieldReadView } from './support/field.mjs';
 const host = activeTarget();
 
 if (process.env.NATIVE_SCALE_TESTS !== '1') throw Error('Explicit NATIVE_SCALE_TESTS=1 required');
@@ -88,13 +89,8 @@ try {
       page.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
     const combo = (page) =>
       frame(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
-    const read = (page) =>
-      page
-        .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-        .locator('..')
-        .locator(
-          '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
-        );
+    const field = await agentPromptsField(api, t);
+    const read = (page) => fieldReadView(page, field.id);
     const search = async (page, query, scale, session, operation = 'search-visible') => {
       const started = performance.now();
       const result = await observeAction(page, 'search', () => combo(page).fill(query), t);
@@ -229,10 +225,6 @@ try {
         `${scale} prompts: all ${pageCount} picker pages verified, no missing/duplicate prompts`,
       );
     }
-    const field = (await api('/field')).find(
-      (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
-    );
-    assert.ok(field);
     const selected = sourceEntries().slice(0, 5);
     const sourceIssues = await Promise.all(
       selected.map((s) => api(`/issue/${s.id}?fields=summary,description`)),

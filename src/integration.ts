@@ -1140,7 +1140,7 @@ export function registerResolvers(sdk: Sdk) {
           if (!record(payload)) throw new UserError('Invalid request.');
           const allowed =
             name === 'save'
-              ? ['ids', 'revision', 'fingerprint']
+              ? ['ids', 'revision', 'fingerprint', 'replace']
               : name === 'resolve-save' || name === 'accept-save'
                 ? ['revision', 'fingerprint', 'acknowledged']
                 : name === 'search'

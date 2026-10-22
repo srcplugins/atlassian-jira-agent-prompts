@@ -5,6 +5,9 @@ modules:
       description: Prompts whose instructions are copied into the work item's description on Save.
       type: string
       collection: list
+      # Prompts can only be added to an existing work item, so the field stays off Jira's Create form.
+      displayConditions:
+        jiraExpression: issue != null && issue.id != null
       resolver:
         function: resolver
       edit:

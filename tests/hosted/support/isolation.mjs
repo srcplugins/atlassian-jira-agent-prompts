@@ -10,6 +10,7 @@ import {
 import { client, observeAction } from '@srcplugins/atlassian-forge-test-framework/jira';
 import { editor, openField, snapshotJourney } from './snapshots.mjs';
 import { spaceSettings } from './space-settings.mjs';
+import { fieldReadView } from './field.mjs';
 
 // Keep the source journal live while probing the other installation. All writes go through
 // the destination's owned fixture journal; the peer client is used only for independent reads.
@@ -102,10 +103,7 @@ export async function runIsolationProbe({
   state.lifecycle.localBackup = local;
   owned.run.persist();
   await page.goto(`${activeTarget().site}/browse/${local.targetKey}`);
-  const readView = page
-    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-    .locator('..')
-    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const readView = fieldReadView(page, local.fieldId);
   const loaded = await observeAction(page, 'load', () => openField(page, readView), target);
   assert.deepEqual(loaded.ids, [local.sourceId]);
   assert.ok(

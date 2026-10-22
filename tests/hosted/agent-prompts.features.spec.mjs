@@ -15,6 +15,8 @@ import {
   markers,
 } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture, teamManagedFixture } from './support/fixture.mjs';
+import { agentPromptsField, fieldReadView } from './support/field.mjs';
+import { spaceBoard } from './support/board.mjs';
 import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
 import { reviewConfiguration } from './support/configuration-dialog.mjs';
 import {
@@ -26,6 +28,17 @@ import {
   removeSetup,
 } from './support/team-managed.mjs';
 test.use({ fixtureApp: agentPromptsFixture });
+/** A node without the localIds Jira's editors stamp, as the app copies a prompt's content. */
+function unstamped(node) {
+  const copy = { ...node };
+  if (copy.attrs) {
+    copy.attrs = { ...copy.attrs };
+    delete copy.attrs.localId;
+    if (!Object.keys(copy.attrs).length) delete copy.attrs;
+  }
+  if (node.content) copy.content = node.content.map(unstamped);
+  return copy;
+}
 test('AP-04 real non-admin sessions cannot administer setup', async ({ browser, jiraRequest }) => {
   test.skip(
     process.env.NATIVE_IDENTITY_TESTS !== '1',
@@ -80,6 +93,12 @@ test('AP-13 retired prompt: hidden from search, kept selection still syncs', asy
   owned,
 }, testInfo) => {
   await snapshotJourney({ page, owned, blank: false, retire: true, testInfo });
+});
+test('AP-15 a Description edit in Jira keeps the section syncable and removable', async ({
+  page,
+  owned,
+}, testInfo) => {
+  await snapshotJourney({ page, owned, blank: false, editInJira: true, testInfo });
 });
 
 /** Opens the space or global page, checks the owned space and returns its health. */
@@ -301,10 +320,7 @@ test('AP-06 empty prompt save preserves unsaved selection during read-only recov
   const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,description,issuetype`);
   const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
   const t = installation('agent-prompts');
-  const field = (await owned.api('/field')).find(
-    (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
-  );
-  expect(field).toBeTruthy();
+  const field = await agentPromptsField(owned.api);
   const before = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
   await expect(async () => {
     const found = await owned.api('/search/jql', 'POST', {
@@ -315,10 +331,7 @@ test('AP-06 empty prompt save preserves unsaved selection during read-only recov
     expect(found.issues.some((i) => i.id === source.id)).toBe(true);
   }).toPass({ timeout: 30000, intervals: [1000, 3000] });
   await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
-  const readView = page
-    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-    .locator('..')
-    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const readView = fieldReadView(page, field.id);
   const loaded = await observeAction(page, 'load', () => openField(page, readView), t);
   owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
   owned.run.persist();
@@ -387,10 +400,7 @@ test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-onl
   );
   const target = await owned.issue('Prompt deleted block');
   const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,issuetype`);
-  const field = (await owned.api('/field')).find(
-    (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
-  );
-  expect(field).toBeTruthy();
+  const field = await agentPromptsField(owned.api);
   await expect(async () => {
     const found = await owned.api('/search/jql', 'POST', {
       jql: `project = ${owned.project.id} AND issuetype = ${sourceIssue.fields.issuetype.id} ORDER BY key ASC`,
@@ -401,10 +411,7 @@ test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-onl
   }).toPass({ timeout: 30000, intervals: [1000, 3000] });
   const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
   const original = targetIssue.fields.description;
-  const readView = page
-    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-    .locator('..')
-    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const readView = fieldReadView(page, field.id);
   let loaded;
   const open = async () => {
     await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
@@ -488,10 +495,419 @@ test('AP-10 an Agent Prompts section deleted in Jira is forgotten by a field-onl
   owned.run.persist();
 });
 
-test('AP-08 opt-in work item reload follows a confirmed save and restores the space preference', async ({
+test('AP-16 an Agent Prompts section the field does not track is listed, refused beside a new one and replaced on request', async ({
+  page,
+  owned,
+}) => {
+  const t = installation('agent-prompts');
+  const health = await configuration(page, owned);
+  const source = await owned.propertyIssue(
+    `Other section ${owned.run.state.runId.slice(0, 8)}`,
+    'Instructions named by a section the field does not track.',
+    health.state.data.type,
+  );
+  const target = await owned.issue('Prompt other section');
+  const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,issuetype,description`);
+  const field = await agentPromptsField(owned.api);
+  await expect(async () => {
+    const found = await owned.api('/search/jql', 'POST', {
+      jql: `project = ${owned.project.id} AND issuetype = ${sourceIssue.fields.issuetype.id} ORDER BY key ASC`,
+      maxResults: 100,
+      fields: ['summary'],
+    });
+    expect(found.issues.some((i) => i.id === source.id)).toBe(true);
+  }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+  const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
+  const original = targetIssue.fields.description;
+  const name = `${sourceIssue.key}: ${source.expected.summary}`;
+  const heading = { type: 'heading', attrs: { level: 2 }, content: [{ type: 'text', text: name }] };
+  // The section another work item's save left in a copied description (agent-prompts#g457).
+  const leftover = {
+    type: 'expand',
+    attrs: { localId: `agent-prompts-${source.id}`, title: 'Agent Prompts' },
+    content: [
+      heading,
+      { type: 'paragraph', content: [{ type: 'text', text: 'Copied from another work item.' }] },
+    ],
+  };
+  const withLeftover = { ...original, content: [...original.content, leftover] };
+  // The app's own section, built here from the prompt as Jira returns it.
+  const own = {
+    type: 'expand',
+    attrs: { localId: `agent-prompts-${target.id}`, title: 'Agent Prompts' },
+    content: [heading, ...sourceIssue.fields.description.content.map(unstamped)],
+  };
+  const replaced = { ...original, content: [...original.content, own] };
+  target.expected.descriptionVariants = [
+    ...(target.expected.descriptionVariants ?? [original]),
+    withLeftover,
+  ];
+  owned.run.persist();
+  await owned.api(`/issue/${target.id}`, 'PUT', { fields: { description: withLeftover } });
+  const before = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  expect(before.description).toEqual(withLeftover);
+
+  await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+  const loaded = await observeAction(
+    page,
+    'load',
+    () => openField(page, fieldReadView(page, field.id)),
+    t,
+  );
+  expect(loaded.otherSection).toEqual({
+    count: 1,
+    replace: expect.any(String),
+    prompts: [{ id: source.id, key: sourceIssue.key, name: source.expected.summary }],
+    unavailable: [],
+  });
+  const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  await expect(combo).toBeEnabled();
+  await expect(
+    editor(page).getByText("This description has an Agent Prompts section the app didn't save.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    editor(page).getByRole('link', {
+      name: `${sourceIssue.key} — ${source.expected.summary}`,
+      exact: true,
+    }),
+  ).toHaveAttribute('href', `/browse/${sourceIssue.key}`);
+  const save = async () => {
+    const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
+    // With the space's reload preference on, navigation can discard the resolver body; the Jira
+    // assertions after each save are the oracle.
+    if (loaded.refreshAfterSave)
+      await Promise.all([
+        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+        click(),
+      ]);
+    else await observeAction(page, 'save', click, t);
+  };
+
+  // Choosing the prompt alone would write a second section beside it: refused, Jira unchanged.
+  await observeAction(page, 'search', () => combo.fill(sourceIssue.key), t);
+  await combo.press('ArrowDown');
+  // The menu's option, not the warning's link with the same text.
+  await editor(page)
+    .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
+    .and(editor(page).locator(':not(a)'))
+    .click();
+  await expect(
+    observeAction(
+      page,
+      'save',
+      () => editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
+      t,
+    ),
+  ).rejects.toMatchObject({ category: 'resolver-failed' });
+  await expect(
+    editor(page).getByText(
+      "The description has an Agent Prompts section the app didn't save. Delete it from the description, or use its prompts here to replace it, then save again.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
+    before,
+  );
+
+  // Use its prompts: the save replaces that section with the app's own, in its place.
+  await editor(page).getByRole('button', { name: 'Use its prompts', exact: true }).click();
+  await expect(
+    editor(page).getByText("Saving replaces that section with the app's own.", { exact: true }),
+  ).toBeVisible();
+  target.expected.descriptionVariants.push(replaced);
+  owned.run.persist();
+  await save();
+  const adopted = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  expect(adopted[field.id]).toEqual([sourceIssue.key]);
+  expect(adopted.description).toEqual(replaced);
+
+  // Removing the prompt then leaves the description as it was before either section.
+  if (loaded.refreshAfterSave) {
+    await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+    await openField(page, fieldReadView(page, field.id));
+  }
+  await editor(page)
+    .getByRole('button', { name: new RegExp(`remove.*${source.expected.summary}`, 'i') })
+    .click();
+  target.expected.descriptionVariants.push(original);
+  owned.run.persist();
+  await save();
+  const cleared = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  expect(cleared.description).toEqual(original);
+  expect(cleared[field.id] ?? []).toEqual([]);
+  target.expected.customField = { id: field.id, value: cleared[field.id] };
+  owned.run.persist();
+});
+
+test('AP-17 a section edited, retitled or duplicated in Jira is refused, and the steps in the message restore the field', async ({
   page,
   owned,
 }, testInfo) => {
+  const t = installation('agent-prompts');
+  const health = await configuration(page, owned);
+  const run = owned.run.state.runId.slice(0, 8);
+  const instructions = `Instructions to edit in Jira ${run}.`;
+  const source = await owned.propertyIssue(
+    `Edited section ${run}`,
+    instructions,
+    health.state.data.type,
+  );
+  // As Jira's editor writes a prompt: a line per paragraph. The fixture's text holds a raw newline,
+  // which Jira's editor turns into a space in any paragraph it edits.
+  const editorSource = {
+    ...source.expected.description,
+    content: source.expected.description.content.flatMap((node) =>
+      node.content?.length === 1 && node.content[0].text?.includes('\n')
+        ? node.content[0].text
+            .split('\n')
+            .map((line) => ({ type: 'paragraph', content: [{ type: 'text', text: line }] }))
+        : [node],
+    ),
+  };
+  source.expected.descriptionVariants = [source.expected.description, editorSource];
+  owned.run.persist();
+  await owned.api(`/issue/${source.id}`, 'PUT', { fields: { description: editorSource } });
+  const target = await owned.issue('Prompt section edited in Jira');
+  const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,issuetype,description`);
+  const field = await agentPromptsField(owned.api);
+  await expect(async () => {
+    const found = await owned.api('/search/jql', 'POST', {
+      jql: `project = ${owned.project.id} AND issuetype = ${sourceIssue.fields.issuetype.id} ORDER BY key ASC`,
+      maxResults: 100,
+      fields: ['summary'],
+    });
+    expect(found.issues.some((i) => i.id === source.id)).toBe(true);
+  }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+  const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
+  const original = targetIssue.fields.description;
+  const ownId = `agent-prompts-${target.id}`;
+  const isOwn = (n) => n.type === 'expand' && n.attrs?.localId === ownId;
+  // The app's own section, built here from the prompt as Jira returns it.
+  const own = {
+    type: 'expand',
+    attrs: { localId: ownId, title: 'Agent Prompts' },
+    content: [
+      {
+        type: 'heading',
+        attrs: { level: 2 },
+        content: [{ type: 'text', text: `${sourceIssue.key}: ${source.expected.summary}` }],
+      },
+      ...sourceIssue.fields.description.content.map(unstamped),
+    ],
+  };
+  const changed =
+    'The Agent Prompts section was changed, moved or duplicated in Jira. Undo that change, or delete the section from the description, remove all prompts here and save, then add them again.';
+  const read = async () =>
+    (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  /** A REST write of the Description, journaled first. */
+  const write = async (description) => {
+    target.expected.descriptionVariants.push(description);
+    owned.run.persist();
+    await owned.api(`/issue/${target.id}`, 'PUT', { fields: { description } });
+    expect((await read()).description).toEqual(description);
+  };
+  /** Edits the Description in Jira's own editor and saves it there; returns what Jira saved. */
+  const jiraEdit = async (label, act, landed) => {
+    await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+    // The fixture's own first paragraph: the middle of the read view is the section's expand.
+    await page.getByTestId('issue.views.field.rich-text.description').locator('p').first().click();
+    const content = page.locator('#ak-editor-textarea');
+    await expect(content).toBeVisible();
+    // The editor opens the section's expand as it was last shown; open it to reach the prompt.
+    const prompt = content.getByText(instructions, { exact: false });
+    await expect(async () => {
+      if (!(await prompt.isVisible()))
+        await content.getByRole('button', { name: /expand content/i }).click({ timeout: 5000 });
+      await expect(prompt).toBeVisible({ timeout: 5000 });
+    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    await act({ prompt, content });
+    // The editor's document is unknown until saved: journal that a save is pending, which no
+    // description matches, so an interrupted run stops cleanup for inspection.
+    target.expected.descriptionVariants.push({ pendingJiraEditorSave: label });
+    owned.run.persist();
+    await page.getByRole('button', { name: 'Save', exact: true }).first().click();
+    let saved = original;
+    await expect(async () => {
+      saved = (await read()).description;
+      expect(landed(saved)).toBe(true);
+    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    target.expected.descriptionVariants.splice(-1, 1, saved);
+    owned.run.persist();
+    await testInfo.attach(`jira-editor-${label}`, {
+      body: JSON.stringify(saved, null, 1),
+      contentType: 'application/json',
+    });
+    return saved;
+  };
+  let loaded;
+  const open = async () => {
+    await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
+    loaded = await observeAction(
+      page,
+      'load',
+      () => openField(page, fieldReadView(page, field.id)),
+      t,
+    );
+    await expect(
+      editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true }),
+    ).toBeEnabled();
+  };
+  const button = (name) => editor(page).getByRole('button', { name, exact: true });
+  const save = async (name = 'Save') => {
+    // With the space's reload preference on, navigation can discard the resolver body; the Jira
+    // assertions after each save are the oracle.
+    if (loaded.refreshAfterSave)
+      await Promise.all([
+        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+        button(name).click(),
+      ]);
+    else await observeAction(page, 'save', () => button(name).click(), t);
+  };
+  /** Sync is refused with the recovery message, and Jira is unchanged. */
+  const syncRefused = async () => {
+    const before = await read();
+    await open();
+    await expect(
+      observeAction(page, 'save', () => button('Sync').click(), t),
+    ).rejects.toMatchObject({ category: 'resolver-failed' });
+    await expect(editor(page).getByText(changed, { exact: true })).toBeVisible();
+    expect(await read()).toEqual(before);
+  };
+  const choose = async () => {
+    const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+    await observeAction(page, 'search', () => combo.fill(sourceIssue.key), t);
+    await combo.press('ArrowDown');
+    await editor(page)
+      .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
+      .click();
+  };
+
+  const linked = { ...original, content: [...original.content, own] };
+  target.expected.descriptionVariants = [
+    ...(target.expected.descriptionVariants ?? [original]),
+    linked,
+  ];
+  target.expected.customField = { id: field.id, value: [sourceIssue.key] };
+  owned.run.persist();
+  await open();
+  await choose();
+  await save();
+  expect(await read()).toEqual({ description: linked, [field.id]: [sourceIssue.key] });
+
+  // Retitled, or copied with its identifier: Sync is refused until the change is undone.
+  for (const tampered of [
+    {
+      ...linked,
+      content: linked.content.map((n) =>
+        isOwn(n) ? { ...n, attrs: { ...n.attrs, title: 'Prompts for agents' } } : n,
+      ),
+    },
+    { ...linked, content: [structuredClone(own), ...linked.content] },
+  ]) {
+    await write(tampered);
+    await syncRefused();
+    await write(linked);
+    await open();
+    await save('Sync');
+    expect(await read()).toEqual({ description: linked, [field.id]: [sourceIssue.key] });
+  }
+
+  // Jira's editor may give its own ids to nodes it touches, inside the section or out. The app
+  // ignores them inside its section and keeps everything outside exactly as Jira saved it.
+  const editorIdsOff = (d) => ({
+    ...d,
+    content: d.content.map((n) =>
+      isOwn(n) ? { ...n, content: n.content.map(unstamped) } : unstamped(n),
+    ),
+  });
+  /** What a save of the prompt writes over `d`: the app's section in place of its own, or last. */
+  const withSection = (d) =>
+    d.content.some(isOwn)
+      ? { ...d, content: d.content.map((n) => (isOwn(n) ? own : n)) }
+      : { ...d, content: [...d.content, own] };
+
+  // Typed inside the section in Jira's editor: refused; deleting the typing in the editor undoes it.
+  const typing = ` (edited in Jira ${run})`;
+  const typed = await jiraEdit(
+    'typed',
+    async ({ prompt }) => {
+      await prompt.click();
+      await page.keyboard.press('End');
+      await page.keyboard.type(typing);
+    },
+    (d) => JSON.stringify(d).includes(typing),
+  );
+  expect(editorIdsOff(typed).content.filter((n) => !isOwn(n))).toEqual(original.content);
+  await syncRefused();
+  const undone = await jiraEdit(
+    'undone',
+    async ({ content }) => {
+      await content.getByText(typing.trim(), { exact: false }).click();
+      await page.keyboard.press('End');
+      for (let i = 0; i < typing.length; i++) await page.keyboard.press('Backspace');
+    },
+    (d) => !JSON.stringify(d).includes(typing),
+  );
+  expect(editorIdsOff(undone)).toEqual(linked);
+  target.expected.descriptionVariants.push(withSection(undone));
+  owned.run.persist();
+  await open();
+  await save('Sync');
+  expect(await read()).toEqual({ description: withSection(undone), [field.id]: [sourceIssue.key] });
+
+  // Typed again, then the other way out: delete the section in the editor, remove all prompts and
+  // save (the field alone is cleared), then add them again.
+  await jiraEdit(
+    'typed-again',
+    async ({ prompt }) => {
+      await prompt.click();
+      await page.keyboard.press('End');
+      await page.keyboard.type(typing);
+    },
+    (d) => JSON.stringify(d).includes(typing),
+  );
+  await syncRefused();
+  const deleted = await jiraEdit(
+    'deleted',
+    async ({ prompt }) => {
+      await prompt.click();
+      await page
+        .getByTestId('editor-floating-toolbar')
+        .getByRole('button', { name: 'Remove', exact: true })
+        .click();
+    },
+    (d) => !d.content.some(isOwn) && !JSON.stringify(d).includes(typing),
+  );
+  expect(editorIdsOff(deleted)).toEqual(original);
+  await open();
+  await editor(page)
+    .getByRole('button', { name: new RegExp(`remove.*${source.expected.summary}`, 'i') })
+    .click();
+  target.expected.customField = { id: field.id, value: [] };
+  owned.run.persist();
+  await save();
+  const cleared = await read();
+  expect(cleared.description).toEqual(deleted);
+  expect(cleared[field.id] ?? []).toEqual([]);
+  target.expected.descriptionVariants.push(withSection(deleted));
+  target.expected.customField = { id: field.id, value: [sourceIssue.key] };
+  owned.run.persist();
+  await open();
+  await choose();
+  await save();
+  expect(await read()).toEqual({
+    description: withSection(deleted),
+    [field.id]: [sourceIssue.key],
+  });
+});
+
+/**
+ * Runs `journey(initial)` with the space's "Reload work item after saving prompts" preference on,
+ * then restores the preference it found. `initial` is the space's health before the change.
+ */
+async function withReloadPreference(page, owned, journey) {
   const t = installation('agent-prompts');
   async function health() {
     const value = await configuration(page, owned);
@@ -524,6 +940,54 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
   }
   try {
     await preference(true);
+    await journey(initial);
+  } finally {
+    await preference(original);
+    owned.run.state.reloadPreference.restored = true;
+    owned.run.persist();
+  }
+}
+
+/** The target's Description after a Save that adds one prompt: its own section, then the prompt. */
+function withPrompt(target, key, source) {
+  return {
+    ...target.expected.description,
+    content: [
+      ...target.expected.description.content,
+      {
+        type: 'expand',
+        attrs: { localId: `agent-prompts-${target.id}`, title: 'Agent Prompts' },
+        content: [
+          {
+            type: 'heading',
+            attrs: { level: 2 },
+            content: [{ type: 'text', text: `${key}: ${source.expected.summary}` }],
+          },
+          ...source.expected.description.content,
+        ],
+      },
+    ],
+  };
+}
+
+/** Waits until Jira's search finds a prompt, as the field's picker searches for it. */
+async function searchable(owned, type, id) {
+  await expect(async () => {
+    const found = await owned.api('/search/jql', 'POST', {
+      jql: `project = ${owned.project.id} AND issuetype = ${type}`,
+      fields: ['summary'],
+      maxResults: 100,
+    });
+    expect(found.issues.some((i) => i.id === id)).toBe(true);
+  }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+}
+
+test('AP-08 opt-in work item reload follows a confirmed save and restores the space preference', async ({
+  page,
+  owned,
+}, testInfo) => {
+  const t = installation('agent-prompts');
+  await withReloadPreference(page, owned, async (initial) => {
     const source = await owned.propertyIssue(
       'Reload preference source',
       'RELOAD-SENTINEL',
@@ -532,45 +996,14 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
     const target = await owned.issue('Reload preference target');
     const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary,description`);
     const targetIssue = await owned.api(`/issue/${target.id}?fields=description`);
-    const field = (await owned.api('/field')).find(
-      (f) => f.schema?.custom?.includes(`/${t.appId}/`) && f.name === 'Agent Prompts',
-    );
-    const linked = {
-      ...target.expected.description,
-      content: [
-        ...target.expected.description.content,
-        {
-          type: 'expand',
-          attrs: { localId: `agent-prompts-${target.id}`, title: 'Agent Prompts' },
-          content: [
-            {
-              type: 'heading',
-              attrs: { level: 2 },
-              content: [{ type: 'text', text: `${sourceIssue.key}: ${source.expected.summary}` }],
-            },
-            ...source.expected.description.content,
-          ],
-        },
-      ],
-    };
+    const field = await agentPromptsField(owned.api);
+    const linked = withPrompt(target, sourceIssue.key, source);
     target.expected.descriptionVariants = [target.expected.description, linked];
     target.expected.customField = { id: field.id, value: [sourceIssue.key] };
     owned.run.persist();
-    await expect(async () => {
-      const found = await owned.api('/search/jql', 'POST', {
-        jql: `project = ${owned.project.id} AND issuetype = ${initial.state.data.type}`,
-        fields: ['summary'],
-        maxResults: 100,
-      });
-      expect(found.issues.some((i) => i.id === source.id)).toBe(true);
-    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    await searchable(owned, initial.state.data.type, source.id);
     await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
-    const read = page
-      .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-      .locator('..')
-      .locator(
-        '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
-      );
+    const read = fieldReadView(page, field.id);
     const loaded = await observeAction(page, 'load', () => openField(page, read), t);
     owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
     owned.run.persist();
@@ -612,14 +1045,7 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
       initial.state.data.type,
     );
     const secondIssue = await owned.api(`/issue/${second.id}?fields=summary,description`);
-    await expect(async () => {
-      const found = await owned.api('/search/jql', 'POST', {
-        jql: `project = ${owned.project.id} AND issuetype = ${initial.state.data.type}`,
-        fields: ['summary'],
-        maxResults: 100,
-      });
-      expect(found.issues.some((i) => i.id === second.id)).toBe(true);
-    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    await searchable(owned, initial.state.data.type, second.id);
     await openField(page, read);
     const picker = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
     await expect(picker).toBeEnabled();
@@ -669,11 +1095,80 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
     const onlySecond = structuredClone(two);
     onlySecond.content.at(-1).content.splice(0, 2);
     await saveAndReload(onlySecond, [secondIssue.key]);
-  } finally {
-    await preference(original);
-    owned.run.state.reloadPreference.restored = true;
+  });
+});
+
+test('AP-18 board side panel: a prompt saved there reloads the board with the panel, the selection and the section', async ({
+  page,
+  owned,
+  jiraRequest,
+}, testInfo) => {
+  const t = installation('agent-prompts');
+  const board = await spaceBoard(jiraRequest, owned.project);
+  await withReloadPreference(page, owned, async (initial) => {
+    const source = await owned.propertyIssue(
+      'Side panel source',
+      'PANEL-SENTINEL',
+      initial.state.data.type,
+    );
+    const target = await owned.issue('Side panel target');
+    const sourceIssue = await owned.api(`/issue/${source.id}?fields=summary`);
+    const targetIssue = await owned.api(`/issue/${target.id}?fields=summary`);
+    const field = await agentPromptsField(owned.api);
+    const linked = withPrompt(target, sourceIssue.key, source);
+    target.expected.descriptionVariants = [target.expected.description, linked];
+    target.expected.customField = { id: field.id, value: [sourceIssue.key] };
     owned.run.persist();
-  }
+    await searchable(owned, initial.state.data.type, source.id);
+    // The board shows the new work item once Jira has indexed it; open it from its card.
+    const card = page.getByText(targetIssue.fields.summary, { exact: true });
+    await expect(async () => {
+      await page.goto(board);
+      await expect(card).toBeVisible({ timeout: 10000 });
+    }).toPass({ timeout: 60000, intervals: [3000] });
+    await card.click();
+    const panel = new RegExp(`/boards/\\d+\\?(.*&)?selectedIssue=${targetIssue.key}(&|$)`);
+    await expect(page).toHaveURL(panel);
+    // A card opens Jira's modal over the board; its Switch to sidebar shows the work item in the
+    // board's side panel instead. Jira keeps that choice until the page loads again.
+    const toSidebar = page.getByRole('button', { name: 'Switch to sidebar', exact: true });
+    const sidebar = page.getByText('Jira work item', { exact: true });
+    async function inSidebar() {
+      await expect(toSidebar.or(sidebar)).toBeVisible({ timeout: 30000 });
+      const modal = await toSidebar.isVisible();
+      if (modal) await toSidebar.click();
+      await expect(sidebar).toBeVisible();
+      await expect(page.getByRole('dialog')).toHaveCount(0);
+      return modal ? 'modal' : 'sidebar';
+    }
+    await inSidebar();
+    const read = fieldReadView(page, field.id);
+    const loaded = await observeAction(page, 'load', () => openField(page, read), t);
+    owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
+    owned.run.persist();
+    expect(loaded.refreshAfterSave).toBe(true);
+    const picker = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+    await observeAction(page, 'search', () => picker.fill(sourceIssue.key), t);
+    await picker.press('ArrowDown');
+    await editor(page)
+      .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
+      .click();
+    await page.screenshot({ path: testInfo.outputPath('side-panel-picked.png') });
+    await Promise.all([
+      page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+      editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
+    ]);
+    const actual = await owned.api(`/issue/${target.id}?fields=description,${field.id}`);
+    expect(actual.fields.description).toEqual(linked);
+    expect(actual.fields[field.id]).toEqual([sourceIssue.key]);
+    // The reload keeps the board with the work item open (Jira reopens it in its modal), and the
+    // side panel shows the saved selection and the Description's section.
+    await expect(page).toHaveURL(panel);
+    testInfo.annotations.push({ type: 'reload-reopens-in', description: await inSidebar() });
+    await expect(read).toContainText(sourceIssue.key, { timeout: 30000 });
+    await expandPrompts(page, 'PANEL-SENTINEL');
+    await page.screenshot({ path: testInfo.outputPath('side-panel-reloaded.png') });
+  });
 });
 
 test('AP-09 newest prompts, server search and cursor pages preserve draft selections', async ({
@@ -703,10 +1198,7 @@ test('AP-09 newest prompts, server search and cursor pages preserve draft select
     expected = result.issues;
   }).toPass({ timeout: 60000, intervals: [1000, 3000] });
   await page.goto(`${activeTarget().site}/browse/${before.key}`);
-  const readView = page
-    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-    .locator('..')
-    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const readView = fieldReadView(page, (await agentPromptsField(owned.api)).id);
   const loaded = await observeAction(page, 'load', () => openField(page, readView), t);
   expect(loaded.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
   const search = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
@@ -769,6 +1261,96 @@ test('AP-09 newest prompts, server search and cursor pages preserve draft select
   }
 });
 
+// The field's display condition keeps it off Jira's Create form: give the form time to add its
+// fields, then neither the field's label, its frame nor Jira's own label editor is there.
+async function expectFieldOff(dialog, t) {
+  await dialog.page().waitForTimeout(8000);
+  await expect(dialog.getByText(/^Agent Prompts/)).toHaveCount(0);
+  await expect(dialog.locator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`)).toHaveCount(
+    0,
+  );
+  await expect(dialog.getByText('Select label', { exact: true })).toHaveCount(0);
+}
+/**
+ * AP-14 in the owned space: Create from the top bar over the space's board makes a Task without
+ * the field, then Create over that work item, which shows the field, leaves it out again.
+ */
+async function createWithoutField({ page, owned, theme, jiraRequest, testInfo }) {
+  const t = installation('agent-prompts');
+  const key = owned.project.key;
+  const task = owned.project.issueTypes.find((x) => !x.subtask && x.name === 'Task');
+  expect(task).toBeTruthy();
+  const field = await agentPromptsField(owned.api);
+  // Both fixture spaces have the field on Task's Create screen (a team-managed layout is also its
+  // Create form), so only the field's display condition keeps it off the form.
+  const meta = await owned.api(`/issue/createmeta/${owned.project.id}/issuetypes/${task.id}`);
+  expect(meta.fields.map((f) => f.fieldId)).toContain(field.id);
+  const board = await spaceBoard(jiraRequest, owned.project);
+
+  await dismissOnboarding(page);
+  await theme('Dark');
+  await page.goto(board);
+  const dialog = page.getByRole('dialog', { name: /^Create/ });
+  let createMs;
+  const created = await owned.browserIssue('Create form without the field', task.id, {
+    async fill(summary) {
+      await page.getByRole('banner').getByRole('button', { name: 'Create', exact: true }).click();
+      await expect(
+        dialog.getByRole('button', { name: new RegExp(`^Space: .*\\(${key}\\)$`) }),
+      ).toBeVisible({ timeout: 30000 });
+      const type = dialog.getByRole('button', { name: 'Type: Task', exact: true });
+      if (!(await type.isVisible())) {
+        await dialog.getByRole('button', { name: /^Type: / }).click();
+        await page.getByRole('option', { name: 'Task', exact: true }).click();
+      }
+      await expect(type).toBeVisible();
+      await dialog.getByRole('textbox', { name: 'Summary', exact: true }).fill(summary);
+      await expectFieldOff(dialog, t);
+      await page.screenshot({
+        path: `${activeTarget().runs}/${owned.run.state.runId}-create-form.png`,
+      });
+    },
+    async submit() {
+      const started = Date.now();
+      await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+      await expect(dialog).toBeHidden({ timeout: 30000 });
+      createMs = Date.now() - started;
+    },
+  });
+  testInfo.annotations.push({ type: 'create-ms', description: String(createMs) });
+  // Create closes promptly: no app field on the form for Jira to wait on.
+  expect(createMs).toBeLessThan(8000);
+  // browserIssue returned after Jira's Create outcome flag, which the page guard fails on if it
+  // is "Created <type> with exceptions": a field that Jira couldn't save after the create.
+  const x = await owned.api(`/issue/${created.id}?fields=issuetype,${field.id}`);
+  expect(x.fields.issuetype.id).toBe(task.id);
+  expect(x.fields[field.id] ?? null).toBeNull();
+
+  // Create opened over a work item that shows the field leaves it out too. Closed unsaved.
+  await page.goto(`${activeTarget().site}/browse/${x.key}`);
+  // Development labels the field "Agent Prompts" with a DEV badge.
+  await expect(page.getByText(/^Agent Prompts/).first()).toBeVisible({ timeout: 30000 });
+  await page.getByRole('banner').getByRole('button', { name: 'Create', exact: true }).click();
+  await expect(dialog.getByRole('textbox', { name: 'Summary', exact: true })).toBeVisible({
+    timeout: 30000,
+  });
+  await expectFieldOff(dialog, t);
+  await dialog
+    .getByRole('button', { name: /^Close/ })
+    .first()
+    .click();
+  const discard = page.getByRole('button', { name: 'Discard', exact: true });
+  if (await discard.isVisible().catch(() => false)) await discard.click();
+  await expect(dialog).toBeHidden();
+}
+test('AP-14 Create form from the board in a company-managed space: the field stays off it, and the work item is created empty', async ({
+  page,
+  owned,
+  theme,
+  jiraRequest,
+}, testInfo) => {
+  await createWithoutField({ page, owned, theme, jiraRequest, testInfo });
+});
 test.describe('team-managed space', () => {
   test.use({ fixtureProfile: teamManagedFixture });
   test('AP-12 team-managed space: field placement, own prompt type, Save and Sync, setup removal', async ({
@@ -826,64 +1408,12 @@ test.describe('team-managed space', () => {
     expect(health.state.data.previousTypes).toContain(prompt);
     expect(await jira()).toEqual(before);
   });
-  test('AP-14 Create form: a note instead of a picker, and the work item is created empty and promptly', async ({
+  test('AP-14 Create form from the board in a team-managed space: the field stays off it, and the work item is created empty', async ({
     page,
     owned,
+    theme,
+    jiraRequest,
   }, testInfo) => {
-    const t = installation('agent-prompts');
-    const key = owned.project.key;
-    const task = owned.project.issueTypes.find((x) => !x.subtask && x.name === 'Task');
-    expect(task).toBeTruthy();
-    const field = (await owned.api('/field')).find(
-      (f) =>
-        f.schema?.custom?.includes(`/${t.appId}/`) &&
-        f.schema.custom.includes(t.environmentId) &&
-        f.name === 'Agent Prompts',
-    );
-    expect(field).toBeTruthy();
-    // A team-managed layout is also the Create form: the prepared space has the field on Task's.
-    const meta = await owned.api(`/issue/createmeta/${owned.project.id}/issuetypes/${task.id}`);
-    expect(meta.fields.map((f) => f.fieldId)).toContain(field.id);
-
-    await dismissOnboarding(page);
-    await page.goto(`${activeTarget().site}/browse/${key}`);
-    // The page's Create button opens the form on this space; the board has Create buttons too.
-    const dialog = page.getByRole('dialog', { name: /^Create/ });
-    let createMs;
-    const created = await owned.browserIssue('Create form note', task.id, {
-      async fill(summary) {
-        await page.getByRole('banner').getByRole('button', { name: 'Create', exact: true }).click();
-        await expect(
-          dialog.getByRole('button', { name: new RegExp(`^Space: .*\\(${key}\\)$`) }),
-        ).toBeVisible({ timeout: 30000 });
-        const type = dialog.getByRole('button', { name: 'Type: Task', exact: true });
-        if (!(await type.isVisible())) {
-          await dialog.getByRole('button', { name: /^Type: / }).click();
-          await page.getByRole('option', { name: 'Task', exact: true }).click();
-        }
-        await expect(type).toBeVisible();
-        const frame = dialog.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
-        await expect(
-          frame.getByText('Add prompts after you create the work item.', { exact: true }),
-        ).toBeVisible({ timeout: 30000 });
-        await expect(dialog.getByText('Select label', { exact: true })).toHaveCount(0);
-        await dialog.getByRole('textbox', { name: 'Summary', exact: true }).fill(summary);
-        await page.screenshot({
-          path: `${activeTarget().runs}/${owned.run.state.runId}-create-form.png`,
-        });
-      },
-      async submit() {
-        const started = Date.now();
-        await dialog.getByRole('button', { name: 'Create', exact: true }).click();
-        await expect(dialog).toBeHidden({ timeout: 30000 });
-        createMs = Date.now() - started;
-      },
-    });
-    testInfo.annotations.push({ type: 'create-ms', description: String(createMs) });
-    // Jira waits up to 10 seconds for a field that never answers before creating without it.
-    expect(createMs).toBeLessThan(8000);
-    const x = await owned.api(`/issue/${created.id}?fields=issuetype,${field.id}`);
-    expect(x.fields.issuetype.id).toBe(task.id);
-    expect(x.fields[field.id] ?? null).toBeNull();
+    await createWithoutField({ page, owned, theme, jiraRequest, testInfo });
   });
 });

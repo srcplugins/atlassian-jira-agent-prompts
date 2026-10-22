@@ -30,6 +30,9 @@ on:
       - 'config/check-plugin.mjs'
       - 'config/eslint-local-rules.mjs'
       - 'config/forge-eslint.mjs'
+      # Publish runs the production smoke; no hosted suite reads it.
+      - 'config/production-smoke.mjs'
+      - 'tests/hosted/production-smoke.mjs'
       - 'tests/*.test.mjs'
   pull_request:
     types: [ready_for_review]

@@ -2,6 +2,13 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
+## 1.0.2
+
+- **Jira's Create form.** The Agent Prompts field is no longer on Jira's Create form, so the form never waits for it to load. Add prompts once the work item exists.
+- **Sections saved by Jira's editor.** Jira's editor can add its own markers inside the Agent Prompts section when it saves a description. Save, Sync and removing prompts now accept them, so the field no longer refuses a section nobody changed. When a section really was changed, the message says how to restore it.
+- **Untracked Agent Prompts sections.** When a description holds an Agent Prompts section the field doesn't track, such as one copied from another work item, the field lists it with links to the prompts it names and doesn't write a second section beside it. Use its prompts and save, or delete it in Jira, to replace it.
+- **Security.** markdown-it 14.3.3, for two denial-of-service advisories.
+
 ## 1.0.1
 
 - **Jira's Create form.** Where the Agent Prompts field is on a Create form, it now says to add prompts after you create the work item, instead of showing Jira's own list editor, and the work item is created with the field empty.

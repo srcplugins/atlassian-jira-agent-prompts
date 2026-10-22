@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sectionIdPrefix } from './names';
 
 type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
 interface JsonObject {
@@ -32,6 +33,9 @@ export class DescriptionError extends Error {
     this.name = 'DescriptionError';
   }
 }
+
+const otherSectionMessage =
+  "The description has an Agent Prompts section the app didn't save. Delete it from the description, or use its prompts here to replace it, then save again.";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -111,7 +115,23 @@ function canonicalJson(value: unknown): string {
  * review fingerprints. */
 export const hash = (value: unknown) =>
   createHash('sha256').update(canonicalJson(value)).digest('hex');
-const fingerprint = (node: AdfNode) => hash(node);
+/** Hash of a section as the app wrote it. Jira's editors stamp their own `localId` on every node
+ * inside when they save a description; that isn't an edit, and the app never writes one there
+ * (`snapshotContent` drops them), so leaving them out still matches every section already saved. */
+function fingerprint(node: AdfNode): string {
+  const unstamped = (n: AdfNode): AdfNode => {
+    const copy: AdfNode = { ...n };
+    if (copy.attrs && 'localId' in copy.attrs) {
+      const rest = { ...copy.attrs };
+      delete rest.localId;
+      if (Object.keys(rest).length) copy.attrs = rest;
+      else delete copy.attrs;
+    }
+    if (n.content) copy.content = n.content.map(unstamped);
+    return copy;
+  };
+  return hash(node.content ? { ...node, content: node.content.map(unstamped) } : node);
+}
 
 type Meaning = (attrs: JsonObject) => JsonValue;
 const color: Meaning = (a) => (typeof a.color === 'string' ? a.color.toLowerCase() : null);
@@ -254,6 +274,54 @@ export function snapshotContent(description: unknown): AdfNode[] {
   return result;
 }
 
+/** An Agent Prompts section the app doesn't track: one saved by an earlier installation or on
+ * another work item, a copy, or this work item's own section after its record was cleared. */
+export interface OtherSection {
+  /** Its position in the description, or null when it is inside another node. */
+  index: number | null;
+  /** Its hash, which a save names to replace it. */
+  fingerprint: string;
+  /** The prompt keys its headings start with, in order. */
+  keys: string[];
+}
+const promptHeading = /^([A-Z][A-Z0-9_]{1,30}-[1-9]\d{0,19}): /;
+/** Finds untracked sections: an expand with the app's section identifier prefix, or with the app's
+ * title and at least one prompt heading (pasting can drop the identifier). An expand of a user's
+ * own with that title and no prompt heading is theirs. Finding one never makes it the app's: a save
+ * replaces one only when the user names it by its hash. */
+export function otherSections(description: unknown, managed: ManagedBlock | null): OtherSection[] {
+  validateDescription(description);
+  const found: OtherSection[] = [];
+  function visit(node: AdfNode, index: number | null): void {
+    const id = node.attrs?.localId;
+    const title = node.attrs?.title;
+    if (
+      (node.type === 'expand' || node.type === 'nestedExpand') &&
+      !(managed && id === managed.localId)
+    ) {
+      const keys: string[] = [];
+      for (const child of node.content ?? []) {
+        if (child.type !== 'heading') continue;
+        const text = (child.content ?? [])
+          .map((t) => (typeof t.text === 'string' ? t.text : ''))
+          .join('');
+        const key = promptHeading.exec(text)?.[1];
+        if (key && !keys.includes(key)) keys.push(key);
+      }
+      if (
+        (typeof id === 'string' && id.startsWith(sectionIdPrefix)) ||
+        (typeof title === 'string' && title.trim().toLowerCase() === 'agent prompts' && keys.length)
+      ) {
+        found.push({ index, fingerprint: hash(node), keys });
+        return;
+      }
+    }
+    for (const child of node.content ?? []) visit(child, null);
+  }
+  description?.content.forEach((node, i) => visit(node, i));
+  return found;
+}
+
 export function observedManaged(
   description: unknown,
   managed: ManagedBlock | null,
@@ -271,6 +339,8 @@ export function synchronizeDescription(
   prompts: readonly ResolvedPrompt[],
   managed: ManagedBlock | null,
   blockId: string,
+  /** The hash of an untracked section the user chose to replace with this one. */
+  replace?: string,
 ): {
   description: AdfDoc | null;
   managed: ManagedBlock | null;
@@ -298,10 +368,7 @@ export function synchronizeDescription(
       throw new DescriptionError(
         'The Agent Prompts section was removed in Jira. Remove all prompts and save, then add them again.',
       );
-    if (occurrences(blockId))
-      throw new DescriptionError(
-        'The description has an Agent Prompts section the app did not save. Review the description before saving.',
-      );
+    if (occurrences(blockId)) throw new DescriptionError(otherSectionMessage);
     return { description, managed: null, shape: null, forgotten: true };
   }
   function locate(localId: string, expected: string): number {
@@ -320,7 +387,7 @@ export function synchronizeDescription(
       fingerprint(hit.node) !== expected
     )
       throw new DescriptionError(
-        'The Agent Prompts section was changed, moved or duplicated. Review the description before saving.',
+        'The Agent Prompts section was changed, moved or duplicated in Jira. Undo that change, or delete the section from the description, remove all prompts here and save, then add them again.',
       );
     return hit.index;
   }
@@ -341,12 +408,26 @@ export function synchronizeDescription(
   // Do not adopt a lookalike expander solely because its title matches ours.
   function collisions(node: AdfNode, index: number | null): void {
     if (node.attrs?.localId === blockId && (index === null || !owned.has(index)))
-      throw new DescriptionError(
-        'The description has an Agent Prompts section the app did not save. Review the description before saving.',
-      );
+      throw new DescriptionError(otherSectionMessage);
     for (const child of node.content ?? []) collisions(child, null);
   }
-  doc.content.forEach((node, i) => collisions(node, i));
+  // A section the app doesn't track is kept as it is, or replaced as a whole when the user names
+  // it; the app never writes a second section beside one.
+  const others = otherSections(doc, managed);
+  let replaced: number | null = null;
+  if (replace !== undefined) {
+    const named = others.filter((o) => o.index !== null && o.fingerprint === replace);
+    if (named.length !== 1 || others.length !== 1)
+      throw new DescriptionError(
+        'The other Agent Prompts section changed in the description. Reopen the field and try again.',
+      );
+    if (!prompts.length)
+      throw new DescriptionError('Choose at least one prompt to replace the other section with.');
+    replaced = named[0]!.index;
+  } else if (prompts.length && others.length) throw new DescriptionError(otherSectionMessage);
+  doc.content.forEach((node, i) => {
+    if (i !== replaced) collisions(node, i);
+  });
   if (!managed && !prompts.length) return { description, managed: null, shape: null };
   const block: AdfNode | null = prompts.length
     ? {
@@ -361,7 +442,13 @@ export function synchronizeDescription(
   const content: AdfNode[] = [];
   let inserted = false;
   doc.content.forEach((node, index) => {
-    if (!owned.has(index)) content.push(node);
+    if (index === replaced) {
+      // The new section takes its place when the app has no section of its own to replace.
+      if (block && !inserted && !owned.size) {
+        content.push(block);
+        inserted = true;
+      }
+    } else if (!owned.has(index)) content.push(node);
     else if (block && !inserted) {
       content.push(block);
       inserted = true;

@@ -7,6 +7,7 @@ import {
   trackedBlock,
   DescriptionError,
   synchronizeDescription,
+  otherSections,
   hash,
   type ManagedBlock,
 } from './description';
@@ -99,6 +100,17 @@ type Receipt = {
 export interface Stored {
   revision: number;
   data: State;
+}
+/** An Agent Prompts section in the description that the field doesn't track. */
+export interface OtherSection {
+  /** How many there are; only a single top-level one can be replaced. */
+  count: number;
+  /** The section's hash, which a save sends to replace it. */
+  replace?: string;
+  /** The prompts its headings name that this work item can use now. */
+  prompts: Prompt[];
+  /** Keys its headings name that aren't prompts this work item can use. */
+  unavailable: string[];
 }
 export interface PromptPage {
   prompts: Prompt[];
@@ -311,6 +323,46 @@ export function createService(p: Ports) {
       throw new UserError(`Wait two minutes and check saved state before ${action} this save.`);
     return { issue, field, stored, pending };
   }
+  /** Describes the untracked sections in a work item's description, looking up the prompts a single
+   * one names as the user. Reading it never changes it. */
+  async function otherSection(
+    c: Context,
+    issue: Issue,
+    managed: ManagedBlock | null,
+    type: string,
+    cleanupOnly: boolean,
+  ): Promise<OtherSection | undefined> {
+    let others;
+    try {
+      others = otherSections(issue.fields.description, managed);
+    } catch {
+      return undefined;
+    }
+    const only = others[0];
+    if (!only) return undefined;
+    if (others.length > 1 || only.index === null || cleanupOnly)
+      return { count: others.length, prompts: [], unavailable: [] };
+    const keys = only.keys.slice(0, 10);
+    const found = await limited(keys, async (key): Promise<Prompt | null> => {
+      try {
+        const source = await p.issue(key);
+        return source.id !== issue.id &&
+          source.fields.project.id === c.projectId &&
+          source.fields.issuetype.id === type &&
+          source.fields.status?.statusCategory?.key !== 'done'
+          ? { id: source.id, key: source.key, name: source.fields.summary }
+          : null;
+      } catch {
+        return null;
+      }
+    });
+    return {
+      count: 1,
+      replace: only.fingerprint,
+      prompts: found.filter((prompt): prompt is Prompt => !!prompt),
+      unavailable: keys.filter((_, i) => !found[i]),
+    };
+  }
   async function releaseUnsent(issueId: string, attemptId: string) {
     // A failed CAS can mean a concurrent writer won. Never release a claim by
     // revision or identical content alone: only this invocation's unique attempt.
@@ -469,8 +521,10 @@ export function createService(p: Ports) {
       ]
         .filter(Boolean)
         .join(' ');
+      const other = await otherSection(c, issue, stored.data.managed, type, cleanupOnly);
       return {
         ...library,
+        ...(other ? { otherSection: other } : {}),
         cleanupOnly,
         refreshAfterSave,
         ...(loadWarning ? { loadWarning } : {}),
@@ -479,7 +533,15 @@ export function createService(p: Ports) {
         fingerprint: targetHash(issue, field),
       };
     },
-    async save(c: Context, input: { ids: string[]; revision: number; fingerprint: string }) {
+    async save(
+      c: Context,
+      input: { ids: string[]; revision: number; fingerprint: string; replace?: string },
+    ) {
+      if (
+        input.replace !== undefined &&
+        (typeof input.replace !== 'string' || !/^[0-9a-f]{64}$/.test(input.replace))
+      )
+        throw new UserError('Invalid section to replace. Reopen the field.');
       if (
         !Array.isArray(input.ids) ||
         input.ids.length > 5 ||
@@ -540,6 +602,7 @@ export function createService(p: Ports) {
         prompts,
         stored.data.managed,
         sectionLocalId(issue.id),
+        input.replace,
       );
       const keys = sources.map((s) => s.key);
       const fresh = await target(c, field);

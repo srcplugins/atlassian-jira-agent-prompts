@@ -9,7 +9,7 @@ export const fieldKey = 'agent-prompts-field';
 export const storageEntity = 'agent-prompt-state';
 
 /** Prefix of a managed description section's local ID; the work item ID follows it. */
-const sectionIdPrefix = 'agent-prompts-';
+export const sectionIdPrefix = 'agent-prompts-';
 
 export const sectionLocalId = (issueId: string) => `${sectionIdPrefix}${issueId}`;
 

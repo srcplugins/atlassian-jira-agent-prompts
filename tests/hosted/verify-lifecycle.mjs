@@ -26,6 +26,7 @@ import {
 import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
 import { snapshotJourney, editor, openField, resumeSavedJourney } from './support/snapshots.mjs';
 import { agentPromptsFixture } from './support/fixture.mjs';
+import { fieldReadView } from './support/field.mjs';
 import { reviewConfiguration } from './support/configuration-dialog.mjs';
 
 const options = lifecycleOptions(
@@ -203,7 +204,15 @@ try {
         state.lifecycle.stage = blank ? 'blank-round-trip' : 'add-sync-remove';
         owned.run.persist();
         const testInfo = { annotations: [] };
-        await snapshotJourney({ page: userPage, owned, blank, testInfo });
+        // nc-user is refused space settings (checked above), so the prompt type comes from
+        // nc-admin's health read after configuring.
+        await snapshotJourney({
+          page: userPage,
+          owned,
+          blank,
+          testInfo,
+          promptType: state.lifecycle.configuredState.data.type,
+        });
         owned.run.check(
           blank
             ? 'AP-03 ordinary-user blank round trip'
@@ -290,12 +299,7 @@ try {
       owned.run.persist();
       const page = await contexts.owner.newPage();
       await page.goto(`${activeTarget().site}/browse/${backup.targetKey}`);
-      const readView = page
-        .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-        .locator('..')
-        .locator(
-          '[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]',
-        );
+      const readView = fieldReadView(page, backup.fieldId);
       const loaded = await observeAction(page, 'load', () => openField(page, readView), target);
       assert.deepEqual(loaded.ids, [], 'Reinstall must not adopt old selections');
       const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
@@ -307,7 +311,7 @@ try {
       await editor(page).getByRole('button', { name: 'Save', exact: true }).click();
       await expect(
         editor(page).getByText(
-          'The description has an Agent Prompts section the app did not save. Review the description before saving.',
+          "The description has an Agent Prompts section the app didn't save. Delete it from the description, or use its prompts here to replace it, then save again.",
           { exact: true },
         ),
       ).toBeVisible({ timeout: 45000 });

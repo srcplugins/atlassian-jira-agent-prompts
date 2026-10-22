@@ -8,6 +8,7 @@ import {
 import { activeTarget, markers } from '@srcplugins/atlassian-forge-test-framework/core';
 import { expect } from './expect.mjs';
 import { spaceHealth } from './space-settings.mjs';
+import { agentPromptsField, fieldReadView } from './field.mjs';
 /** Searches for a retired prompt's exact key: the resolver must return no prompts. */
 async function searchHides(page, combo, key, id) {
   const found = await observeAction(
@@ -115,7 +116,9 @@ function watchAppEgress(page) {
 /**
  * Saves a prompt to a work item, Syncs an edit to it and removes it. With `retire`, the prompt is
  * moved to its work type's Done-category status after the first save: search must stop offering
- * it, while the work item keeps it, labelled, and Sync still copies its text.
+ * it, while the work item keeps it, labelled, and Sync still copies its text. The space's prompt
+ * type comes from its health in space settings, read through `page`; a caller whose `page` is an
+ * ordinary user, who can't open space settings, passes `promptType` from an administrator's read.
  */
 export async function snapshotJourney({
   page,
@@ -124,14 +127,17 @@ export async function snapshotJourney({
   testInfo,
   retainSaved = false,
   retire = false,
+  editInJira = false,
+  promptType = undefined,
 }) {
   const egress = watchAppEgress(page);
   await dismissOnboarding(page);
-  const health = await spaceHealth(page, owned.project);
+  const type = promptType ?? (await spaceHealth(page, owned.project)).state.data.type;
+  expect(type).toBeTruthy();
   const source = await owned.propertyIssue(
     `Error handling ${owned.run.state.runId.slice(0, 8)}`,
     `SNAPSHOT-PROMPT-${owned.run.state.runId}`,
-    health.state.data.type,
+    type,
   );
   const marker = markers.runMarker(owned.run.state.runId, owned.run.state.resources.length);
   const target = blank
@@ -153,13 +159,7 @@ export async function snapshotJourney({
   const sentinel = `SNAPSHOT-PROMPT-${owned.run.state.runId}`;
   owned.run.state.snapshotIntent = { sourceId: source.id, targetId: target.id, sentinel };
   owned.run.persist();
-  const field = (await owned.api('/field')).find(
-    (f) =>
-      f.schema?.custom?.includes(`/${installation('agent-prompts').appId}/`) &&
-      f.schema.custom.includes(installation('agent-prompts').environmentId) &&
-      f.name === 'Agent Prompts',
-  );
-  expect(field).toBeTruthy();
+  const field = await agentPromptsField(owned.api);
   await expect(async () => {
     const found = await owned.api('/search/jql', 'POST', {
       jql: `project = ${owned.project.id} AND issuetype = ${sourceIssue.fields.issuetype.id} ORDER BY key ASC`,
@@ -182,10 +182,7 @@ export async function snapshotJourney({
     }
   });
   await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
-  const readView = page
-    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-    .locator('..')
-    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const readView = fieldReadView(page, field.id);
   await expect(readView).toBeVisible();
   await page.waitForTimeout(1500);
   expect(calls).toEqual([]);
@@ -291,6 +288,54 @@ export async function snapshotJourney({
   // Only the test explicitly reloads, after asserting the editor remained mounted.
   await page.reload();
   await expandPrompts(page, sentinel);
+  // A person edits the Description in Jira's own editor, which round-trips the whole document,
+  // the Agent Prompts section included. Sync and removal must still recognise the section.
+  let saved = linked.description;
+  if (editInJira) {
+    const note = `Edited in Jira ${owned.run.state.runId.slice(0, 8)}`;
+    const description = page.getByTestId('issue.views.field.rich-text.description');
+    await description.click();
+    // The editor's document box; the section's expand has its own nested text box.
+    const content = page.locator('#ak-editor-textarea');
+    await expect(content).toBeVisible();
+    await content.press('ControlOrMeta+Home');
+    await page.keyboard.type(note);
+    await page.keyboard.press('Enter');
+    // The editor's document is unknown until saved: journal that a save is pending, which no
+    // description matches, so an interrupted run stops cleanup for inspection.
+    target.expected.descriptionVariants.push({ pendingJiraEditorSave: note });
+    owned.run.persist();
+    await page.getByRole('button', { name: 'Save', exact: true }).first().click();
+    await expect(async () => {
+      const now = (await owned.api(`/issue/${target.id}?fields=description`)).fields.description;
+      expect(JSON.stringify(now)).toContain(note);
+      saved = now;
+    }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+    target.expected.descriptionVariants.splice(-1, 1, saved);
+    owned.run.persist();
+    await testInfo.attach('jira-editor-description', {
+      body: JSON.stringify(saved, null, 1),
+      contentType: 'application/json',
+    });
+    // Jira's mobile editor also gives every node inside the section except text its own 12-hex
+    // `localId` when it saves (agent-prompts#netc); the desktop editor above doesn't, so write it.
+    const stamped = structuredClone(saved);
+    const ownSection = stamped.content.find(
+      (n) => n.type === 'expand' && n.attrs?.localId === `agent-prompts-${target.id}`,
+    );
+    let stamps = 0;
+    const stamp = (node) => {
+      node.attrs = { ...node.attrs, localId: (0xa9e000000000 + stamps++).toString(16) };
+      node.content?.filter((child) => child.type !== 'text').forEach(stamp);
+    };
+    ownSection.content.forEach(stamp);
+    target.expected.descriptionVariants.push(stamped);
+    owned.run.persist();
+    await owned.api(`/issue/${target.id}`, 'PUT', { fields: { description: stamped } });
+    saved = (await owned.api(`/issue/${target.id}?fields=description`)).fields.description;
+    expect(saved).toEqual(stamped);
+    await page.reload();
+  }
   if (retire) {
     const { transitions } = await owned.api(`/issue/${source.id}/transitions`);
     const retiring = transitions.find((t) => t.to?.statusCategory?.key === 'done');
@@ -320,8 +365,14 @@ export async function snapshotJourney({
   owned.run.persist();
   await owned.api(`/issue/${source.id}`, 'PUT', { fields: { description: updated } });
   expect((await owned.api(`/issue/${target.id}?fields=description`)).fields.description).toEqual(
-    linked.description,
+    saved,
   );
+  // Everything outside the section, as last saved; the section itself is found by its id.
+  const ownId = `agent-prompts-${target.id}`;
+  const outside = (doc) =>
+    doc.content.filter((n) => n.type !== 'expand' || n.attrs?.localId !== ownId);
+  const section = (doc) =>
+    doc.content.find((n) => n.type === 'expand' && n.attrs?.localId === ownId);
   if (retire) {
     const reopened = await observeAction(
       page,
@@ -348,11 +399,20 @@ export async function snapshotJourney({
   const expectedRefresh = structuredClone(expectedLinked);
   expectedRefresh.content.at(-1).content.splice(1, Infinity, ...updated.content);
   target.expected.descriptionVariants.push(expectedRefresh);
+  if (editInJira) {
+    // The app writes its own section in place of the edited one, without the editor's ids.
+    const own = section(saved);
+    target.expected.descriptionVariants.push({
+      ...saved,
+      content: saved.content.map((n) => (n === own ? section(expectedRefresh) : n)),
+    });
+  }
   owned.run.persist();
   await save('Sync');
   const refreshed = (await owned.api(`/issue/${target.id}?fields=description`)).fields.description;
-  expect(refreshed.content.slice(0, -1)).toEqual(linked.description.content.slice(0, -1));
-  expect(refreshed.content.at(-1).content[1]).toEqual(updated.content[0]);
+  expect(outside(refreshed)).toEqual(outside(saved));
+  expect(section(refreshed).content[1]).toEqual(updated.content[0]);
+  if (editInJira) expect(section(refreshed)).toEqual(section(expectedRefresh));
   target.expected.descriptionVariants.push(refreshed);
   owned.run.persist();
   await page.screenshot({
@@ -361,9 +421,11 @@ export async function snapshotJourney({
   await editor(page)
     .getByRole('button', { name: /remove.*Error handling/i })
     .click();
-  const removedDescription = blank
-    ? { type: 'doc', version: 1, content: [] }
-    : target.expected.description;
+  const removedDescription = editInJira
+    ? { ...saved, content: outside(saved) }
+    : blank
+      ? { type: 'doc', version: 1, content: [] }
+      : target.expected.description;
   target.expected.descriptionVariants.push(removedDescription);
   owned.run.persist();
   await save();
@@ -409,10 +471,7 @@ export async function resumeSavedJourney({ page, owned, backup }) {
     (await owned.api(`/issue/${target.id}?fields=description,${backup.fieldId}`)).fields;
   expect(await fields()).toEqual(backup.linked);
   await page.goto(`${activeTarget().site}/browse/${backup.targetKey}`);
-  const readView = page
-    .getByRole('button', { name: /^(Agent Prompts, .*edit|Edit Agent Prompts)$/ })
-    .locator('..')
-    .locator('[data-component-selector="jira-issue-view-select-inline-edit-read-view-container"]');
+  const readView = fieldReadView(page, backup.fieldId);
   const loaded = await observeAction(
     page,
     'load',

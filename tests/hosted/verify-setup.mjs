@@ -28,6 +28,7 @@ import {
 import { spaceSettings } from './support/space-settings.mjs';
 import { agentPromptsFixture, setupRunSpace } from './support/fixture.mjs';
 import { setupCleanup } from './support/setup-cleanup.mjs';
+import { agentPromptsField } from './support/field.mjs';
 import {
   chooseScreenTypes,
   nextStep,
@@ -438,13 +439,7 @@ try {
       await expect(ack).toBeChecked();
     }
     const choose = (f, name) => chooseScreenTypes(page, f.key, name);
-    async function appField() {
-      const field = (await api('/field')).find(
-        (x) => x.schema?.custom?.includes(`/${t.appId}/`) && x.name === 'Agent Prompts',
-      );
-      assert.ok(field, 'Agent Prompts field required');
-      return field.id;
-    }
+    const appField = async () => (await agentPromptsField(api, t)).id;
     const task = original.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
     assert.ok(task);
     if (bulk) {
