@@ -66,7 +66,7 @@ export const checks = [
       const type = dialog.getByRole('button', { name: `Type: ${issue.typeName}`, exact: true });
       if (!(await type.isVisible())) {
         await dialog.getByRole('button', { name: /^Type: / }).click();
-        await page.getByRole('option', { name: issue.typeName, exact: true }).click();
+        await page.getByRole('menuitem', { name: issue.typeName, exact: true }).click();
       }
       await expect(type).toBeVisible();
       await expect(dialog.getByRole('textbox', { name: 'Summary', exact: true })).toBeVisible({

@@ -38,7 +38,7 @@
     "@eslint/js": "10.0.1",
     "@forge/cli": "file:.local/toolchain/forge-cli-14.0.0.tgz",
     "@playwright/test": "1.63.0",
-    "@srcplugins/atlassian-forge-test-framework": "github:srcplugins/atlassian-forge-test-framework#b3cf37aefea06bb51ebdea5f90f8415a8278531a",
+    "@srcplugins/atlassian-forge-test-framework": "github:srcplugins/atlassian-forge-test-framework#d1929f912dede088ee65d6902040617f161823c7",
     "@types/node": "24.19.0",
     "@types/react": "18.3.31",
     "@types/react-dom": "18.3.7",

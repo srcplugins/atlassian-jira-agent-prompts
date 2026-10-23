@@ -2,6 +2,10 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
+## 1.0.5 (unreleased)
+
+- **Demo video.** "Watch the demo" in this README plays the current demo, recorded on the released app.
+
 ## 1.0.4
 
 - **Sync always fixes the Agent Prompts section.** Save and Sync replace every collapsible section titled Agent Prompts in the description with one fresh section from the prompts the field links, wherever those sections are and whatever anyone edited, typed, moved, copied or deleted. They no longer refuse and ask you to undo a change in Jira first. The rest of the description stays as it is.

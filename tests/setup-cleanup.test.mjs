@@ -78,7 +78,7 @@ function addType(world, j, schemes) {
 
 /** Cleanup over the fake. Every write must follow a journal write made since the previous one;
  * `before` keeps the journal as persisted just before each write. */
-function harness(world, j, options) {
+function harness(world, j, options, accepted) {
   const jira = fakeJira(world, options);
   const snapshots = [];
   const before = [];
@@ -95,7 +95,7 @@ function harness(world, j, options) {
     }
     return jira.api(path, method, body);
   };
-  const { cleanup } = setupCleanup({ j, api, persist });
+  const { cleanup } = setupCleanup({ j, api, persist, accepted });
   return { cleanup, ...jira, snapshots, before };
 }
 
@@ -128,6 +128,60 @@ test('cleanup after a default run deletes the work type, both spaces and their s
   assert.equal(world.types[30001], undefined);
   assertSiteRestored(world, j);
   assertClean(h, j);
+});
+
+test('an outside mapping change stops cleanup unless the owner accepted exactly that mapping', async () => {
+  // Another space's setup added Epic to OTHER's scheme while the run was out.
+  const outside = () => {
+    const { world, j } = run();
+    addType(world, j, ['21000', '21001', '10000']);
+    Object.assign(j, { detachIntent: true, passed: true });
+    world.typeSchemes[10100].types.push('10002');
+    return { world, j };
+  };
+  const refused = outside();
+  await assert.rejects(harness(refused.world, refused.j).cleanup(), /Unrelated type-scheme/);
+  assert.equal(refused.world.types[30001].name, `Renamed ${id}`);
+
+  const { world, j } = outside();
+  const baseline = structuredClone(j.mappingBaseline);
+  const h = harness(world, j, undefined, ['10100:10002']);
+  await h.cleanup();
+  assert.deepEqual(h.writes, ['DELETE /issuetype/30001', ...removeSpaces(j)]);
+  assert.equal(world.types[30001], undefined);
+  assert.deepEqual(world.typeSchemes[10100].types, ['10001', '10002']);
+  assert.deepEqual(j.mappingBaseline, baseline, 'The journal baseline is not changed');
+  assertClean(h, j);
+
+  // A second outside change still stops it.
+  const other = outside();
+  other.world.typeSchemes[10000].types.push('10003');
+  await assert.rejects(
+    harness(other.world, other.j, undefined, ['10100:10002']).cleanup(),
+    /Unrelated type-scheme/,
+  );
+});
+
+test('a new run builds its cleanup before recording the baseline, and cleanup reads it later', async () => {
+  // verify-setup.mjs builds the cleanup at start; a new run journals mappingBaseline afterwards.
+  const { world, j } = run();
+  const recorded = j.mappingBaseline;
+  delete j.mappingBaseline;
+  addType(world, j, ['21000', '21001', '10000']);
+  Object.assign(j, { detachIntent: true, passed: true });
+  const h = harness(world, j);
+  j.mappingBaseline = recorded;
+  await h.cleanup();
+  assert.deepEqual(h.writes, ['DELETE /issuetype/30001', ...removeSpaces(j)]);
+  assertSiteRestored(world, j);
+  assertClean(h, j);
+});
+
+test('accepted mappings must be new, on a baseline scheme and not the run’s own type', () => {
+  const { world, j } = run();
+  addType(world, j, ['21000']);
+  for (const accepted of [['10000:10001'], ['99999:10002'], ['10100:30001'], ['10100']])
+    assert.throws(() => harness(world, j, undefined, accepted), /Accepted mapping/);
 });
 
 test('cleanup before steps mode planned its fixtures reads no screens', async () => {

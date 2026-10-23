@@ -3,8 +3,37 @@ import assert from 'node:assert/strict';
 import { verifyTypeMappings } from './agent-prompts-setup.mjs';
 import { spaceLeftovers } from './space-leftovers.mjs';
 
-/** Cleanup over a run journal `j`, a Jira client `api` and the journal writer `persist`. */
-export function setupCleanup({ j, api, persist }) {
+/**
+ * The baseline plus mappings that work outside the run added meanwhile and the owner reviewed
+ * (tests/hosted/cleanup.json's SETUP_ACCEPTED_MAPPINGS, for one recovery). Each must be new, on a
+ * scheme the baseline knew, and not the run's own type, so every other change still stops cleanup.
+ */
+function acceptedBaseline(j, accepted) {
+  const schemes = new Set(j.mappingBaseline.map((value) => value.split(':')[0]));
+  for (const mapping of accepted) {
+    const [scheme, type] = mapping.split(':');
+    if (
+      !/^[1-9]\d*:[1-9]\d*$/.test(mapping) ||
+      !schemes.has(scheme) ||
+      type === j.type?.id ||
+      j.mappingBaseline.includes(mapping)
+    )
+      throw Error(
+        `Accepted mapping ${mapping} must be new, on a baseline scheme, not the run's type`,
+      );
+  }
+  return [...j.mappingBaseline, ...accepted].sort();
+}
+
+/**
+ * Cleanup over a run journal `j`, a Jira client `api` and the journal writer `persist`. `accepted`
+ * lists reviewed outside mappings (see acceptedBaseline); the journal itself is never changed.
+ */
+export function setupCleanup({ j, api, persist, accepted = [] }) {
+  // A new run records its baseline after this, so it is read when cleanup compares, not here; a
+  // recovery's accepted mappings are checked against its journal at once.
+  if (accepted.length) acceptedBaseline(j, accepted);
+  const baseline = () => acceptedBaseline(j, accepted);
   const leftovers = spaceLeftovers(api);
   async function pages(endpoint) {
     const out = [];
@@ -177,7 +206,7 @@ export function setupCleanup({ j, api, persist }) {
       x.gone = true;
       persist();
     }
-    assert.deepEqual(known(await mappings()), j.mappingBaseline);
+    assert.deepEqual(known(await mappings()), baseline());
   }
   async function cleanup() {
     // `steps` is the mode flag until steps mode journals its planned fixtures in its place.
@@ -251,7 +280,7 @@ export function setupCleanup({ j, api, persist }) {
         });
         assert.equal(found.isLast, true);
         assert.equal(found.issues.length, 0);
-        verifyTypeMappings(j.mappingBaseline, await mappings(), {
+        verifyTypeMappings(baseline(), await mappings(), {
           type: t.id,
           schemes: (j.shared ? j.fixtures.slice(0, 1) : j.fixtures).map((f) => f.scheme.id),
           defaultScheme: j.defaultScheme,
@@ -264,7 +293,7 @@ export function setupCleanup({ j, api, persist }) {
       }
       j.typeDeleted = true;
       persist();
-      assert.deepEqual(known(await mappings()), j.mappingBaseline);
+      assert.deepEqual(known(await mappings()), baseline());
     }
     for (const f of j.fixtures) {
       if (!f.project) continue;

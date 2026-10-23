@@ -1248,7 +1248,7 @@ async function createWithoutField({ page, owned, theme, jiraRequest, testInfo })
       const type = dialog.getByRole('button', { name: 'Type: Task', exact: true });
       if (!(await type.isVisible())) {
         await dialog.getByRole('button', { name: /^Type: / }).click();
-        await page.getByRole('option', { name: 'Task', exact: true }).click();
+        await page.getByRole('menuitem', { name: 'Task', exact: true }).click();
       }
       await expect(type).toBeVisible();
       await dialog.getByRole('textbox', { name: 'Summary', exact: true }).fill(summary);
