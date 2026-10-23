@@ -4,7 +4,7 @@
 
 Stop repeating the same instructions across Jira work items. Create reusable prompts for coding standards, review guidelines and team conventions, all managed directly in Jira. Add the right prompts to each work item to give your coding agents the context they need.
 
-[Watch the demo](https://youtu.be/bzba00JMcGI) · [Website](https://srcplugins.com/plugins/atlassian/agent-prompts-for-jira/)
+[Watch the demo](https://youtu.be/D4K5Ow1Sw_A) · [Website](https://srcplugins.com/plugins/atlassian/agent-prompts-for-jira/)
 
 ## Features
 

@@ -128,6 +128,10 @@ const { pages, mappings, known, emptyProject, fieldTab, cleanup } = setupCleanup
   j,
   api,
   persist,
+  accepted:
+    mode === 'cleanup'
+      ? (process.env.SETUP_ACCEPTED_MAPPINGS ?? '').split(',').filter(Boolean)
+      : [],
 });
 let browser;
 const stage = (value) => {

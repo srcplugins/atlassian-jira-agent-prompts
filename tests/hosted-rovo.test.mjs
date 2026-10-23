@@ -74,9 +74,13 @@ function fixture() {
   const input = {
     owned,
     setup: async () => ({ project: { id: '1' }, type: '39' }),
-    discover: async (key) => ({ prompts: [{ id: source.id, key }] }),
+    discover: async (key) => ({
+      prompts: issues.filter((issue) => issue.key === key).map(({ id }) => ({ id, key })),
+    }),
     search: async (args) => {
-      assert.deepEqual(Object.keys(args).sort(), ['index', 'key']);
+      assert.deepEqual(Object.keys(args).sort(), ['agentCheck', 'index', 'key']);
+      assert.notEqual(args.agentCheck.key, source.key);
+      assert.match(args.agentCheck.instructions, /Agent check token ROVO-AGENT-/);
       calls.push(`search-${args.index}`);
       return `${source.key} — ${source.fields.summary}`;
     },
@@ -94,7 +98,16 @@ function fixture() {
 test('Rovo runner journals one ordinary source in the current type and cleans after two searches/reads', async () => {
   const f = fixture();
   await runRovoJourney(f.input);
-  assert.deepEqual(f.calls, ['create', 'search-1', 'read-1', 'search-2', 'read-2', 'delete']);
+  assert.deepEqual(f.calls, [
+    'create',
+    'create',
+    'search-1',
+    'read-1',
+    'search-2',
+    'read-2',
+    'delete',
+    'delete',
+  ]);
   assert.equal(f.owned.run.state.status, 'clean');
   assert.equal(f.owned.run.state.testStatus, 'passed');
   assert.equal(f.owned.run.state.resources[0].expected.description.content[0].type, 'paragraph');
@@ -128,9 +141,20 @@ test('search absence, unverified search, failed/incomplete reads and Jira drift 
       /searchable in Jira/,
     ],
     [
+      'agent check fixture absent from Jira search',
+      (f) => {
+        let discovered = 0;
+        return {
+          discover: async (key) => (++discovered === 1 ? f.input.discover(key) : { prompts: [] }),
+        };
+      },
+      ['create', 'create', 'delete', 'delete'],
+      /agent check fixture must be searchable/,
+    ],
+    [
       'search without the withheld source name',
       () => ({ search: async ({ key }) => key }),
-      ['create', 'delete'],
+      ['create', 'create', 'delete', 'delete'],
     ],
     [
       'agent read unavailable',
@@ -139,12 +163,12 @@ test('search absence, unverified search, failed/incomplete reads and Jira drift 
           throw Error('Agent action unavailable');
         },
       }),
-      ['create', 'search-1', 'delete'],
+      ['create', 'create', 'search-1', 'delete', 'delete'],
     ],
     [
       'agent read without the source instructions',
       () => ({ read: async ({ key }) => `${key}: a summary without the source instructions` }),
-      ['create', 'search-1', 'delete'],
+      ['create', 'create', 'search-1', 'delete', 'delete'],
     ],
     [
       'unexpected Jira change during read-only Rovo',
@@ -155,7 +179,7 @@ test('search absence, unverified search, failed/incomplete reads and Jira drift 
           return response;
         },
       }),
-      ['create', 'search-1', 'read-1', 'delete'],
+      ['create', 'create', 'search-1', 'read-1', 'delete', 'delete'],
     ],
   ]) {
     const f = fixture();
@@ -175,8 +199,12 @@ test('changed fixture content blocks guarded deletion instead of being silently 
   };
   await assert.rejects(runRovoJourney({ ...f.input, read }), /cleanup incomplete/);
   assert.equal(f.owned.run.state.status, 'cleanup-required');
-  assert.equal(f.calls.includes('delete'), false);
-  assert.equal(f.issues.length, 2);
+  // The unchanged agent check fixture is removed; the edited source stays.
+  assert.equal(f.calls.filter((call) => call === 'delete').length, 1);
+  assert.deepEqual(
+    f.issues.map((issue) => issue.id),
+    [f.baseline.id, '20'],
+  );
 });
 
 test('successful chats remain failed acceptance when final inventory restoration cannot be verified', async () => {
