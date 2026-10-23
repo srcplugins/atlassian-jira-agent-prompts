@@ -584,7 +584,9 @@ try {
     assert.ok(JSON.stringify(removed.description).includes(`ACCESS-VISIBLE-${id}`));
 
     stage('member-adds-hidden');
-    // A forged save that adds the hidden ID must be refused by the backend with no write.
+    // A forged save that adds the hidden ID gets nothing of it. Jira answers the member 404, as for
+    // a deleted work item, and the ID was never saved with a security level, so the app drops it,
+    // names it only by the forged ID, and copies and links nothing of it.
     await open(member);
     await editor(member)
       .getByRole('button', { name: new RegExp(`remove.*${visible.summary}`, 'i') })
@@ -603,7 +605,7 @@ try {
         return route.continue();
       const swap = (value) => {
         if (!value || typeof value !== 'object') return false;
-        if (Array.isArray(value.ids) && typeof value.fingerprint === 'string') {
+        if (Array.isArray(value.ids) && typeof value.revision === 'number') {
           value.ids = [visible.id, hidden.id];
           return true;
         }
@@ -613,16 +615,18 @@ try {
       forged++;
       return route.continue({ postData: JSON.stringify(body) });
     });
-    await expect(
-      observeAction(
-        member,
-        'save',
-        () => editor(member).getByRole('button', { name: 'Save', exact: true }).click(),
-        t,
-      ),
-    ).rejects.toMatchObject({ category: 'resolver-failed' });
+    const forgedSave = await observeAction(
+      member,
+      'save',
+      () => editor(member).getByRole('button', { name: 'Save', exact: true }).click(),
+      t,
+    );
     await member.unroute(pattern);
     assert.equal(forged, 1);
+    assert.deepEqual(forgedSave.ids, [visible.id]);
+    assert.deepEqual(forgedSave.dropped, [`the prompt with ID ${hidden.id}`]);
+    for (const secret of [hidden.key, hidden.summary, `ACCESS-HIDDEN-${id}`])
+      assert.ok(!JSON.stringify(forgedSave).includes(secret));
     assert.deepEqual(await targetState(), removed);
     await member.screenshot({ path: `${directory}/${id}-member-forged.png`, fullPage: true });
 
