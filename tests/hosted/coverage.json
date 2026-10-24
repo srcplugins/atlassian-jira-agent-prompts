@@ -305,6 +305,19 @@
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
     },
     {
+      "id": "AP-LICENSING",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-licensing.mjs",
+      "optIn": "NATIVE_LICENSING_TESTS",
+      "command": "For each state: uninstall the development installation on the isolation site, forge install -e development --license <inactive|trial|active> (no --license for none), then NATIVE_LICENSING_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> node tests/hosted/verify-licensing.mjs <state>; end with none",
+      "fixture": "The marked Agent Prompts fixture space on the isolation site with this installation's field on its Task screens; one run-owned Task per state; exact owner session",
+      "assertion": "The space inventory reports the runtime license and Configure names a missing one; without a license, setup preview, field load and search return exactly the subscription refusal, also with a license forged into the request context, while health, options, status, setup-removal preview and save-status still answer; with a trial, active or no license object in development, nothing is refused for the license",
+      "cleanup": "Durable fixture journal and space lock shared with the lifecycle runs; explicit cleanup <run-uuid>; verified work item absence",
+      "version": "Current development; a fresh installation per license state, because an upgrade keeps the license",
+      "lowerLevelTests": ["tests/license.test.mjs", "tests/health-ui.test.mjs"]
+    },
+    {
       "id": "AP-WORKFLOW-FIXTURE",
       "method": "fixture-runner",
       "unattended": false,

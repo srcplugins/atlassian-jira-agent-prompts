@@ -46,6 +46,10 @@ Everything runs as the current user, so Jira's normal visibility rules apply. Sa
 | `manage:jira-project`       | Read screens and screen schemes, add or remove the Agent Prompts field, and add summary and description to screens after administrator review.                                   |
 | `storage:app`               | Store space settings, selected prompt IDs and content fingerprints, the latest space configuration, records of screens where the app added the field, and save-recovery records. |
 
+## Subscription
+
+Agent Prompts for Jira is a paid app, billed through Atlassian, and works fully during a free trial. Without an active subscription, the Agent Prompts field and the Rovo assistant can't search, save or sync prompts, and spaces can't be configured; the **Configure** page says so. Administrators can still list spaces and run their health checks, remove setup, and check and release interrupted saves and configuration changes. Prompts, copied instructions, field values and the app's stored settings stay as they are, and everything works again once the site subscribes in Atlassian Administration.
+
 ## Data
 
 Prompts, their copied instructions and each work item's Agent Prompts field, which lists the prompts selected on it, stay in Jira. Atlassian Forge stores the app's configuration, save-recovery data, each work item's selected prompt IDs and content fingerprints, a record of the latest space configuration (without any account) and which screens the app added the Agent Prompts field to; removing setup removes the field only from those screens. The app does not send data outside Atlassian or log prompt content. After uninstalling, work items and copies remain; Forge keeps app data for 28 days, and reinstalling doesn't restore it automatically.

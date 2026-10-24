@@ -187,7 +187,7 @@ Production dependencies included in this app and its UI bundles.
 | eventemitter3 | 4.0.7 | MIT |
 | exenv | 1.2.2 | BSD-3-Clause |
 | fast-deep-equal | 3.1.3 | MIT |
-| fast-uri | 3.1.8 | BSD-3-Clause |
+| fast-uri | 3.1.9 | BSD-3-Clause |
 | final-form | 4.20.10 | MIT |
 | final-form-focus | 1.1.2 | MIT |
 | find-root | 1.1.0 | MIT |
@@ -276,7 +276,7 @@ Production dependencies included in this app and its UI bundles.
 | tiny-invariant | 1.3.3 | MIT |
 | tslib | 2.8.1 | 0BSD |
 | uc.micro | 2.1.0 | MIT |
-| undici | 7.30.0 | MIT |
+| undici | 7.30.1 | MIT |
 | use-callback-ref | 1.3.3 | MIT |
 | use-isomorphic-layout-effect | 1.2.1 | MIT |
 | use-memo-one | 1.1.3 | MIT |

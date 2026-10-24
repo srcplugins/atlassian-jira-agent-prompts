@@ -4,6 +4,7 @@ User-facing changes in each released version of Agent Prompts for Jira.
 
 ## 1.0.5 (unreleased)
 
+- **Paid subscription.** Agent Prompts for Jira is now a paid app, billed through Atlassian, with a free trial. Without an active subscription the field and the Rovo assistant can't search, save or sync prompts, and spaces can't be configured; removing setup, health checks and recovery of interrupted changes stay available, and nothing stored is lost.
 - **Demo video.** "Watch the demo" in this README plays the current demo, recorded on the released app.
 
 ## 1.0.4
