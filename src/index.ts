@@ -14,6 +14,10 @@ const sdk = {
     const c = getAppContext();
     return fieldType(c.appAri.appId, c.environmentAri.environmentId);
   },
+  appContext: () => {
+    const c = getAppContext();
+    return { environmentType: c.environmentType, license: c.license };
+  },
 };
 export const handler = registerResolvers(sdk);
 export const searchPrompts = registerRovo(sdk);

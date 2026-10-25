@@ -1290,6 +1290,208 @@ async function createWithoutField({ page, owned, theme, jiraRequest, testInfo })
   if (await discard.isVisible().catch(() => false)) await discard.click();
   await expect(dialog).toBeHidden();
 }
+/** Waits until Jira's search lists each prompt, so the field's server search can find it. */
+async function indexed(owned, typeId, ids) {
+  await expect(async () => {
+    const found = await owned.api('/search/jql', 'POST', {
+      jql: `project = ${owned.project.id} AND issuetype = ${typeId} ORDER BY key ASC`,
+      maxResults: 100,
+      fields: ['summary'],
+    });
+    for (const id of ids) expect(found.issues.some((i) => i.id === id)).toBe(true);
+  }).toPass({ timeout: 30000, intervals: [1000, 3000] });
+}
+/** The app's own section for one prompt, built here from the prompt as Jira returns it. */
+function ownSection(targetId, prompt) {
+  return {
+    type: 'expand',
+    attrs: { localId: `agent-prompts-${targetId}`, title: 'Agent Prompts' },
+    content: [
+      {
+        type: 'heading',
+        attrs: { level: 2 },
+        content: [{ type: 'text', text: `${prompt.key}: ${prompt.fields.summary}` }],
+      },
+      ...prompt.fields.description.content.map(unstamped),
+    ],
+  };
+}
+/** Opens the field on a work item and returns the app's load reply. */
+async function openOn(page, key, fieldId) {
+  await page.goto(`${activeTarget().site}/browse/${key}`);
+  return observeAction(
+    page,
+    'load',
+    () => openField(page, fieldReadView(page, fieldId)),
+    installation('agent-prompts'),
+  );
+}
+async function choose(page, prompt) {
+  const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
+  await expect(combo).toBeEnabled();
+  await observeAction(page, 'search', () => combo.fill(prompt.key), installation('agent-prompts'));
+  await combo.press('ArrowDown');
+  await editor(page).getByText(`${prompt.key} — ${prompt.fields.summary}`, { exact: true }).click();
+}
+/** Presses Save and waits for its reply; the Jira reads after it are the oracle. */
+async function confirmedSave(page, loaded) {
+  const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
+  // With the space's reload preference on, navigation can discard the resolver body.
+  if (loaded.refreshAfterSave)
+    await Promise.all([
+      page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+      click(),
+    ]);
+  else await observeAction(page, 'save', click, installation('agent-prompts'));
+}
+const historyLength = async (owned, id) =>
+  (await owned.api(`/issue/${id}/changelog?maxResults=100`)).total;
+
+test('AP-19 a Description edit made while the field is open is kept, and a second tab saving after the first changes nothing', async ({
+  page,
+  owned,
+}) => {
+  const health = await configuration(page, owned);
+  const type = health.state.data.type;
+  const run = owned.run.state.runId.slice(0, 8);
+  const first = await owned.propertyIssue(`First tab ${run}`, 'Saved from the first tab.', type);
+  const second = await owned.propertyIssue(`Second tab ${run}`, 'Chosen in the second tab.', type);
+  const target = await owned.issue('Prompt from two tabs');
+  const field = await agentPromptsField(owned.api);
+  const read = (id) => owned.api(`/issue/${id}?fields=summary,description`);
+  const [firstPrompt, secondPrompt, targetIssue] = await Promise.all(
+    [first, second, target].map((entry) => read(entry.id)),
+  );
+  await indexed(owned, type, [first.id, second.id]);
+
+  // Both tabs open the field before either saves.
+  const other = await page.context().newPage();
+  try {
+    const loaded = await openOn(page, targetIssue.key, field.id);
+    const loadedOther = await openOn(other, targetIssue.key, field.id);
+    expect(loadedOther.revision).toBe(loaded.revision);
+
+    // The Description changes through Jira while both fields are open.
+    const original = targetIssue.fields.description;
+    const typed = {
+      ...original,
+      content: [
+        ...original.content,
+        { type: 'paragraph', content: [{ type: 'text', text: 'Typed while the field was open.' }] },
+      ],
+    };
+    target.expected.descriptionVariants = [original, typed];
+    owned.run.persist();
+    await owned.api(`/issue/${target.id}`, 'PUT', { fields: { description: typed } });
+    const edited = (await read(target.id)).fields.description;
+    expect(edited).toEqual(typed);
+
+    // The first tab's Save keeps that edit and adds the section after it.
+    await choose(page, firstPrompt);
+    const saved = { ...edited, content: [...edited.content, ownSection(target.id, firstPrompt)] };
+    target.expected.descriptionVariants.push(saved);
+    target.expected.customField = { id: field.id, value: [firstPrompt.key] };
+    owned.run.persist();
+    await confirmedSave(page, loaded);
+    const after = (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+    expect(after.description).toEqual(saved);
+    expect(after[field.id]).toEqual([firstPrompt.key]);
+    const history = await historyLength(owned, target.id);
+
+    // The second tab chose from what it loaded before that save: its Save is refused and
+    // nothing in Jira changes.
+    await choose(other, secondPrompt);
+    await editor(other).getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(
+      editor(other).getByText('The work item changed. Review your selection and save again.', {
+        exact: true,
+      }),
+    ).toBeVisible({ timeout: 30000 });
+    expect((await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields).toEqual(
+      after,
+    );
+    expect(await historyLength(owned, target.id)).toBe(history);
+  } finally {
+    await other.close();
+  }
+});
+
+test('AP-20 Jira refuses a sixth key, an over-long prompt stops Save, and Save replaces keys set outside the app', async ({
+  page,
+  owned,
+}) => {
+  const health = await configuration(page, owned);
+  const type = health.state.data.type;
+  const run = owned.run.state.runId.slice(0, 8);
+  // propertyIssue writes `${body}\nSynthetic ${marker}` as one text node: size the body so the
+  // prompt holds exactly 4,001 characters, one over the app's limit.
+  const marker = markers.runMarker(owned.run.state.runId, owned.run.state.resources.length);
+  const suffix = Array.from(`\nSynthetic ${marker}`).length;
+  const long = await owned.propertyIssue(`Over-long ${run}`, 'L'.repeat(4001 - suffix), type);
+  const short = await owned.propertyIssue(`Within limits ${run}`, 'Short instructions.', type);
+  const target = await owned.issue('Prompt limits');
+  const field = await agentPromptsField(owned.api);
+  const read = (id) => owned.api(`/issue/${id}?fields=summary,description`);
+  const [longPrompt, shortPrompt, targetIssue] = await Promise.all(
+    [long, short, target].map((entry) => read(entry.id)),
+  );
+  const characters = (node) =>
+    node.type === 'text'
+      ? Array.from(node.text).length
+      : (node.content ?? []).reduce((sum, child) => sum + characters(child), 0);
+  expect(characters(longPrompt.fields.description)).toBe(4001);
+  await indexed(owned, type, [long.id, short.id]);
+  const fields = async () =>
+    (await owned.api(`/issue/${target.id}?fields=description,${field.id}`)).fields;
+  const original = targetIssue.fields.description;
+
+  // Through Jira's own editors or REST the field takes five values the app never wrote, which
+  // needn't be prompts; the manifest's validation refuses a sixth.
+  const five = ['1', '2', '3', '4', '5'].map((n) => `ZZFAKE-${n}`);
+  target.expected.customField = { id: field.id, value: five };
+  owned.run.persist();
+  await owned.api(`/issue/${target.id}`, 'PUT', { fields: { [field.id]: five } });
+  expect((await fields())[field.id]).toEqual(five);
+  target.expected.customField = { id: field.id, value: [...five, 'ZZFAKE-6'] };
+  owned.run.persist();
+  await expect(
+    owned.api(`/issue/${target.id}`, 'PUT', { fields: { [field.id]: [...five, 'ZZFAKE-6'] } }),
+  ).rejects.toThrow(/HTTP 400/);
+  target.expected.customField = { id: field.id, value: five };
+  owned.run.persist();
+  expect(await fields()).toEqual({ description: original, [field.id]: five });
+
+  // The field opens on what the app saved (nothing), not on those values.
+  const loaded = await openOn(page, targetIssue.key, field.id);
+  expect(loaded.ids).toEqual([]);
+  await expect(editor(page).getByText(/^0\/5 selected/)).toBeVisible();
+
+  // Saving the over-long prompt is refused by name, and Jira is unchanged.
+  const history = await historyLength(owned, target.id);
+  await choose(page, longPrompt);
+  await editor(page).getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(
+    editor(page).getByText(
+      `${longPrompt.key}: Prompt instructions must contain 1–4000 text characters.`,
+      { exact: true },
+    ),
+  ).toBeVisible({ timeout: 30000 });
+  expect(await fields()).toEqual({ description: original, [field.id]: five });
+  expect(await historyLength(owned, target.id)).toBe(history);
+
+  // A prompt within the limits saves, replacing the values set outside the app.
+  await editor(page)
+    .getByRole('button', { name: new RegExp(`remove ${longPrompt.key} —`, 'i') })
+    .click();
+  await choose(page, shortPrompt);
+  const saved = { ...original, content: [...original.content, ownSection(target.id, shortPrompt)] };
+  target.expected.descriptionVariants = [original, saved];
+  target.expected.customField = { id: field.id, value: [shortPrompt.key] };
+  owned.run.persist();
+  await confirmedSave(page, loaded);
+  expect(await fields()).toEqual({ description: saved, [field.id]: [shortPrompt.key] });
+});
+
 test('AP-14 Create form from the board in a company-managed space: the field stays off it, and the work item is created empty', async ({
   page,
   owned,

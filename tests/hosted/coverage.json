@@ -139,6 +139,24 @@
       "lowerLevelTests": ["tests/field-ui.test.mjs", "tests/settings.test.mjs"]
     },
     {
+      "id": "AP-19",
+      "behavior": "A Description edit made in Jira while the field is open is kept by Save, and a second tab that loaded before that save is refused without a write",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "Two journaled Prompts and one Task in the owned Agent Prompts fixture space; a second page in the same browser context",
+      "assertion": "Both tabs load the same revision; a REST Description edit made after both loads is read back exactly; the first tab's Save leaves that edit with the app's section after it (exact ADF built here from the prompt) and the field holding the prompt's key; the second tab's Save of another prompt shows The work item changed. Review your selection and save again., the Description and field are unchanged and Jira's history gains no entry",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs", "tests/field-ui.test.mjs"]
+    },
+    {
+      "id": "AP-20",
+      "behavior": "The five-value limit holds in Jira's own editors, an over-long prompt stops Save by name, and Save replaces field values set outside the app",
+      "suite": "tests/hosted/agent-prompts.features.spec.mjs",
+      "fixture": "A journaled Prompt of exactly 4,001 characters, one within the limits and one Task in the owned Agent Prompts fixture space",
+      "assertion": "A REST write of five values that aren't prompts is stored and one of six is refused with HTTP 400 (the manifest validation); the field then opens with no prompts selected; Save of the 4,001-character prompt shows its key with Prompt instructions must contain 1–4000 text characters., with the Description, field and Jira's history unchanged; Save of the other prompt replaces the five values with its key and adds exactly the app's section",
+      "cleanup": "journal-verified",
+      "lowerLevelTests": ["tests/service.test.mjs", "tests/snapshots.test.mjs"]
+    },
+    {
       "id": "AP-09",
       "behavior": "Single searchable dropdown, newest suggestions, cursor pages, stable selections and Jira themes",
       "suite": "tests/hosted/agent-prompts.features.spec.mjs",
@@ -220,8 +238,8 @@
       "script": "tests/hosted/verify-rovo.mjs",
       "optIn": "NATIVE_ROVO_TESTS",
       "command": "NATIVE_ROVO_TESTS=1 JIRA_SITE=<primary site> node tests/hosted/verify-rovo.mjs, and with NATIVE_ROVO_SPACE=team-managed (both run in the full and release suites of forge-test.mjs)",
-      "fixture": "One journal-owned ordinary-description source in the Agent Prompts fixture space in the current configured type, or in team-managed mode in the persistent marked team-managed space in its own Prompt type, set through Configure; consenting owner session; shared space lock; existing unresolved scale journal blocks execution",
-      "assertion": "Jira search returns the fixture; two fresh chats search its exact key and retrieve its withheld name, then read complete normalized instructions withheld from chat input; independent Jira inventory unchanged throughout reads; team-managed mode then removes setup, keeps the type as previous and finds the space's work types and every type's create metadata unchanged",
+      "fixture": "One journal-owned ordinary-description source in the Agent Prompts fixture space in the current configured type, or in team-managed mode in the persistent marked team-managed space in its own Prompt type, set through Configure; one journaled disposable Task in the other owned space; consenting owner session; shared space lock; existing unresolved scale journal blocks execution",
+      "assertion": "Jira search returns the fixture; two fresh chats search its exact key and retrieve its withheld name, then read complete normalized instructions withheld from chat input; a read of a work item key from the other owned space (team-managed, or the Agent Prompts space in team-managed mode) is refused with no part of its text; independent Jira inventory unchanged throughout reads; team-managed mode then removes setup, keeps the type as previous and finds the space's work types and every type's create metadata unchanged",
       "cleanup": "Exact run-owned fixture deleted with guarded verification; complete original inventory restored; private UUID artifacts retained, failed reads remain failed",
       "version": "Unattended in every hosted suite run",
       "lowerLevelTests": ["tests/hosted-rovo.test.mjs", "tests/boundary.test.mjs"]
@@ -303,6 +321,19 @@
       "cleanup": "Site-specific durable fixture journal and space lock; explicit cleanup <run-uuid>; verified work item absence and setup removal. Interrupted runs require inspection.",
       "version": "Current development; Rovo eligibility checked separately",
       "lowerLevelTests": ["tests/hosted-lifecycle.test.mjs"]
+    },
+    {
+      "id": "AP-LICENSING",
+      "method": "supervised-script",
+      "unattended": false,
+      "script": "tests/hosted/verify-licensing.mjs",
+      "optIn": "NATIVE_LICENSING_TESTS",
+      "command": "For each state: uninstall the development installation on the isolation site, forge install -e development --license <inactive|trial|active> (no --license for none), then NATIVE_LICENSING_TESTS=1 JIRA_SITE=<isolation site> PLUGIN_TEST_SITE=<isolation site> node tests/hosted/verify-licensing.mjs <state>; end with none",
+      "fixture": "The marked Agent Prompts fixture space on the isolation site with this installation's field on its Task screens; one run-owned Task per state; exact owner session",
+      "assertion": "The space inventory reports the runtime license and Configure names a missing one; without a license, setup preview, field load and search return exactly the subscription refusal, also with a license forged into the request context, while health, options, status, setup-removal preview and save-status still answer; with a trial, active or no license object in development, nothing is refused for the license",
+      "cleanup": "Durable fixture journal and space lock shared with the lifecycle runs; explicit cleanup <run-uuid>; verified work item absence",
+      "version": "Current development; a fresh installation per license state, because an upgrade keeps the license",
+      "lowerLevelTests": ["tests/license.test.mjs", "tests/health-ui.test.mjs"]
     },
     {
       "id": "AP-WORKFLOW-FIXTURE",

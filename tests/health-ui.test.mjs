@@ -710,3 +710,23 @@ test('the inventory limit line counts only the spaces the inventory listed', asy
   assert.equal(f.nodes('DynamicTable')[0].props.rows.length, 4);
   assert.match(f.text(), /Showing the first 3 supported spaces/);
 });
+
+test('an unlicensed installation is named above the inventory, which stays usable', async () => {
+  const projects = [{ id: '1', key: 'PR1', name: 'P1', teamManaged: false }];
+  for (const licensed of [false, true]) {
+    const call = async (name) => {
+      if (name === 'settings-projects') return { projects, incomplete: false, licensed };
+      if (name === 'configuration-status') return null;
+      assert.fail(name);
+    };
+    const f = render(call, [], {});
+    await f.mount();
+    const titles = f.nodes('SectionMessage').map((n) => n.props.title);
+    assert.deepEqual(titles, licensed ? [] : ['No active subscription']);
+    if (!licensed)
+      assert.match(f.text(), /Removing setup and recovering interrupted changes stay available/);
+    // Selection and Configure selected stay available: removing setup goes through them.
+    f.check('Select PR1', true);
+    assert.equal(f.button('Configure selected').props.isDisabled, false);
+  }
+});

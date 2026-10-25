@@ -101,7 +101,12 @@ const put = { expect: { method: 'PUT', path: '/rest/api/3/issue/10' }, status: 2
 function harness(...responses) {
   const contract = forgeContract(...responses);
   const kv = store();
-  const sdk = { ...contract, ...kv, fieldType: () => 'exact-field' };
+  const sdk = {
+    ...contract,
+    ...kv,
+    fieldType: () => 'exact-field',
+    appContext: () => ({ environmentType: 'DEVELOPMENT' }),
+  };
   return { contract, kv, resolvers: registerResolvers(sdk) };
 }
 

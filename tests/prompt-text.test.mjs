@@ -120,6 +120,7 @@ test('the actual Rovo read handler returns faithful numbered instructions with a
     },
   );
   sdk.kvs = { entity: () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) }) };
+  sdk.appContext = () => ({ environmentType: 'DEVELOPMENT' });
   const result = await registerRovo(sdk)(
     { projectKey: 'TEST', query: '', promptKey: 'TEST-20' },
     { principal: { accountId: 'actor' } },

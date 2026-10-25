@@ -8,6 +8,7 @@ function fixture() {
   const issues = [structuredClone(baseline)];
   const calls = [];
   const captures = [];
+  const other = { key: 'OTHER-7', text: 'Disposable fixture in another space, token OTHER-TOKEN.' };
   let source;
   const run = FixtureRun.create({
     app: 'native-prompt-links', // The journal identity of Agent Prompts' owned fixtures.
@@ -87,7 +88,12 @@ function fixture() {
     read: async (args) => {
       assert.deepEqual(Object.keys(args).sort(), ['index', 'key']);
       calls.push(`read-${args.index}`);
+      if (args.key === other.key) return `${other.key} is not a prompt in the selected space.`;
       return `${source.key}: ${source.fields.description.content[0].content[0].text}`;
+    },
+    elsewhere: async () => {
+      calls.push('elsewhere');
+      return structuredClone(other);
     },
     inventory: async () => structuredClone(issues),
     capture: async (stage, data) => captures.push({ stage, data }),
@@ -105,6 +111,8 @@ test('Rovo runner journals one ordinary source in the current type and cleans af
     'read-1',
     'search-2',
     'read-2',
+    'elsewhere',
+    'read-other-space',
     'delete',
     'delete',
   ]);
@@ -112,7 +120,7 @@ test('Rovo runner journals one ordinary source in the current type and cleans af
   assert.equal(f.owned.run.state.testStatus, 'passed');
   assert.equal(f.owned.run.state.resources[0].expected.description.content[0].type, 'paragraph');
   assert.deepEqual(f.issues, [f.baseline]);
-  assert.equal(f.captures.length, 4);
+  assert.equal(f.captures.length, 5);
 });
 
 test('missing consent/setup, missing space setup and wrong space fail before fixture creation', async () => {
@@ -169,6 +177,44 @@ test('search absence, unverified search, failed/incomplete reads and Jira drift 
       'agent read without the source instructions',
       () => ({ read: async ({ key }) => `${key}: a summary without the source instructions` }),
       ['create', 'create', 'search-1', 'delete', 'delete'],
+    ],
+    [
+      'another space read returning its text',
+      (f) => ({
+        read: async (args) =>
+          args.key === 'OTHER-7'
+            ? 'OTHER-7: Disposable fixture in another space, token OTHER-TOKEN.'
+            : f.input.read(args),
+      }),
+      [
+        'create',
+        'create',
+        'search-1',
+        'read-1',
+        'search-2',
+        'read-2',
+        'elsewhere',
+        'delete',
+        'delete',
+      ],
+      /Another space leaked/,
+    ],
+    [
+      'another space read without a refusal',
+      (f) => ({
+        read: async (args) => (args.key === 'OTHER-7' ? 'Done.' : f.input.read(args)),
+      }),
+      [
+        'create',
+        'create',
+        'search-1',
+        'read-1',
+        'search-2',
+        'read-2',
+        'elsewhere',
+        'delete',
+        'delete',
+      ],
     ],
     [
       'unexpected Jira change during read-only Rovo',

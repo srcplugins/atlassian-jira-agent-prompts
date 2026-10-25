@@ -669,3 +669,26 @@ test('Sync writes the saved prompts whatever the client last saw', async () => {
     ['Added in Jira', 'Keep this'],
   );
 });
+test('a field value written outside the app is replaced by the saved selection on Sync and by the chosen one on Save', async () => {
+  // Jira's own field editors (bulk edit, the list view, REST) write the field without the app
+  // (agent-prompts#ee9j): the field then holds keys the app never saved, and the section is stale.
+  const f = fixture();
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
+  const linked = structuredClone(f.target.fields.description);
+  f.target.fields.customfield_1 = ['TEST-20', 'TEST-99', 'NOT A KEY'];
+  f.target.fields.updated = '9';
+  // The field opens on the selection the app saved, not on the value Jira holds.
+  const loaded = await f.service.load(c);
+  assert.deepEqual(loaded.ids, ['20']);
+  const writes = f.calls();
+  const synced = await f.service.save(c, { sync: true });
+  assert.deepEqual(synced.ids, ['20']);
+  assert.equal(f.calls(), writes + 1);
+  assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
+  assert.deepEqual(f.target.fields.description, linked);
+  // Removing every prompt clears the field, whatever was written there meanwhile.
+  f.target.fields.customfield_1 = ['TEST-99'];
+  await f.service.save(c, { ids: [], revision: (await f.service.load(c)).revision });
+  assert.deepEqual(f.target.fields.customfield_1, []);
+  assert.deepEqual(f.target.fields.description, doc('Keep this'));
+});

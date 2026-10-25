@@ -77,6 +77,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     [busy, setBusy] = useState(true),
     [error, setError] = useState(''),
     [incomplete, setIncomplete] = useState(false),
+    [unlicensed, setUnlicensed] = useState(false),
     // How many spaces the inventory listed, without spaces this view added to keep them reachable.
     [listed, setListed] = useState(0),
     [inventoryFailed, setInventoryFailed] = useState(false),
@@ -98,10 +99,11 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
     working(true);
     setError('');
     try {
-      const inventory = await call<{ projects: InventoryProject[]; incomplete: boolean }>(
-        'settings-projects',
-        {},
-      );
+      const inventory = await call<{
+        projects: InventoryProject[];
+        incomplete: boolean;
+        licensed: boolean;
+      }>('settings-projects', {});
       if (!mounted.current) return;
       // The view opens on the kind of the space it was opened from and stays there until the
       // administrator picks the other tab, so a check never moves the view under a selection.
@@ -113,6 +115,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
           : inventory.projects,
       );
       setIncomplete(inventory.incomplete);
+      setUnlicensed(inventory.licensed === false);
       setListed(inventory.projects.length);
       setInventoryFailed(false);
     } catch (e) {
@@ -351,6 +354,16 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
   return (
     <Stack space="space.200">
       <Heading as="h2">Space configuration</Heading>
+      {unlicensed && (
+        <SectionMessage appearance="warning" title="No active subscription">
+          <Text>
+            Agent Prompts for Jira has no active subscription on this site, so prompts can’t be
+            saved or synced and spaces can’t be configured. Removing setup and recovering
+            interrupted changes stay available. A site administrator can subscribe in Atlassian
+            Administration.
+          </Text>
+        </SectionMessage>
+      )}
       {active ? (
         <SectionMessage appearance="warning" title="Configuration in progress">
           <Text>

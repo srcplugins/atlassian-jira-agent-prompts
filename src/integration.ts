@@ -40,6 +40,7 @@ import {
 } from './service';
 import { DescriptionError } from './description';
 import { storageEntity } from './names';
+import { licensed, requireLicense, type AppLicense } from './license';
 interface Sdk {
   Resolver: typeof import('@forge/resolver').default;
   api: typeof import('@forge/api').default;
@@ -48,6 +49,8 @@ interface Sdk {
   Filter: typeof import('@forge/kvs').Filter;
   FilterConditions: typeof import('@forge/kvs').FilterConditions;
   fieldType(): string;
+  /** This invocation's environment and license, from the Forge runtime. */
+  appContext(): AppLicense;
 }
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -982,7 +985,7 @@ export function registerResolvers(sdk: Sdk) {
         requireEmptyPayload(request.payload ?? {});
         const ports = createBatchPorts(sdk);
         await ports.admin();
-        return ports.projects();
+        return { ...(await ports.projects()), licensed: licensed(sdk.appContext()) };
       },
       (e) => e instanceof UserError,
     ),
@@ -1037,6 +1040,17 @@ export function registerResolvers(sdk: Sdk) {
             (!Number.isSafeInteger(payload.revision) || Number(payload.revision) < 0)
           )
             throw new UserError('Invalid configuration revision.');
+          // Without a license, administrators can still read, remove setup and recover; a run
+          // continues only when it removes setup.
+          const app = sdk.appContext();
+          if ((action === 'preview' || action === 'start') && payload.unlink !== true)
+            requireLicense(app);
+          if (
+            action === 'advance' &&
+            !licensed(app) &&
+            (await createBatchPorts(sdk).get())?.data.input.unlink !== true
+          )
+            requireLicense(app);
           const batch = createConfigurationBatch(
             createPorts(sdk),
             createSettingsPorts(sdk),
@@ -1140,6 +1154,8 @@ export function registerResolvers(sdk: Sdk) {
                   : [];
           if (Object.keys(payload).some((k) => !allowed.includes(k)))
             throw new UserError('Unexpected request fields.');
+          // Recovery of an unresolved save stays available without a license.
+          if (name !== 'save-status' && name !== 'resolve-save') requireLicense(sdk.appContext());
           if (name === 'save-status') return service.saveStatus(c);
           if (name === 'resolve-save')
             return service.resolveSave(
@@ -1186,6 +1202,8 @@ export function registerResolvers(sdk: Sdk) {
             );
           if (action === 'preferences' && typeof payload.refreshAfterSave !== 'boolean')
             throw new UserError('Invalid display preference.');
+          // Health checks and recovery stay available without a license.
+          if (action === 'preferences') requireLicense(sdk.appContext());
           const raw = request.context as unknown;
           if (
             !record(raw) ||
@@ -1239,6 +1257,7 @@ export function registerRovo(sdk: Sdk) {
             : undefined;
         if (!promptKey && (typeof input.query !== 'string' || input.query.length > 200))
           throw new UserError('Provide a search query of at most 200 characters.');
+        requireLicense(sdk.appContext());
         const service = createService(createPorts(sdk));
         // Resolve the explicit space through the actor-bound API, never from chat identity fields.
         let project: unknown;

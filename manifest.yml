@@ -101,6 +101,8 @@ app:
   runtime:
     name: nodejs24.x
     memoryMB: 256
+  licensing:
+    enabled: true
   storage:
     entities:
       - name: agent-prompt-state
