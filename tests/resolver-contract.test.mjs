@@ -20,6 +20,7 @@ const sdk = () => {
       }),
     },
     fieldType: () => 'exact-field',
+    appContext: () => ({ environmentType: 'DEVELOPMENT' }),
   };
 };
 const resolvers = Object.keys(registerResolvers(sdk()));

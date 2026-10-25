@@ -10,6 +10,8 @@ export async function runRovoJourney({
   discover,
   search,
   read,
+  // A work item in another owned space, `{ key, text }`, whose text the agent must not return.
+  elsewhere,
   inventory,
   capture,
   verifyCleanup = async (baseline) =>
@@ -81,7 +83,18 @@ export async function runRovoJourney({
       assert.ok(normalize(response).includes(normalize(body)));
       assert.deepEqual(await inventory(), withFixture, 'Read-only Rovo changed Jira work items');
     }
-    owned.run.check('Two fresh ordinary-source Rovo searches/reads and unchanged Jira');
+    // A key from another space is refused: the action reads prompts of the space it was asked
+    // about only, so the other work item's text never reaches the chat.
+    const other = await elsewhere();
+    assert.ok(other.text.length > 15);
+    const refused = await read({ key: other.key, index: 'other-space' });
+    await capture('read-other-space', { key: other.key, withheld: other.text, response: refused });
+    assert.ok(!normalize(refused).includes(normalize(other.text)), 'Another space leaked');
+    assert.match(refused, /\b(?:not|n['’]t)\b[\s\S]{0,80}\bprompt/i);
+    assert.deepEqual(await inventory(), withFixture, 'Read-only Rovo changed Jira work items');
+    owned.run.check(
+      'Two fresh ordinary-source Rovo searches/reads, another space refused, unchanged Jira',
+    );
     passed = true;
   } finally {
     owned.run.state.testStatus = 'failed';

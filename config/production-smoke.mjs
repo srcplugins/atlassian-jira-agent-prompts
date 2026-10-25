@@ -1,4 +1,5 @@
 // Shared srcplugins file, synchronized across repositories.
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -12,11 +13,13 @@ import {
 
 // Publish's read-only production smoke: after the production deploy, checks the plugin's production
 // installation on the primary owned site through its own tests/hosted/production-smoke.mjs, which
-// exports { app, checks: [{ title, run(context) }] }. Nothing here writes to Jira: the API helper
-// handed to checks reads only, and checks open pages and forms without saving them. The target is
-// the app's one production installation on the primary site in the forge-test configuration,
-// with `issue`: an existing work item in a configured fixture space whose description carries
-// that space's marker. Without a target the smoke is skipped, never passed. Usage:
+// exports { app, checks: [{ title, run(context) }] } and optionally `state(context)` (below).
+// Nothing here writes to Jira: the API helper handed to checks reads only, and checks open pages
+// and forms without saving them. The target is the app's one production installation on the
+// primary site in the forge-test configuration, with `issue`: an existing work item in a
+// configured fixture space whose description carries that space's marker. Without a target the
+// smoke is skipped, never passed. A target that hasn't accepted a new major version yet is
+// reported as waiting for upgrade approval, from Forge's installation list (read-only). Usage:
 // node config/production-smoke.mjs <result.json>   (EXPECT_BUILD: the deployed build stamp)
 
 export const checksModule = 'tests/hosted/production-smoke.mjs';
@@ -37,6 +40,59 @@ export function productionTarget(installations, app, primaryHost) {
   if (!/^[A-Z][A-Z0-9_]{1,9}-[1-9]\d*$/.test(target.issue ?? ''))
     return { status: 'failed', reason: 'the production target names no work item (issue)' };
   return { status: 'ready', target };
+}
+
+/**
+ * Whether the target's installation runs the latest major version, from `forge install list
+ * --json`. Forge marks the latest major version "(Latest)"; an installation on an older one waits
+ * for its site administrator to approve the upgrade, so its checks would only see the old build.
+ * Anything else this can't read is a failure, never a pass.
+ */
+export function upgradeState(installations, site) {
+  const matches = (Array.isArray(installations) ? installations : []).filter(
+    (i) => i?.environment === 'production' && i.site === site && i.product === 'Jira',
+  );
+  if (matches.length !== 1)
+    return {
+      status: 'failed',
+      reason: "Forge's installation list doesn't show the production target exactly once",
+    };
+  const major = String(matches[0].majorVersion ?? '').match(/^(\d+)( \(Latest\))?$/);
+  if (!major)
+    return {
+      status: 'failed',
+      reason: "Forge's installation list gives no readable major version",
+    };
+  if (!major[2])
+    return {
+      status: 'waiting',
+      reason: `major version ${major[1]} installed; the site administrator hasn't approved the new major version`,
+    };
+  return { status: 'ready' };
+}
+
+/** This app's installations, through the plugin's Forge CLI (`install list` reads only). */
+export function forgeInstallations(run = spawnSync) {
+  const listed = run(process.execPath, ['config/forge.mjs', 'install', 'list', '--json'], {
+    encoding: 'utf8',
+    maxBuffer: 1 << 24,
+  });
+  if (listed.status !== 0) throw Error('forge install list failed');
+  // The CLI can print notices before the JSON.
+  const lines = listed.stdout.split('\n');
+  return JSON.parse(lines.slice(lines.findIndex((line) => line.startsWith('['))).join('\n'));
+}
+
+/**
+ * The plugin's `state(context)` result: undefined or null when the installation can be checked
+ * as usual, or { outcome: 'unlicensed', reason } when it has no subscription. Checks still run and
+ * read it from `context.state`, so an unlicensed installation is checked for its refusal.
+ */
+export function checkedState(value) {
+  if (value === undefined || value === null) return null;
+  if (value?.outcome === 'unlicensed' && typeof value.reason === 'string' && value.reason)
+    return { outcome: 'unlicensed', reason: value.reason };
+  throw Error('state() returned something other than null or { outcome: "unlicensed", reason }');
 }
 
 /**
@@ -75,16 +131,21 @@ export async function runChecks(checks, context, { log = console.error, onFailur
 
 /**
  * The outcome, its release-notes line (public: fixed text and check names only) and a summary
- * table. `failed` is true for any failed check or a configuration error.
+ * table. `failed` is true for any failed check or a configuration error. Skipped, waiting for
+ * upgrade approval and unlicensed are warnings, never passed.
  */
-export function report({ status, reason, results = [] }) {
+export function report({ status, reason, state = null, results = [] }) {
   const passed = results.filter((r) => r.ok).map((r) => r.name);
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   let outcome = status;
-  if (status === 'ready') outcome = failed.length || !results.length ? 'failed' : 'passed';
+  if (status === 'ready')
+    outcome = failed.length || !results.length ? 'failed' : (state?.outcome ?? 'passed');
   let notes;
   if (outcome === 'skipped') notes = `${label}: skipped: ${reason}.`;
+  else if (outcome === 'waiting') notes = `${label}: waiting for upgrade approval: ${reason}.`;
   else if (outcome === 'passed') notes = `${label}: passed: ${passed.join('; ')}.`;
+  else if (outcome === 'unlicensed')
+    notes = `${label}: unlicensed: ${state.reason}. Passed: ${passed.join('; ')}.`;
   else
     notes = `${label}: FAILED: ${reason ?? (failed.join('; ') || 'no checks ran')}.${
       passed.length ? ` Passed: ${passed.join('; ')}.` : ''
@@ -104,7 +165,7 @@ function finish(file, outcome, env = process.env) {
   const result = report(outcome);
   writeFileSync(file, `${JSON.stringify(result, null, 2)}\n`);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${result.summary}\n`);
-  const level = { failed: 'error', skipped: 'warning', passed: 'notice' }[result.outcome];
+  const level = result.failed ? 'error' : result.outcome === 'passed' ? 'notice' : 'warning';
   console.log(`::${level}::${result.notes}`);
   return result;
 }
@@ -113,11 +174,23 @@ async function main([file]) {
   if (!file) throw Error('Usage: node config/production-smoke.mjs <result.json>');
   if (!existsSync(checksModule))
     return finish(file, { status: 'skipped', reason: `no ${checksModule} in this plugin` });
-  const { app, checks } = await import(pathToFileURL(resolve(checksModule)).href);
+  const { app, checks, state } = await import(pathToFileURL(resolve(checksModule)).href);
   if (typeof app !== 'string' || !Array.isArray(checks) || !checks.length)
     return finish(file, { status: 'failed', reason: `${checksModule} exports no app and checks` });
   const chosen = productionTarget(config().installations, app, siteFor('primary'));
   if (chosen.status !== 'ready') return finish(file, chosen);
+  let installations;
+  try {
+    installations = forgeInstallations();
+  } catch (error) {
+    console.error(error?.message ?? error);
+    return finish(file, {
+      status: 'failed',
+      reason: "the smoke couldn't read Forge's installation list",
+    });
+  }
+  const upgrade = upgradeState(installations, chosen.target.site);
+  if (upgrade.status !== 'ready') return finish(file, upgrade);
 
   const { chromium } = await import('@playwright/test');
   const { client, tokenRequest } = await import('@srcplugins/atlassian-forge-test-framework/jira');
@@ -160,27 +233,37 @@ async function main([file]) {
     page.setDefaultTimeout(30000);
     const evidence = `${site.directory}/production-smoke`;
     mkdirSync(evidence, { recursive: true });
-    const results = await runChecks(
-      checks,
-      {
-        page,
-        site: site.site,
-        target,
-        issue: {
-          key: issue.key,
-          id: issue.id,
-          spaceKey,
-          typeName: issue.fields.issuetype.name,
-        },
-        build: process.env.EXPECT_BUILD || undefined,
-        get,
+    const checkContext = {
+      page,
+      site: site.site,
+      target,
+      issue: {
+        key: issue.key,
+        id: issue.id,
+        spaceKey,
+        typeName: issue.fields.issuetype.name,
       },
-      {
-        onFailure: (index) =>
-          page.screenshot({ path: `${evidence}/check-${index + 1}.png` }).catch(() => {}),
-      },
-    );
-    return finish(file, { status: 'ready', results });
+      build: process.env.EXPECT_BUILD || undefined,
+      get,
+      state: null,
+    };
+    if (typeof state === 'function') {
+      try {
+        checkContext.state = checkedState(await state(checkContext));
+      } catch (error) {
+        console.error(`state: ${error?.message ?? error}`);
+        await page.screenshot({ path: `${evidence}/state.png` }).catch(() => {});
+        return finish(file, {
+          status: 'failed',
+          reason: "the smoke couldn't read the installation's state",
+        });
+      }
+    }
+    const results = await runChecks(checks, checkContext, {
+      onFailure: (index) =>
+        page.screenshot({ path: `${evidence}/check-${index + 1}.png` }).catch(() => {}),
+    });
+    return finish(file, { status: 'ready', state: checkContext.state, results });
   } finally {
     await browser?.close();
     await request.dispose();

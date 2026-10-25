@@ -99,3 +99,15 @@ test('the team-managed fixture runner does nothing without its explicit opt-in',
   assert.notEqual(run.status, 0);
   assert.match(run.stderr, /Explicit fixture preparation required/);
 });
+
+test('the licensing runner, which needs reinstalls, does nothing without its explicit opt-in', () => {
+  const env = { ...process.env };
+  delete env.NATIVE_LICENSING_TESTS;
+  const run = spawnSync(process.execPath, ['tests/hosted/verify-licensing.mjs', 'inactive'], {
+    env,
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stderr, /Explicit licensing run required/);
+});

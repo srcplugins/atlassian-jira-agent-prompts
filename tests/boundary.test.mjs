@@ -16,6 +16,7 @@ const sdk = (...responses) => ({
   ...forgeContract(...responses),
   kvs: { entity: () => ({ get: async () => undefined }) },
   fieldType: () => 'exact-field',
+  appContext: () => ({ environmentType: 'DEVELOPMENT' }),
 });
 test('space inventory uses asUser live-software pagination and marks team-managed spaces', async () => {
   const { createBatchPorts } = await import('../src/integration.ts');

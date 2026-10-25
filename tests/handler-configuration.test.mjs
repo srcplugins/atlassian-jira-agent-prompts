@@ -278,6 +278,7 @@ function harness(site = jira()) {
     route,
     ...kv,
     fieldType: () => 'exact-field',
+    appContext: () => ({ environmentType: 'DEVELOPMENT' }),
   });
   // Like the page that started a run, `call` keeps each run's one-time key and sends it with
   // that run's later requests.

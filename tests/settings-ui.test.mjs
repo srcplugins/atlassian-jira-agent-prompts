@@ -87,6 +87,7 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
         transact: () => assert.fail('Diagnostic and outcome checks must not write storage'),
       },
       fieldType: () => 'exact',
+      appContext: () => ({ environmentType: 'DEVELOPMENT' }),
     };
     const handlers = registerResolvers(sdk);
     const replies = [];
