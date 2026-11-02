@@ -98,7 +98,7 @@ const removalRun = { revision: 1, data: { id: 'x', input: { unlink: true }, entr
 // Each resolver request, and whether it needs a license. Reads, setup removal and recovery stay
 // available; prompt use, configuration and preferences do not.
 const requests = [
-  ['setup', {}, true],
+  ['setup', {}, false],
   ['search', { query: '' }, true],
   ['load', {}, true],
   ['save', { ids: [], revision: 0 }, true],

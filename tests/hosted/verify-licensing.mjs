@@ -24,6 +24,7 @@ import { expect } from './support/expect.mjs';
 import { agentPromptsFixture } from './support/fixture.mjs';
 import { agentPromptsField, fieldReadView } from './support/field.mjs';
 import { editor } from './support/snapshots.mjs';
+import { spaceSettings } from './support/space-settings.mjs';
 
 const refusal =
   'Agent Prompts for Jira has no active subscription on this site. A site administrator can subscribe in Atlassian Administration.';
@@ -207,6 +208,20 @@ try {
         environmentType: 'DEVELOPMENT',
       }),
     );
+
+    // The space settings page reads its space, then shows the same Space configuration, with the
+    // same banner when there is no license.
+    const setup = await capture(page, 'setup', () => spaceSettings(page, project.key));
+    kept('setup', setup.result);
+    assert.equal(setup.result.ok, true, 'The space settings page reads its space');
+    await expect(page.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled({
+      timeout: 60_000,
+    });
+    await expect(page.getByText('No active subscription', { exact: true })).toHaveCount(
+      licensed ? 0 : 1,
+    );
+    check('Space settings banner', { shown: !licensed });
+    await page.screenshot({ path: artifact('space-settings.png'), fullPage: true });
 
     // The field on a run-owned work item: opening it loads, and its other calls are sent again
     // from that load. Search only reads; save-status reads the pending save.

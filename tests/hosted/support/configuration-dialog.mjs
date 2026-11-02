@@ -29,6 +29,8 @@ export async function reviewStep(page) {
     const failed = page.getByText(/^Could not be reviewed: Jira request failed \(HTTP 5\d\d\)/);
     if (attempt === 2 || (await failed.count()) === 0) return;
     await page.getByRole('button', { name: 'Back', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Review changes', exact: true })).toBeEnabled();
+    // A backoff, not a wait for the page: Jira is given time to recover before the next preview.
     await page.waitForTimeout(5000);
   }
 }

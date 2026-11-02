@@ -3,8 +3,9 @@ import { view } from '@forge/bridge';
 import { Field } from './field';
 
 /**
- * Jira also shows the field on its Create form. Saving copies prompts into an existing work item's
- * description, so there the field only says when to add them, and leaves the value empty.
+ * A display condition keeps the field off Jira's Create form. Should Jira still render it there,
+ * the field only says to add prompts once the work item exists, and leaves the value empty: saving
+ * copies prompts into an existing work item's description.
  */
 export function FieldRoot() {
   const [renderContext, setRenderContext] = useState<string>();

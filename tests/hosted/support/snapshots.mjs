@@ -25,6 +25,20 @@ export function editor(page) {
   return page.frameLocator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`);
 }
 /**
+ * Clicks a save that reloads the work item (the space's reload preference) and waits for that
+ * reload. The field reloads only after its resolver answers, which Forge allows 25 s, so the
+ * default 15 s wait failed a Sync that was still loading (agent-prompts#mcrb).
+ */
+export async function saveAndReload(page, click) {
+  await Promise.all([
+    page.waitForEvent('framenavigated', {
+      predicate: (frame) => frame === page.mainFrame(),
+      timeout: 60000,
+    }),
+    click(),
+  ]);
+}
+/**
  * Opens the field's editor from its read view. On a slower host (GitHub's runners) Jira can drop
  * a click on a freshly loaded work item before it is interactive, so click again until the
  * editor shows. Opening only reads; a second click lands only when the first opened nothing.
@@ -184,8 +198,6 @@ export async function snapshotJourney({
   await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
   const readView = fieldReadView(page, field.id);
   await expect(readView).toBeVisible();
-  await page.waitForTimeout(1500);
-  expect(calls).toEqual([]);
   const started = Date.now();
   const loaded = await observeAction(
     page,
@@ -193,9 +205,14 @@ export async function snapshotJourney({
     () => openField(page, readView),
     installation('agent-prompts'),
   );
+  // The work item page calls the app only once the field is opened: its first call is that load.
+  expect(calls[0]).toBe('load');
   owned.run.state.loadedPromptIds = loaded.prompts.map((p) => p.id);
   owned.run.persist();
   expect(loaded.prompts.map((p) => p.id)).toContain(source.id);
+  // Save and Sync are checked in place, so the space's reload preference must be off: the feature
+  // suite sets it with withReloadPreference, and the lifecycle runners configure it off.
+  expect(loaded.refreshAfterSave).toBe(false);
   const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
   await expect(combo).toBeEnabled();
   owned.run.state.pickerMs = Date.now() - started;
@@ -219,23 +236,10 @@ export async function snapshotJourney({
   expect(calls).toContain('search');
   async function save(action = 'Save') {
     const click = () => editor(page).getByRole('button', { name: action, exact: true }).click();
-    if (loaded.refreshAfterSave) {
-      // Navigation can discard the resolver body. The independent Jira assertions
-      // below verify each mutation; do not make a response-body race the oracle.
-      await Promise.all([
-        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
-        click(),
-      ]);
-    } else {
-      await observeAction(page, 'save', click, installation('agent-prompts'));
-    }
-    if (loaded.refreshAfterSave) {
-      await openField(page, readView);
-    } else {
-      await expect(
-        editor(page).getByText(action === 'Sync' ? '✓ Synced' : 'Saved.', { exact: true }),
-      ).toBeVisible();
-    }
+    await observeAction(page, 'save', click, installation('agent-prompts'));
+    await expect(
+      editor(page).getByText(action === 'Sync' ? '✓ Synced' : 'Saved.', { exact: true }),
+    ).toBeVisible();
     await expect(combo).toBeEnabled();
     await expect(editor(page).getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
   }

@@ -129,6 +129,7 @@ Production dependencies included in this app and its UI bundles.
 | @forge/manifest | 13.6.0 | SEE LICENSE IN LICENSE.txt |
 | @forge/react | 12.2.0 | SEE LICENSE IN LICENSE.txt |
 | @forge/resolver | 2.0.0 | SEE LICENSE IN LICENSE.txt |
+| @isaacs/nonrecursive-glob-match | 1.0.3 | BlueOak-1.0.0 |
 | @jridgewell/gen-mapping | 0.3.13 | MIT |
 | @jridgewell/resolve-uri | 3.1.2 | MIT |
 | @jridgewell/sourcemap-codec | 1.6.0 | MIT |
@@ -194,7 +195,7 @@ Production dependencies included in this app and its UI bundles.
 | focus-lock | 1.3.6 | MIT |
 | focus-trap | 2.4.6 | MIT |
 | function-bind | 1.1.2 | MIT |
-| glob | 13.0.6 | BlueOak-1.0.0 |
+| glob | 14.0.3 | BlueOak-1.0.0 |
 | hasown | 2.0.4 | MIT |
 | headers-utils | 3.0.2 | MIT |
 | hoist-non-react-statics | 3.3.2 | BSD-3-Clause |
@@ -218,7 +219,7 @@ Production dependencies included in this app and its UI bundles.
 | memoize-one | 6.0.0 | MIT |
 | mime-db | 1.52.0 | MIT |
 | mime-types | 2.1.35 | MIT |
-| minimatch | 10.2.6 | BlueOak-1.0.0 |
+| minimatch | 11.0.3 | BlueOak-1.0.0 |
 | minipass | 7.1.3 | BlueOak-1.0.0 |
 | ms | 2.1.3 | MIT |
 | nth-check | 2.1.1 | BSD-2-Clause |
@@ -230,7 +231,7 @@ Production dependencies included in this app and its UI bundles.
 | parse5-htmlparser2-tree-adapter | 7.1.0 | MIT |
 | parse5-parser-stream | 7.1.2 | MIT |
 | path-parse | 1.0.7 | MIT |
-| path-scurry | 2.0.2 | BlueOak-1.0.0 |
+| path-scurry | 3.0.0 | BlueOak-1.0.0 |
 | path-type | 4.0.0 | MIT |
 | picocolors | 1.1.1 | ISC |
 | prop-types | 15.8.1 | MIT |

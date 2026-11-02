@@ -657,7 +657,7 @@ async function root(getContext) {
   await v.mount();
   return v;
 }
-test('on the Create form the field only says to add prompts after creating the work item', async () => {
+test('if Jira still renders the field on the Create form, it only says to add prompts after creating the work item', async () => {
   const v = await root(async () => ({ extension: { renderContext: 'issue-create' } }));
   assert.equal(v.text('p'), 'Add prompts after you create the work item.');
   assert.equal(v.nodes('Field').length, 0);

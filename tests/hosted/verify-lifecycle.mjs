@@ -198,7 +198,7 @@ try {
     } else {
       const userPage = await contexts['nc-user'].newPage();
       await spaceSettings(userPage, project.key);
-      await expectSpaceSettingsRefused(userPage, expect);
+      await expectSpaceSettingsRefused(userPage);
       owned.run.check('nc-user ADMINISTER=false and space settings refused');
       for (const blank of [false, true]) {
         state.lifecycle.stage = blank ? 'blank-round-trip' : 'add-sync-remove';
@@ -308,39 +308,24 @@ try {
       await editor(page)
         .getByText(new RegExp(`^${backup.sourceKey} —`))
         .click();
-      await editor(page).getByRole('button', { name: 'Save', exact: true }).click();
-      await expect(
-        editor(page).getByText(
-          "The description has an Agent Prompts section the app didn't save. Delete it from the description, or use its prompts here to replace it, then save again.",
-          { exact: true },
-        ),
-      ).toBeVisible({ timeout: 45000 });
-      assert.deepEqual(await issueFields(), backup.linked, 'Rejected adoption changed Jira');
-      owned.run.check('Untracked copy adoption refused with exact Jira baseline unchanged');
-      // Explicit fixture repair is a Jira edit, never claimed as automatic app adoption.
-      const resource = state.resources.find((r) => r.id === backup.targetId);
-      const repaired = structuredClone(backup.linked.description);
-      repaired.content = repaired.content.filter(
-        (n) => n.attrs?.localId !== `agent-prompts-${backup.targetId}`,
-      );
-      resource.expected.descriptionVariants.push(repaired);
-      owned.run.persist();
-      await api(`/issue/${backup.targetId}`, 'PUT', { fields: { description: repaired } });
-      assert.deepEqual((await issueFields()).description, repaired);
-      await page.reload();
-      await observeAction(page, 'load', () => openField(page, readView), target);
-      await combo.fill(backup.sourceKey);
-      await combo.press('ArrowDown');
-      await editor(page)
-        .getByText(new RegExp(`^${backup.sourceKey} —`))
-        .click();
+      // Since 1.0.3 Save rewrites the Agent Prompts section from the linked prompts, so the copy
+      // that survived reinstall is replaced by the same section rather than refused.
       await observeAction(
         page,
         'save',
         () => editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
         target,
       );
-      assert.deepEqual(await issueFields(), backup.linked);
+      assert.deepEqual(await issueFields(), backup.linked, 'Save did not rewrite the section');
+      owned.run.check('Save after reinstall rewrote the copied section from the linked prompt');
+      // Removing the prompt removes the section and keeps the rest of the description.
+      const resource = state.resources.find((r) => r.id === backup.targetId);
+      const removed = structuredClone(backup.linked.description);
+      removed.content = removed.content.filter(
+        (n) => n.attrs?.localId !== `agent-prompts-${backup.targetId}`,
+      );
+      resource.expected.descriptionVariants.push(removed);
+      owned.run.persist();
       await editor(page)
         .getByRole('button', { name: /remove.*Error handling/i })
         .click();
@@ -351,13 +336,11 @@ try {
         target,
       );
       const cleared = await issueFields();
-      assert.deepEqual(cleared.description, repaired);
+      assert.deepEqual(cleared.description, removed);
       assert.deepEqual(cleared[backup.fieldId] ?? [], []);
       resource.expected.customField = { id: backup.fieldId, value: cleared[backup.fieldId] };
       owned.run.persist();
-      owned.run.check(
-        'Explicit Jira copy repair allows adding and removing all prompts on original target',
-      );
+      owned.run.check('Removing every prompt after reinstall removed the section, nothing else');
       await snapshotJourney({ page, owned, blank: false, testInfo: { annotations: [] } });
       owned.run.check('Fresh add, Sync and remove work after reconfiguration');
       state.lifecycle.journeysPassed = true;

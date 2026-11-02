@@ -1,5 +1,7 @@
 // Shared srcplugins file, synchronized across repositories.
 import assert from 'node:assert/strict';
+// Jira Rovo read contract: sync leaves this section out of other products' copies, since their
+// readers don't retry (Confluence's shared reader tries each read once).
 import { forgeContract } from './forge-contract.mjs';
 
 const trusted = { principal: { accountId: 'trusted' } };
@@ -48,6 +50,7 @@ export async function assertRovoReadContract(createAction, input) {
     );
   }
 }
+// End of the Jira Rovo read contract.
 
 /**
  * Contract for a UI reader of resolver envelopes: valid values pass through unchanged, malformed

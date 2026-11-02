@@ -16,6 +16,7 @@ import { spaceHealth } from './support/space-settings.mjs';
 import { activeTarget } from '@srcplugins/atlassian-forge-test-framework/core';
 import { agentPromptsFixture } from './support/fixture.mjs';
 import { agentPromptsField, fieldReadView } from './support/field.mjs';
+import { saveAndReload } from './support/snapshots.mjs';
 const host = activeTarget();
 
 if (process.env.NATIVE_SCALE_TESTS !== '1') throw Error('Explicit NATIVE_SCALE_TESTS=1 required');
@@ -308,11 +309,7 @@ try {
         run.persist();
         const started = performance.now();
         const click = () => frame(page).getByRole('button', { name: 'Save', exact: true }).click();
-        if (loaded.refreshAfterSave)
-          await Promise.all([
-            page.waitForEvent('framenavigated', { predicate: (f) => f === page.mainFrame() }),
-            click(),
-          ]);
+        if (loaded.refreshAfterSave) await saveAndReload(page, click);
         else await observeAction(page, 'save', click, t);
         const actual = (await api(`/issue/${entry.id}?fields=description,${field.id}`)).fields;
         assert.deepEqual(actual.description, expected);

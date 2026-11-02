@@ -154,13 +154,15 @@ export interface SettingsPorts {
   /** The screen used for each requested work type and operation; no type means the default. */
   screenUses(project: string, uses: { type?: string; op: ScreenOp }[]): Promise<string[]>;
   /** Screens in order, undefined for a screen Jira no longer has. Tabs list `field` where it is;
-   * every field only for the screens in `full`. A screen without `field` lists all its tabs.
-   * Reads stop at the review cutoff, or with `confirm` (after writes) when the write time ends. */
+   * every field only for the screens in `full`, and of a screen in `only` just the listed tabs.
+   * A screen without `field` lists all its tabs. Reads stop at the review cutoff, or with
+   * `confirm` (after writes) when the write time ends. */
   screens(
     ids: string[],
     field: string,
     full?: string[],
     confirm?: boolean,
+    only?: Record<string, string[]>,
   ): Promise<(ScreenInfo | undefined)[]>;
   /** The spaces using a screen; incomplete when there are too many, or the reads ran out of time. */
   screenImpact(
@@ -365,6 +367,15 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         throw new UserError(
           `The screen ${screen.name} is used by more spaces than can be reviewed. Change it in Jira settings instead.`,
         );
+      // This space reaches an added or required screen through its own work type screen scheme,
+      // so an impact without it is incomplete (Jira left out a scheme's users), never unshared.
+      if (
+        (change.action === 'add' || change.action === 'require') &&
+        !impact.projects.some((p) => p.id === projectId)
+      )
+        throw new JiraUnavailable(
+          `The spaces using the screen ${screen.name} could not be read completely. Review this space again.`,
+        );
       labels[screen.id] = impact.projects;
       changes.push({
         ...change,
@@ -504,7 +515,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
           .join(' '),
       });
     }
-    return { project, state, types, selected, layouts, canConfigure: true, checks };
+    return { project, state, types, selected, layouts, checks };
   }
   async function plan(c: Context, input: SettingsInput) {
     if (input.reloadAfterSave !== undefined) reloadInput(input.reloadAfterSave);
@@ -826,7 +837,6 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         types: (types ?? []).filter(eligible),
         selected,
         scheme,
-        canConfigure: !!types && !!scheme,
         checks,
       };
     },
@@ -890,7 +900,10 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       // A request stopped by the platform mid-way leaves an uncertain result, so this step makes
       // only the screen changes that fit in the time left (about a second each, after up to two
       // type writes); the rest are reported back and applied by the next step after a new check.
-      const budget = Math.floor((s.timeLeft() - 3_000) / 1_000) - 2;
+      // The closing reserve keeps a second for the read confirming the screen changes and three
+      // for the storage writes after it.
+      const reserve = 4_000;
+      const budget = Math.floor((s.timeLeft() - reserve) / 1_000) - 2;
       if (budget < Math.min(1, preview.screens.changes.length))
         throw notApplied(
           new UserError('Too little time was left in this request to apply the changes.'),
@@ -924,7 +937,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         for (const [i, ch] of changes.entries()) {
           // A slow Jira write or read can use the time fitted for the later changes, so each one
           // starts only while its second and the closing reserve are left; the rest wait.
-          if (s.timeLeft() < 4_000) {
+          if (s.timeLeft() < reserve + 1_000) {
             outcome.remaining = [
               ...changes.slice(i).map((later) => ({ screen: later.screen.id, field: later.field })),
               ...outcome.remaining,
@@ -996,10 +1009,14 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         }
         // Confirm Jira shows each written change before reporting success.
         const ids = [...new Set(touched.map((ch) => ch.screen.id))];
-        const full = [
-          ...new Set(touched.filter((ch) => ch.field !== field).map((ch) => ch.screen.id)),
-        ];
-        const after = ids.length ? await s.screens(ids, field, full, true) : [];
+        // A screen given a required field is confirmed on the tabs this step wrote, not by reading
+        // every tab.
+        const only: Record<string, string[]> = {};
+        for (const ch of touched) if (ch.field !== field) only[ch.screen.id] = [];
+        for (const ch of touched)
+          if (only[ch.screen.id] && !only[ch.screen.id]!.includes(ch.tab!))
+            only[ch.screen.id]!.push(ch.tab!);
+        const after = ids.length ? await s.screens(ids, field, Object.keys(only), true, only) : [];
         for (const ch of touched) {
           const info = after[ids.indexOf(ch.screen.id)];
           const shown = !!info?.tabs.some((t) => t.fields.includes(ch.field));
@@ -1012,6 +1029,13 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       function screenFailure(error: unknown) {
         if (!stored && (sent === 0 || (sent === 1 && error instanceof JiraRejected)))
           return notApplied(error, sent === 0 && transient(error));
+        // Storage-only changes (join, leave, drop) committed before Jira rejected the first
+        // write: Jira is unchanged and the records saved so far are true, so nothing is in doubt.
+        if (sent === 1 && error instanceof JiraRejected)
+          return new NotApplied(
+            `${error.message} Nothing was changed in Jira; the app’s records of the screens before it are kept. Review this space again.`,
+            false,
+          );
         return sent === 0 && error instanceof UserError ? error : new UserError(uncertainScreens);
       }
       // Removing setup clears the space's setup after removing the screens it alone relied on.
@@ -1134,7 +1158,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         // The type writes and their confirming reads can take longer than the time set aside for
         // them, so the screen changes are fitted again to the time left; the rest wait for the
         // next step.
-        const left = Math.floor((s.timeLeft() - 3_000) / 1_000);
+        const left = Math.floor((s.timeLeft() - reserve) / 1_000);
         if (left < changes.length) fit(Math.max(0, left));
         // The claim stays through the screen changes, so a partial result keeps its outcome check.
         screensStarted = true;

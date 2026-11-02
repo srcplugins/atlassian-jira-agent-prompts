@@ -5,7 +5,9 @@ name: Hosted
 # upgrade the owned site's installation, then the suite's unattended journeys and runners. A push
 # to `dev` (any branch but main) runs the features suite; a "Hosted: <choice>" line in its commit message
 # picks another: full, none, or comma-separated step names (the full suite's prerequisites and the
-# steps whose names contain them, for example "Hosted: bulk, rovo"). Marking a pull request ready
+# steps whose names contain them, for example "Hosted: bulk, rovo"). A push to `dev` whose head
+# commit carries a "Local-suite:" trailer naming that commit's own tree (the suite already passed
+# locally on exactly it, config/commit-gate.mjs) runs nothing. Marking a pull request ready
 # for review runs the full suite, and Publish runs the release suite. Site, accounts and evidence
 # stay private: values come from the `acceptance` environment's secrets and are masked, and
 # reports and journals are uploaded only age-encrypted. Setup:
@@ -56,7 +58,7 @@ on:
           "npx forge-test cleanup", for example "native-prompt-links <run-uuid>"
         required: false
         default: ''
-  # Publish runs the release suite on its tagged build.
+  # Publish runs the release suite on the build it attested.
   workflow_call:
     inputs:
       ref:
@@ -79,10 +81,102 @@ defaults:
     shell: bash
 
 jobs:
+  # A release commit changes package.json's version, which no deployed code reads, so a push whose
+  # other changes are all ones paths-ignore lists starts no suite either; Publish tests the build.
+  scope:
+    name: Changes
+    if: github.event_name == 'push'
+    runs-on: ${{ github.event.repository.private && 'px-0' || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    outputs:
+      version_only: ${{ steps.scope.outputs.version_only }}
+      has_suite: ${{ steps.suite.outputs.has_suite }}
+      passed_locally: ${{ steps.local.outputs.passed_locally }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Only the version changed
+        id: scope
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # The same list as paths-ignore above; a test keeps them equal.
+          ignored=('**.md' .github/dependabot.yml .github/workflows/check.yml
+            .github/workflows/security.yml .prettierignore .prettierrc.json eslint.config.mjs
+            knip.config.js config/check-licenses.mjs config/check-plugin.mjs
+            config/eslint-local-rules.mjs config/forge-eslint.mjs config/production-smoke.mjs
+            tests/hosted/production-smoke.mjs 'tests/*.test.mjs')
+          # paths-ignore's * stops at a slash and ** doesn't; bash's * never stops, so count them.
+          skipped() {
+            local pattern
+            for pattern in "${ignored[@]}"; do
+              # shellcheck disable=SC2053
+              [[ "$1" == $pattern ]] || continue
+              [[ "$pattern" == *'**'* || "${1//[^\/]/}" == "${pattern//[^\/]/}" ]] && return 0
+            done
+            return 1
+          }
+          # The same JSON with the root version removed (the lockfile also records it for "").
+          same() {
+            local filter='del(.version) | if .packages? then del(.packages[""].version) else . end'
+            [ "$(git show "$BEFORE:$1" | jq -S "$filter")" = "$(git show "$GITHUB_SHA:$1" | jq -S "$filter")" ]
+          }
+          only=false
+          # A new branch, or a push whose previous commit isn't here, runs the suite.
+          if [[ "$BEFORE" =~ ^[0-9a-f]{40}$ && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2> /dev/null; then
+            only=true
+            changed=$(git diff --name-only --no-renames "$BEFORE" "$GITHUB_SHA")
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              case "$file" in
+                package.json | package-lock.json)
+                  git cat-file -e "$BEFORE:$file" 2> /dev/null && git cat-file -e "$GITHUB_SHA:$file" 2> /dev/null &&
+                    same "$file" || only=false ;;
+                *) skipped "$file" || only=false ;;
+              esac
+            done <<< "$changed"
+          fi
+          echo "version_only=$only" >> "$GITHUB_OUTPUT"
+          [ "$only" = false ] || echo "Only the version changed: no hosted suite; Publish tests the build." >> "$GITHUB_STEP_SUMMARY"
+      # A new plugin has no hosted suite until its first features are built.
+      - name: Has a hosted suite
+        id: suite
+        run: |
+          if [ -f forge-test.mjs ]; then
+            echo "has_suite=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_suite=false" >> "$GITHUB_OUTPUT"
+            echo "No hosted suite yet (no forge-test.mjs): nothing to run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # `npm run hosted -- features` (or full) records the tree a whole suite passed on locally,
+      # and committing exactly that tree on dev adds the trailer. Only `dev` honors it: the real
+      # repositories have no dev, so a landing, its ready pull request and Publish always run. An
+      # explicit "Hosted:" line keeps its choice, and a trailer whose tree isn't this commit's
+      # (a rebase, an amend outside the hook, a hand-written one) is ignored.
+      - name: Passed locally on this tree
+        id: local
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          tree=$(git rev-parse "$GITHUB_SHA^{tree}")
+          passed=$(printf '%s\n' "$MESSAGE" | sed -nE 's/^Local-suite: (features|full) passed on tree ([0-9a-f]{40})( .*)?$/\2/p' | tail -n 1)
+          local=false
+          if [ "$GITHUB_REF_NAME" = dev ] && [ -n "$passed" ] && [ "$passed" = "$tree" ] &&
+            [[ $'\n'"$MESSAGE" != *$'\n'Hosted:* ]]; then
+            local=true
+            echo "The suite passed locally on this commit's tree $tree: no hosted run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "passed_locally=$local" >> "$GITHUB_OUTPUT"
+
   hosted:
     name: Hosted suite
-    # Pull requests from forks get no environment secrets.
+    needs: scope
+    # Pull requests from forks get no environment secrets. Runs that aren't pushes skip `scope`.
     if: >-
+      !cancelled() && needs.scope.result != 'failure' && needs.scope.outputs.version_only != 'true' &&
+      needs.scope.outputs.has_suite != 'false' && needs.scope.outputs.passed_locally != 'true' &&
       !contains(github.event.head_commit.message, 'Hosted: none') &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # The self-hosted px-0 runners while the repository is private; GitHub-hosted once it is
@@ -254,6 +348,9 @@ jobs:
           FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          # The real repository's runs (landings and releases) go first on the site; a development
+          # copy (it sets these variables) pauses its suite between steps for them.
+          FORGE_TEST_LEASE_PRIORITY: ${{ vars.SRCPLUGINS_REPO_OWNER == '' && vars.SRCPLUGINS_REPO_PREFIX == '' && '1' || '0' }}
         # A failed lane or runner cleans up through its declared cleanup and the suite moves on;
         # a cleanup that refuses stops it, leaving the journal for "cleanup" above.
         run: npx forge-test suite "$SUITE" ${ONLY:+--only "$ONLY"}

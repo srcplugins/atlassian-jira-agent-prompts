@@ -550,6 +550,67 @@ test('a screen shared by two reviewed spaces gets the field once and records bot
   assert.deepEqual(f.configs.get('1').data.screenTypes, ['3']);
   assert.deepEqual(f.configs.get('2').data.screens, ['200']);
 });
+test('a run without room to record a step’s outcome stops and never stays running', async () => {
+  const { batchLimit, finishReserve } = await import('../src/configuration-batch.ts');
+  const bytes = (data) => Buffer.byteLength(JSON.stringify(data), 'utf8');
+  /** Takes the first step with `room` bytes left in the stored record. */
+  const run = async (room) => {
+    const f = sharedScreenFixture();
+    // Storage refuses a record over the limit, as the port does.
+    const cas = f.w.cas;
+    f.w.cas = async (revision, data) => {
+      if (bytes(data) > batchLimit) throw new UserError('Configuration contains too many spaces.');
+      return cas(revision, data);
+    };
+    let r = await f.start({ name: 'Prompt', allowSharedScreens: true }, ['1', '2'], taskScreens);
+    if (room !== undefined) {
+      // Earlier progress filled the record, in a field every outcome keeps.
+      const data = structuredClone(r.data);
+      data.entries[1].message = '';
+      data.entries[1].message = 'x'.repeat(batchLimit - room - bytes(data));
+      await f.w.cas(r.revision, data);
+      r = { revision: r.revision + 1, data };
+    }
+    return { f, before: r, after: await f.api.advance('admin', r.data.id, r.revision) };
+  };
+  const plain = await run();
+  assert.equal(plain.after.data.status, 'ready');
+  const growth = bytes(plain.after.data) - bytes(plain.before.data);
+  // Too little room for any outcome: the run stops before the space is changed.
+  let { f, after } = await run(finishReserve - 1);
+  assert.equal(after.data.status, 'stopped');
+  assert.match(after.data.message, /^Nothing was changed for this space: .* too large/);
+  assert.deepEqual(f.state().data, after.data);
+  assert.deepEqual(f.writes, []);
+  await f.start({ name: 'Prompt', allowSharedScreens: true }, ['1', '2'], taskScreens);
+  // Room for this step's outcome but not the next one's: the run stops with this step recorded.
+  ({ f, after } = await run(finishReserve));
+  assert.equal(after.data.status, 'stopped');
+  assert.equal(after.data.entries[0].status, 'done');
+  assert.match(after.data.message, /^This space’s changes were made, but .* too large/);
+  assert.deepEqual(f.state().data, after.data);
+  assert.deepEqual(f.writes, ['create', 'attach 91', 'add 200 customfield_1']);
+  // With room for the next outcome too, the run goes on and completes.
+  ({ f, after } = await run(finishReserve + growth));
+  assert.equal(after.data.status, 'ready');
+  assert.equal(bytes(after.data) + finishReserve, batchLimit);
+  after = await f.api.advance('admin', after.data.id, after.revision);
+  assert.equal(after.data.status, 'complete', after.data.message);
+  // A run whose record fits but leaves no room for its first step is refused before any write.
+  const g = fixture();
+  const entries = (n) =>
+    Array.from({ length: n }, (_, i) => ({
+      projectId: String(1000 + i),
+      fingerprint: 'a'.repeat(64),
+      screenTypes: Array.from({ length: 50 }, (_, t) => String(100_000_000_000 + t)),
+    }));
+  const input = { name: 'Prompt', reloadAfterSave: 'keep' };
+  assert.ok(bytes({ entries: entries(200) }) < batchLimit);
+  await assert.rejects(g.batch.start(input, entries(200), 0), /too many spaces/);
+  assert.equal(g.state(), undefined);
+  await g.batch.start(input, entries(150), 0);
+  assert.equal(g.state().data.entries.length, 150);
+});
 test('shared screen changes need their own approval before any write', async () => {
   const f = sharedScreenFixture();
   const r = await f.start({ name: 'Prompt', allowShared: true }, ['1', '2'], taskScreens);
@@ -764,8 +825,8 @@ function manyScreensFixture() {
     f.screens.use('1', id, 'edit', String(300 + 2 * i));
     f.screens.use('1', id, 'view', String(301 + 2 * i));
   }
-  // Nine seconds leave room for four screen changes after the type writes.
-  f.screens.clock.left = 9_000;
+  // Ten seconds leave room for four screen changes after the type writes.
+  f.screens.clock.left = 10_000;
   return { f, ids };
 }
 const added = (f) => f.writes.filter((w) => w.startsWith('add')).length;
@@ -839,7 +900,7 @@ test('a large setup removal keeps the space set up until its last screen change'
   let r = await f.start({ name: 'Prompt' }, ['1'], { 1: ids });
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'complete', r.data.message);
-  f.screens.clock.left = 9_000;
+  f.screens.clock.left = 10_000;
   r = await f.start({ unlink: true }, ['1']);
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'ready', r.data.message);

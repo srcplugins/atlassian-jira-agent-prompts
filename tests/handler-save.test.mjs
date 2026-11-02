@@ -395,7 +395,7 @@ test('a documented rejection through the resolver restores the claim and never r
   for (const [status, message] of [
     [409, /HTTP 409.*Review your selection/],
     [429, /limiting requests/],
-    [400, /Agent Prompts field is available/],
+    [400, /Agent Prompts field and Description are on this work item’s edit screen/],
   ]) {
     const h = harness(...loadResponses(), ...saveReadsOf(), {
       expect: { method: 'PUT', path: '/rest/api/3/issue/10' },
@@ -454,12 +454,18 @@ test('save input outside the contract is refused before any Jira or storage acce
     assert.equal(h.contract.calls.length, 0);
     assert.equal(h.kv.conditions.length, 0);
   }
-  // Five distinct prompts is within the limit and reaches Jira.
+  // Five distinct prompts is within the limit: unlike six, it passes validation and reaches Jira
+  // (the harness has no field to read, so the save then fails for another reason).
+  const six = await harness().resolvers.save({
+    context,
+    payload: { ids: ['1', '2', '3', '4', '5', '6'], revision: 0 },
+  });
   const five = harness();
   const result = await five.resolvers.save({
     context,
     payload: { ids: ['1', '2', '3', '4', '5'], revision: 0 },
   });
   assert.equal(result.ok, false);
+  assert.notEqual(result.error, six.error);
   assert.equal(five.contract.calls[0].path, '/rest/api/3/field');
 });

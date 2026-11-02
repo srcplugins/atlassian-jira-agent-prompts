@@ -123,3 +123,11 @@ test('recovery outcomes are announced in a status region present from the start'
   await f.click('Check saved state');
   assert.match([status().props.children].flat().join(''), /Saved state changed/);
 });
+
+test('a check that finds the save still pending is announced, not only shown', async () => {
+  const f = fixture([pending]);
+  const status = () => f.nodes('p').find((p) => p.props.role === 'status');
+  await f.click('Check saved state');
+  assert.equal(f.recovered(), 0);
+  assert.match([status().props.children].flat().join(''), /still unresolved/);
+});

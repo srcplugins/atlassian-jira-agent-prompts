@@ -9,7 +9,7 @@ import { parseDocument } from 'yaml';
 // to config/check-plugin.mjs).
 
 // Usage and Rovo control may live on the plugin's website page instead.
-export const requiredSections = ['Permissions', 'Data', 'Support'];
+export const requiredSections = ['Permissions', 'Data', 'Support', 'License'];
 
 /**
  * Manifest defaults every Forge app must keep unless an explicit review says otherwise.
@@ -57,6 +57,12 @@ export function dependencyPinFindings(pkg, { release = false } = {}) {
   return failures;
 }
 
+/** The package description is public (npm, GitHub); the title already names the host product. */
+export function descriptionFindings(pkg) {
+  const doubled = /\bfor (Jira|Confluence)\b.*\bfor \1\b/.exec(pkg.description ?? '');
+  return doubled ? [`package.json: description names "for ${doubled[1]}" twice`] : [];
+}
+
 // Supports the block-list scope convention only; other forms fail closed.
 export function manifestScopes(text) {
   const permissions = text.match(/^permissions:\s*\n((?:[ \t]+[^\n]*\n|\n)*)/m)?.[1];
@@ -67,7 +73,7 @@ export function manifestScopes(text) {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith('#'))
     .map((line) => {
-      const match = line.match(/^- ([a-zA-Z0-9:-]+)(?:\s+#.*)?$/);
+      const match = line.match(/^- ([a-zA-Z0-9:.-]+)(?:\s+#.*)?$/);
       if (!match) throw Error('Unsupported manifest scope syntax; extend the checker explicitly.');
       return match[1];
     })
@@ -90,6 +96,13 @@ export function readmeFindings(appDir, { sections = requiredSections } = {}) {
   if (!text.trim().startsWith('# ')) errors.push('README.md: missing title');
   if (/\b(?:TODO|TBD|FIXME)\b|__[A-Z_]+__/.test(text))
     errors.push('README.md: unresolved placeholder; state the actual limitation instead');
+  // Registration replaces the starter's all-zero app ID; after it, "unregistered" is false.
+  const manifest = join(appDir, 'manifest.yml');
+  const appId = existsSync(manifest)
+    ? /^\s+id:\s*ari:cloud:ecosystem::app\/([\w-]+)/m.exec(readFileSync(manifest, 'utf8'))?.[1]
+    : undefined;
+  if (appId && /[^0-]/.test(appId) && /\bunregistered\b/i.test(text))
+    errors.push('README.md: says "unregistered", but manifest.yml has a registered app ID');
   for (const heading of sections) {
     const marker = `## ${heading}\n`;
     const start = text.indexOf(marker);
@@ -111,7 +124,7 @@ export function readmeFindings(appDir, { sections = requiredSections } = {}) {
   }
   try {
     const expected = manifestScopes(readFileSync(join(appDir, 'manifest.yml'), 'utf8'));
-    const documented = [...text.matchAll(/^\|\s+`([a-zA-Z0-9:-]+)`\s+\|\s+(.+?)\s+\|$/gm)].filter(
+    const documented = [...text.matchAll(/^\|\s+`([a-zA-Z0-9:.-]+)`\s+\|\s+(.+?)\s+\|$/gm)].filter(
       (m) => m[1].includes(':'),
     );
     if (JSON.stringify(documented.map((m) => m[1]).sort()) !== JSON.stringify(expected))
@@ -168,6 +181,10 @@ const manifestText = (node, path = 'modules', visible = false) =>
           )
         : [];
 export function hostTermFindings(appDir) {
+  const modules = parseDocument(readFileSync(join(appDir, 'manifest.yml'), 'utf8')).toJS()?.modules;
+  // A Confluence app has no work items: the same words are wrong there for another reason.
+  const confluence = Object.keys(modules ?? {}).some((key) => key.startsWith('confluence:'));
+  const kind = confluence ? 'not a Confluence term' : 'an old Jira term';
   const findings = [];
   const readme = join(appDir, 'README.md');
   if (existsSync(readme))
@@ -175,16 +192,15 @@ export function hostTermFindings(appDir) {
       .split('\n')
       .forEach((line, i) => {
         const term = oldHostTerm.exec(visibleWords(line))?.[1];
-        if (term) findings.push(`README.md:${i + 1}: "${term}" is an old Jira term`);
+        if (term) findings.push(`README.md:${i + 1}: "${term}" is ${kind}`);
       });
-  const modules = parseDocument(readFileSync(join(appDir, 'manifest.yml'), 'utf8')).toJS()?.modules;
   for (const [path, text] of manifestText(modules ?? {})) {
     const term = oldHostTerm.exec(visibleWords(text))?.[1];
-    if (term) findings.push(`manifest.yml ${path}: "${term}" is an old Jira term`);
+    if (term) findings.push(`manifest.yml ${path}: "${term}" is ${kind}`);
   }
+  const advice = confluence ? 'use space, page or content' : 'use work item, work type or space';
   return findings.map(
-    (finding) =>
-      `${finding}; use work item, work type or space (quote a host label in bold or double quotes)`,
+    (finding) => `${finding}; ${advice} (quote a host label in bold or double quotes)`,
   );
 }
 
@@ -471,6 +487,7 @@ export function pluginFindings(appDir, { release = false } = {}) {
     ...dependencyPinFindings(JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')), {
       release,
     }),
+    ...descriptionFindings(JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8'))),
     ...readmeFindings(appDir),
     ...hostTermFindings(appDir),
     ...compatFindings(appDir),

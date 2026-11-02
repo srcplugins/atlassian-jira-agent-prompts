@@ -1,4 +1,10 @@
-import { editor, expandPrompts, openField, snapshotJourney } from './support/snapshots.mjs';
+import {
+  editor,
+  expandPrompts,
+  openField,
+  saveAndReload,
+  snapshotJourney,
+} from './support/snapshots.mjs';
 import {
   expect,
   installation,
@@ -17,7 +23,11 @@ import {
 import { agentPromptsFixture, teamManagedFixture } from './support/fixture.mjs';
 import { agentPromptsField, fieldReadView } from './support/field.mjs';
 import { spaceBoard } from './support/board.mjs';
-import { expectSpaceSettingsRefused, spaceSettings } from './support/space-settings.mjs';
+import {
+  expectSpaceSettingsRefused,
+  spaceSettings,
+  withReloadPreference,
+} from './support/space-settings.mjs';
 import { reviewConfiguration } from './support/configuration-dialog.mjs';
 import {
   checkSpace,
@@ -67,7 +77,7 @@ test('AP-04 real non-admin sessions cannot administer setup', async ({ browser, 
       const page = await context.newPage();
       await spaceSettings(page, project.key);
       try {
-        await expectSpaceSettingsRefused(page, expect);
+        await expectSpaceSettingsRefused(page);
       } catch (error) {
         await page.screenshot({
           path: `${activeTarget().directory}/${role}-eligibility.png`,
@@ -85,21 +95,27 @@ for (const blank of [false, true]) {
     page,
     owned,
   }, testInfo) => {
-    await snapshotJourney({ page, owned, blank, testInfo });
+    await inPlace(page, owned, { blank, testInfo });
   });
 }
 test('AP-13 retired prompt: hidden from search, kept selection still syncs', async ({
   page,
   owned,
 }, testInfo) => {
-  await snapshotJourney({ page, owned, blank: false, retire: true, testInfo });
+  await inPlace(page, owned, { blank: false, retire: true, testInfo });
 });
 test('AP-15 a Description edit in Jira keeps the section syncable and removable', async ({
   page,
   owned,
 }, testInfo) => {
-  await snapshotJourney({ page, owned, blank: false, editInJira: true, testInfo });
+  await inPlace(page, owned, { blank: false, editInJira: true, testInfo });
 });
+/** The snapshot journey with the space's reload preference off, then restored. */
+function inPlace(page, owned, options) {
+  return withReloadPreference(page, owned, false, (initial) =>
+    snapshotJourney({ page, owned, promptType: initial.state.data.type, ...options }),
+  );
+}
 
 /** Opens the space or global page, checks the owned space and returns its health. */
 async function configuration(page, owned, global = false) {
@@ -122,7 +138,11 @@ test('AP-02 selected space health and cancelled modal preserve Jira', async ({ p
   ).toBeVisible();
   await page.getByRole('button', { name: 'Reconfigure space', exact: true }).click();
   const plan = await reviewConfiguration(page, t);
-  expect(plan.type).toBe(health.state.data.type);
+  // The prepared company-managed space holds prompts in the site-wide Prompt work type.
+  const prompt = owned.project.issueTypes.find((x) => x.name === 'Prompt' && !x.subtask);
+  expect(prompt).toBeTruthy();
+  expect(plan.type).toBe(prompt.id);
+  const space = await owned.api(`/project/${owned.project.id}`);
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await page.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'Find a space', exact: true })).toBeEnabled();
@@ -136,7 +156,9 @@ test('AP-02 selected space health and cancelled modal preserve Jira', async ({ p
     t,
     owned.project.id,
   );
+  // Cancel records no configuration and changes nothing in Jira.
   expect(after.state).toEqual(health.state);
+  expect((await owned.api(`/project/${owned.project.id}`)).issueTypes).toEqual(space.issueTypes);
   expect((await owned.api(`/issue/${issue.id}?fields=description,issuetype`)).fields).toEqual(
     before.fields,
   );
@@ -237,6 +259,10 @@ test('AP-05 unified global configuration checks selected spaces and selects acro
   });
   const inventory = await globalConfiguration(page, t);
   expect(inventory.incomplete).toBe(false);
+  // Counted from Jira directly: the owned site has fewer than 100 live software spaces.
+  const listed = await owned.api('/project/search?typeKey=software&status=live&maxResults=100');
+  expect(listed.isLast).toBe(true);
+  const companyManaged = listed.values.filter((p) => p.style === 'classic').length;
   const search = page.getByRole('textbox', { name: 'Find a space', exact: true });
   await expect(search).toBeEnabled({ timeout: 60000 });
   await search.fill(owned.project.key);
@@ -263,7 +289,7 @@ test('AP-05 unified global configuration checks selected spaces and selects acro
   // Select all covers the company-managed tab only; team-managed spaces are configured apart.
   await expect(
     page.getByRole('heading', {
-      name: `Configure ${inventory.projects.filter((p) => !p.teamManaged).length} spaces`,
+      name: `Configure ${companyManaged} spaces`,
       exact: true,
     }),
   ).toBeVisible();
@@ -425,20 +451,12 @@ test('AP-10 an Agent Prompts section deleted in Jira is written again by Sync, a
     const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
     // With the space's reload preference on, navigation can discard the resolver body; the Jira
     // assertions after each save are the oracle.
-    if (loaded.refreshAfterSave)
-      await Promise.all([
-        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
-        click(),
-      ]);
+    if (loaded.refreshAfterSave) await saveAndReload(page, click);
     else await observeAction(page, 'save', click, t);
   };
   const sync = async () => {
     const click = () => editor(page).getByRole('button', { name: 'Sync', exact: true }).click();
-    if (loaded.refreshAfterSave)
-      await Promise.all([
-        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
-        click(),
-      ]);
+    if (loaded.refreshAfterSave) await saveAndReload(page, click);
     else await observeAction(page, 'save', click, t);
   };
   await open();
@@ -573,11 +591,7 @@ test("AP-16 an Agent Prompts section copied from another work item is replaced b
     const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
     // With the space's reload preference on, navigation can discard the resolver body; the Jira
     // assertions after each save are the oracle.
-    if (loaded.refreshAfterSave)
-      await Promise.all([
-        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
-        click(),
-      ]);
+    if (loaded.refreshAfterSave) await saveAndReload(page, click);
     else await observeAction(page, 'save', click, t);
   };
 
@@ -727,11 +741,7 @@ test("AP-17 a section edited, retitled, duplicated or deleted in Jira is rewritt
   const save = async (name = 'Save') => {
     // With the space's reload preference on, navigation can discard the resolver body; the Jira
     // assertions after each save are the oracle.
-    if (loaded.refreshAfterSave)
-      await Promise.all([
-        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
-        button(name).click(),
-      ]);
+    if (loaded.refreshAfterSave) await saveAndReload(page, () => button(name).click());
     else await observeAction(page, 'save', () => button(name).click(), t);
   };
   /** Sync rewrites the section: `expected` is the whole description it leaves. */
@@ -843,51 +853,6 @@ test("AP-17 a section edited, retitled, duplicated or deleted in Jira is rewritt
   expect(cleared[field.id] ?? []).toEqual([]);
 });
 
-/**
- * Runs `journey(initial)` with the space's "Reload work item after saving prompts" preference on,
- * then restores the preference it found. `initial` is the space's health before the change.
- */
-async function withReloadPreference(page, owned, journey) {
-  const t = installation('agent-prompts');
-  async function health() {
-    const value = await configuration(page, owned);
-    await details(page, owned.project.key);
-    return value;
-  }
-  const initial = await health();
-  const original = initial.state.data.refreshAfterSave === true;
-  owned.run.state.reloadPreference = { original, restored: false };
-  owned.run.persist();
-  async function preference(enabled) {
-    const current = await health();
-    if ((current.state.data.refreshAfterSave === true) !== enabled) {
-      const toggle = page.getByRole('checkbox', {
-        name: 'Reload work item after saving prompts',
-        exact: true,
-      });
-      await toggle.click();
-      if (enabled) await expect(toggle).toBeChecked();
-      else await expect(toggle).not.toBeChecked();
-      const checked = await observeAction(
-        page,
-        'settings-health',
-        () => page.getByRole('button', { name: 'Save', exact: true }).click(),
-        t,
-      );
-      expect(checked.state.data.refreshAfterSave).toBe(enabled);
-      expect(checked.state.data.type).toBe(initial.state.data.type);
-    }
-  }
-  try {
-    await preference(true);
-    await journey(initial);
-  } finally {
-    await preference(original);
-    owned.run.state.reloadPreference.restored = true;
-    owned.run.persist();
-  }
-}
-
 /** The target's Description after a Save that adds one prompt: its own section, then the prompt. */
 function withPrompt(target, key, source) {
   return {
@@ -927,7 +892,7 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
   owned,
 }, testInfo) => {
   const t = installation('agent-prompts');
-  await withReloadPreference(page, owned, async (initial) => {
+  await withReloadPreference(page, owned, true, async (initial) => {
     const source = await owned.propertyIssue(
       'Reload preference source',
       'RELOAD-SENTINEL',
@@ -963,10 +928,9 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
     await editor(page)
       .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
       .click();
-    await Promise.all([
-      page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+    await saveAndReload(page, () =>
       editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
-    ]);
+    );
     const actual = await owned.api(`/issue/${target.id}?fields=description,${field.id}`);
     expect(actual.fields.description).toEqual(linked);
     expect(actual.fields[field.id]).toEqual([sourceIssue.key]);
@@ -1011,19 +975,18 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
       },
       ...second.expected.description.content,
     );
-    async function saveAndReload(description, keys) {
+    async function saveExpecting(description, keys) {
       target.expected.descriptionVariants.push(description);
       target.expected.customField = { id: field.id, value: keys };
       owned.run.persist();
-      await Promise.all([
-        page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+      await saveAndReload(page, () =>
         editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
-      ]);
+      );
       const saved = await owned.api(`/issue/${target.id}?fields=description,${field.id}`);
       expect(saved.fields.description).toEqual(description);
       expect(saved.fields[field.id]).toEqual(keys);
     }
-    await saveAndReload(two, [sourceIssue.key, secondIssue.key]);
+    await saveExpecting(two, [sourceIssue.key, secondIssue.key]);
     await openField(page, read);
     await expect(picker).toBeEnabled();
     await editor(page)
@@ -1034,7 +997,7 @@ test('AP-08 opt-in work item reload follows a confirmed save and restores the sp
       .click();
     const onlySecond = structuredClone(two);
     onlySecond.content.at(-1).content.splice(0, 2);
-    await saveAndReload(onlySecond, [secondIssue.key]);
+    await saveExpecting(onlySecond, [secondIssue.key]);
   });
 });
 
@@ -1045,7 +1008,7 @@ test('AP-18 board side panel: a prompt saved there reloads the board with the pa
 }, testInfo) => {
   const t = installation('agent-prompts');
   const board = await spaceBoard(jiraRequest, owned.project);
-  await withReloadPreference(page, owned, async (initial) => {
+  await withReloadPreference(page, owned, true, async (initial) => {
     const source = await owned.propertyIssue(
       'Side panel source',
       'PANEL-SENTINEL',
@@ -1101,10 +1064,9 @@ test('AP-18 board side panel: a prompt saved there reloads the board with the pa
       .getByText(`${sourceIssue.key} — ${source.expected.summary}`, { exact: true })
       .click();
     await page.screenshot({ path: testInfo.outputPath('side-panel-picked.png') });
-    await Promise.all([
-      page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
+    await saveAndReload(page, () =>
       editor(page).getByRole('button', { name: 'Save', exact: true }).click(),
-    ]);
+    );
     const actual = await owned.api(`/issue/${target.id}?fields=description,${field.id}`);
     expect(actual.fields.description).toEqual(linked);
     expect(actual.fields[field.id]).toEqual([sourceIssue.key]);
@@ -1122,7 +1084,7 @@ test('AP-09 newest prompts, server search and cursor pages preserve draft select
   page,
   owned,
   theme,
-}) => {
+}, testInfo) => {
   const t = installation('agent-prompts');
   const { type } = (await configuration(page, owned)).state.data;
   const term = `Paging${owned.run.state.runId.replaceAll('-', '')}`;
@@ -1144,10 +1106,24 @@ test('AP-09 newest prompts, server search and cursor pages preserve draft select
     expect(result.issues).toHaveLength(21);
     expected = result.issues;
   }).toPass({ timeout: 60000, intervals: [1000, 3000] });
+  // Opened without a search, the field lists the space's ten newest open prompts. A prompt newer
+  // than this run's, left by another run, belongs there too: it is reported, not failed on.
+  const newest = await owned.api('/search/jql', 'POST', {
+    jql: `project = ${owned.project.id} AND issuetype = ${type} AND statusCategory != Done ORDER BY created DESC, key DESC`,
+    fields: ['summary'],
+    maxResults: 10,
+  });
+  const ours = new Set(sources.map((s) => s.id));
+  const leftovers = newest.issues.filter((p) => !ours.has(p.id)).map((p) => p.key);
+  if (leftovers.length)
+    testInfo.annotations.push({
+      type: 'newer-leftover-prompts',
+      description: leftovers.join(', '),
+    });
   await page.goto(`${activeTarget().site}/browse/${before.key}`);
   const readView = fieldReadView(page, (await agentPromptsField(owned.api)).id);
   const loaded = await observeAction(page, 'load', () => openField(page, readView), t);
-  expect(loaded.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
+  expect(loaded.prompts.map((p) => p.id)).toEqual(newest.issues.map((p) => p.id));
   const search = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
   const first = await observeAction(page, 'search', () => search.fill(`prompt ${term}`), t);
   expect(first.prompts.map((p) => p.id)).toEqual(expected.slice(0, 10).map((p) => p.id));
@@ -1208,10 +1184,11 @@ test('AP-09 newest prompts, server search and cursor pages preserve draft select
   }
 });
 
-// The field's display condition keeps it off Jira's Create form: give the form time to add its
-// fields, then neither the field's label, its frame nor Jira's own label editor is there.
+// The field's display condition keeps it off Jira's Create form: once the form lists Reporter
+// (its fields come in one list, Reporter among the last), neither the field's label, its frame
+// nor Jira's own label editor is there.
 async function expectFieldOff(dialog, t) {
-  await dialog.page().waitForTimeout(8000);
+  await expect(dialog.getByText(/^Reporter/).first()).toBeVisible({ timeout: 30000 });
   await expect(dialog.getByText(/^Agent Prompts/)).toHaveCount(0);
   await expect(dialog.locator(`iframe[src*="${t.appId}"][src*="${t.environmentId}"]`)).toHaveCount(
     0,
@@ -1264,9 +1241,9 @@ async function createWithoutField({ page, owned, theme, jiraRequest, testInfo })
       createMs = Date.now() - started;
     },
   });
+  // Recorded, not asserted: how long Create takes is Jira's performance, not the app's. That no
+  // app field is on the form is checked above.
   testInfo.annotations.push({ type: 'create-ms', description: String(createMs) });
-  // Create closes promptly: no app field on the form for Jira to wait on.
-  expect(createMs).toBeLessThan(8000);
   // browserIssue returned after Jira's Create outcome flag, which the page guard fails on if it
   // is "Created <type> with exceptions": a field that Jira couldn't save after the create.
   const x = await owned.api(`/issue/${created.id}?fields=issuetype,${field.id}`);
@@ -1337,11 +1314,7 @@ async function choose(page, prompt) {
 async function confirmedSave(page, loaded) {
   const click = () => editor(page).getByRole('button', { name: 'Save', exact: true }).click();
   // With the space's reload preference on, navigation can discard the resolver body.
-  if (loaded.refreshAfterSave)
-    await Promise.all([
-      page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame() }),
-      click(),
-    ]);
+  if (loaded.refreshAfterSave) await saveAndReload(page, click);
   else await observeAction(page, 'save', click, installation('agent-prompts'));
 }
 const historyLength = async (owned, id) =>
@@ -1514,8 +1487,12 @@ test.describe('team-managed space', () => {
     expect(prompt).toBeTruthy();
     let health = await configuration(page, owned, true);
     expect(health.project.teamManaged).toBe(true);
-    // An interrupted earlier run may have left the space set up.
+    // An interrupted earlier run may have left the space set up: removing it is reported.
     if (health.state.data.type) {
+      testInfo.annotations.push({
+        type: 'leftover-setup-removed',
+        description: `${key} was set up with work type ${health.state.data.type}`,
+      });
       await removeSetup(page, t, key);
       health = await configuration(page, owned, true);
     }

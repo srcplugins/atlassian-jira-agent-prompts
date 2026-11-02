@@ -77,14 +77,17 @@ test('saved snapshots stay unchanged until an explicit Sync, then removal preser
   const f = fixture();
   const original = structuredClone(f.target.fields.description);
   const loaded = await f.service.load(c);
-  let saved = await f.service.save(c, { ...loaded, ids: ['20'] });
+  await f.service.save(c, { ...loaded, ids: ['20'] });
   const linked = structuredClone(f.target.fields.description);
   assert.deepEqual(f.target.fields.customfield_1, ['TEST-20']);
   assert.deepEqual(linked.content[0], original.content[0]);
   assert.equal(linked.content[1].type, 'expand');
   assert.match(JSON.stringify(linked), /Check errors/);
   f.source.fields.description = sourceDoc('Updated instructions');
+  // Loading the field after the prompt changed writes nothing: only Sync copies the new text.
+  let saved = await f.service.load(c);
   assert.deepEqual(f.target.fields.description, linked);
+  assert.equal(f.calls(), 1);
   saved = await f.service.save(c, saved);
   assert.match(JSON.stringify(f.target.fields.description), /Updated instructions/);
   assert.doesNotMatch(JSON.stringify(f.target.fields.description), /Check errors/);

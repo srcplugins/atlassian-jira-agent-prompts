@@ -394,6 +394,45 @@ test('configure, review, apply and finish through the resolvers creates one type
   assert.equal(status.revision, finished.revision);
 });
 
+test('fields added to a create screen with many tabs are confirmed from the written tab alone', async () => {
+  const site = jira();
+  // The new type's create screen (50) has five tabs and neither Summary nor Description.
+  site.screens[50].tabs = { 60: [], 63: ['labels'], 64: ['priority'], 65: [], 66: ['duedate'] };
+  const sequence = [];
+  const asUser = site.api.asUser;
+  site.api.asUser = () => ({
+    requestJira: (path, options = {}) => {
+      sequence.push(`${options.method ?? 'GET'} ${path.split('?')[0]}`);
+      return asUser().requestJira(path, options);
+    },
+  });
+  const h = harness(site);
+  const input = { name: 'Prompt', reloadAfterSave: 'keep' };
+  const preview = await h.call('configuration-preview', { projectId: '1', ...input });
+  const started = await h.call('configuration-start', {
+    ...input,
+    entries: [{ projectId: '1', fingerprint: preview.fingerprint }],
+    revision: 0,
+  });
+  const finished = await h.call('configuration-advance', {
+    id: started.data.id,
+    revision: started.revision,
+  });
+  assert.equal(finished.data.status, 'complete', finished.data.message);
+  assert.deepEqual(site.screens[50].tabs[60].sort(), ['description', 'summary']);
+  // Both fields go on the first tab; the confirmation then names the screen and reads that one
+  // tab's fields, not the screen's tab list or its other four tabs.
+  const last = sequence.findLastIndex((r) => r.startsWith('POST /rest/api/3/screens/'));
+  assert.deepEqual(sequence.slice(last - 1, last + 1), [
+    'POST /rest/api/3/screens/50/tabs/60/fields',
+    'POST /rest/api/3/screens/50/tabs/60/fields',
+  ]);
+  assert.deepEqual(
+    sequence.slice(last + 1).filter((r) => r.startsWith('GET /rest/api/3/screens')),
+    ['GET /rest/api/3/screens', 'GET /rest/api/3/screens/50/tabs/60/fields'],
+  );
+});
+
 test('a reviewed configuration that is stopped before it advances writes nothing to Jira', async () => {
   const h = harness();
   const input = { type: '10', reloadAfterSave: 'off' };
