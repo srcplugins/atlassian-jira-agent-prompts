@@ -2,6 +2,18 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
+## 1.0.6 (unreleased)
+
+- **Configuration progress.** After **Apply changes**, the progress shows only the new configuration. It no longer briefly shows an earlier configuration's spaces and results.
+- **Review at narrow widths.** The Add, Change, Remove and Keep labels on the Review step stay readable when the text beside them wraps.
+- **Keyboard and screen readers.** Check saved progress, Continue reviewed changes, Release abandoned configuration, Check outcome, Acknowledge resolution and the Preferences Save button show that they are working and keep keyboard focus, instead of being disabled while they run. A Check saved state that finds the save still unresolved, and errors loading the space list or saved progress, are announced.
+- **Large configurations.** A configuration whose saved progress would grow too large now stops with the last space's outcome, or before the next space when too little room is left to record its outcome, instead of staying in progress until an administrator releases it. A selection too large to start is refused before any change.
+- **Space settings without a subscription.** Without an active subscription, a space's **Agent Prompts for Jira** settings page now shows Space configuration, with its health checks, removing setup and recovery, and says there's no subscription, instead of only the subscription message.
+- **Screen changes Jira refuses.** When Jira refuses the first screen change after the app had only updated its own records of shared screens, the configuration stops with Jira's reason and those records, instead of asking for a two-minute wait and an acknowledgement.
+- **Shared screens.** When Jira's answer leaves out the spaces using a screen the space itself uses, the review fails and can be tried again, instead of treating the screen as used by this space alone.
+- **Access prompts.** When Jira needs you to allow the app access to your account, Forge's access prompt now appears instead of a connection error.
+- **Save refused by Jira.** The message for a save Jira refuses as invalid now says that both the Agent Prompts field and Description must be on the work item's edit screen.
+
 ## 1.0.5
 
 - **Paid subscription.** Agent Prompts for Jira is now a paid app, billed through Atlassian, with a free trial. Without an active subscription the field and the Rovo assistant can't search, save or sync prompts, and spaces can't be configured; removing setup, health checks and recovery of interrupted changes stay available, and nothing stored is lost.

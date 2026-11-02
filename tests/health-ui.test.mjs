@@ -405,6 +405,27 @@ test('progress failure remains visible when inventory succeeds', async () => {
   assert.equal(f.button('Configure selected').props.isDisabled, true);
 });
 
+test('inventory and progress errors are announced in the status region instead of its prompt', async () => {
+  for (const [f, error] of [
+    [fixture(Error('Inventory unavailable')), /Inventory unavailable/],
+    [fixture(false, Error('Unavailable')), /Saved configuration progress could not be checked/],
+  ]) {
+    await f.mount();
+    const status = f.nodes('Box').find((b) => b.props.role === 'status');
+    const text = [status]
+      .flatMap(function texts(n) {
+        if (!n || typeof n !== 'object') return [];
+        if (Array.isArray(n)) return n.flatMap(texts);
+        return n.type === 'Text'
+          ? [[n.props.children].flat(Infinity).join('')]
+          : texts(n.props?.children);
+      })
+      .join('\n');
+    assert.match(text, error);
+    assert.doesNotMatch(text, /Select spaces, then choose Check selected/);
+  }
+});
+
 test('the space the page was opened from stays reachable when the inventory misses it', async () => {
   const f = fixture(false, null, [], undefined, { projectId: '500' });
   await f.mount();

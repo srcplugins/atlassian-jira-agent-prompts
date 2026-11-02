@@ -33,7 +33,9 @@ export function SaveRecovery({
     try {
       const value = await call<SaveStatus>('save-status');
       setStatus(value);
-      if (!value.pending) await onRecovered();
+      // The status region announces the outcome; the details follow the button.
+      if (value.pending) setNotice('Saved state checked: the previous save is still unresolved.');
+      else await onRecovered();
     } catch (e) {
       setStatus(undefined);
       setError(e instanceof Error ? e.message : 'Saved state could not be checked.');

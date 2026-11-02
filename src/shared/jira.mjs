@@ -19,6 +19,8 @@ export class JiraHttpError extends UserError {
 // failures, unreadable success bodies) leaves the outcome uncertain and must be reconciled by
 // reading, never retried.
 const definitiveRejections = {
+  'filter-create': [400, 401, 403, 429],
+  'filter-update': [400, 401, 403, 404, 429],
   'issue-edit': [400, 401, 403, 404, 409, 422, 429],
   'issuetype-create': [400, 401, 403, 409, 429],
   'issuetypescheme-add': [400, 401, 403, 404, 429],
@@ -147,6 +149,7 @@ class JiraConnectionError extends UserError {}
  * Reads JSON as the invoking user: use it only for reads (GET, or a read-only POST such as
  * `search/jql`). Transport failures, non-2xx responses (as JiraHttpError) and unreadable bodies
  * become UserErrors; a transport failure or 5xx is tried again up to twice (`readWithRetries`).
+ * Forge's missing-access error (`NEEDS_AUTHENTICATION_ERR`) is rethrown as it is.
  * @param {Pick<import('@forge/api').FetchAPI, 'asUser'>} api
  */
 export function jiraReader(api) {
@@ -162,7 +165,9 @@ export function jiraReader(api) {
         ...options,
         headers: { Accept: 'application/json', ...options.headers },
       });
-    } catch {
+    } catch (error) {
+      // Forge's missing-access error passes through, untried again, so Forge can prompt.
+      if (error instanceof Error && error.name === 'NEEDS_AUTHENTICATION_ERR') throw error;
       throw new JiraConnectionError('Jira connection failed. Try again.');
     }
     if (!response.ok) throw new JiraHttpError(response.status);

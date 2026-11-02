@@ -104,6 +104,26 @@ function batchInput(input: SettingsInput, own = false): SettingsInput {
 }
 /** The stored form of a run's one-time key; anything but a non-empty string owns nothing. */
 const ownerOf = (key: unknown) => (typeof key === 'string' && key ? hash(['run', key]) : '');
+/** The stored run's size limit in bytes, which the storage port enforces. */
+export const batchLimit = 190_000;
+const size = (data: BatchData) => Buffer.byteLength(JSON.stringify(data), 'utf8');
+/** What one step can add: a space's remaining screen changes (at most 52, up to about 900 bytes
+ * each) and its messages. Later steps' screen effects are not bounded by the selection. */
+const stepReserve = 52 * 900 + 2_000;
+/** Room an unfinished run's record keeps for its last write: a step's claim and outcome with its
+ * messages, or a release. */
+export const finishReserve = 2_000;
+const tooMany = 'Configuration contains too many spaces. Select a smaller group.';
+/** Why a run stops when its saved progress is too large to continue, from its space's progress. */
+function tooLarge(entry: BatchData['entries'][number]) {
+  const applied = entry.applied ?? 0;
+  const total = applied + (entry.remaining?.length ?? 0);
+  if (entry.status === 'done')
+    return 'This space’s changes were made, but this configuration’s saved progress is too large to continue. Completed spaces remain configured. Review the remaining spaces again in a smaller group.';
+  return total
+    ? `This space is partly configured (${applied} of ${total} screen changes made), and this configuration’s saved progress is too large to continue. Completed spaces remain configured. Review this space and the remaining spaces again in a smaller group.`
+    : 'Nothing was changed for this space: this configuration’s saved progress is too large to continue. Completed spaces remain configured. Review the remaining spaces again in a smaller group.';
+}
 export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPorts) {
   const settings = createSettings(p, s);
   const active = (r?: BatchRecord) => !!r && !finished(r.data.status);
@@ -202,6 +222,8 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         status: 'ready',
         started: Date.now(),
       };
+      // Refused before any write when even the first step's growth would not fit.
+      if (size(data) + stepReserve > batchLimit) throw new UserError(tooMany);
       await w.cas(revision, data);
       return { revision: revision + 1, data, key };
     },
@@ -221,6 +243,13 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         throw new UserError(
           'Saved configuration progress is incomplete. Inspect it before continuing.',
         );
+      // A step that could not record its outcome would leave the run running with no way on, so
+      // a run without that room stops before this space is reviewed or changed.
+      if (size(d) + finishReserve > batchLimit) {
+        const stopped: BatchData = { ...d, status: 'stopped', message: tooLarge(entry) };
+        await w.cas(revision, stopped);
+        return { revision: revision + 1, data: stopped };
+      }
       const c = { accountId, projectId: entry.projectId };
       // An earlier step of this run already changed this space. A step leaves screen changes for
       // later only after making one or after its type writes, so remaining changes with none
@@ -473,12 +502,35 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
         // After a successful apply, any failure to confirm the outcome needs inspection.
         return finish(attention);
       }
+      // The step's changes are made and confirmed. When recording them would outgrow storage, or
+      // leave an unfinished run without room for its next outcome, the run stops with this
+      // space's outcome instead: later spaces would need this step's screen effects, which are
+      // dropped.
+      if (size(next) + (next.status === 'complete' ? 0 : finishReserve) > batchLimit) {
+        next = {
+          ...next,
+          screenEffects: d.screenEffects ?? [],
+          ...(next.status === 'complete'
+            ? {}
+            : { status: 'stopped' as const, message: tooLarge(next.entries[d.index]!) }),
+        };
+        // The changes left for a later step are not needed once the run has stopped.
+        if (size(next) > batchLimit)
+          next = {
+            ...next,
+            entries: next.entries.map((e, i) => {
+              if (i !== d.index) return e;
+              const { remaining, ...kept } = e;
+              return remaining ? kept : e;
+            }),
+          };
+      }
       try {
         return await finish(next);
       } catch {
-        // A cancel requested from another view can land between finish's read and its write; a
-        // second try reads it and records the confirmed outcome with the cancel. If recording
-        // still fails, the durable running claim remains.
+        // A storage fault can fail the record write; one more try records the confirmed outcome.
+        // (A release from another page can't land meanwhile: it waits two minutes on a running
+        // step.) If recording still fails, the durable running claim remains.
         return finish(next);
       }
     },

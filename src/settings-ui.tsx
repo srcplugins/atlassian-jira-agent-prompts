@@ -5,7 +5,7 @@ import {
   useProductContext,
   Lozenge,
   SectionMessage,
-  Button,
+  LoadingButton,
   Inline,
   Checkbox,
   Heading,
@@ -45,13 +45,16 @@ export function Settings({
     initialHealth.state.data.refreshAfterSave === true,
   );
   const [busy, setBusy] = useState(false);
+  // The button whose action is running.
+  const [pressed, setPressed] = useState('');
   const [message, setMessage] = useState('');
   const target = { projectId };
   // UI Kit can deliver a second click before the disabled tree reaches the host.
   const latch = useRef(createLatch()).current;
-  function run(action: () => Promise<unknown>) {
+  function run(action: () => Promise<unknown>, key: string) {
     return latch.run(async () => {
       setBusy(true);
+      setPressed(key);
       onBusy?.(true);
       setMessage('');
       try {
@@ -60,10 +63,15 @@ export function Settings({
         setMessage(e instanceof Error ? e.message : 'Check or change failed.');
       } finally {
         setBusy(false);
+        setPressed('');
         onBusy?.(false);
       }
     });
   }
+  // The pressed button shows that it is working and keeps keyboard focus, which a disabled button
+  // would drop to the page; the other buttons are disabled meanwhile.
+  const loading = (key: string) => busy && pressed === key;
+  const held = (key: string) => busy && pressed !== key;
   async function check() {
     const value = await call<Health>('settings-health', target);
     setHealth(value);
@@ -173,8 +181,9 @@ export function Settings({
                       also have changed screens. Inspect the result before making another change.
                     </Text>
                     <Inline space="space.100" shouldWrap>
-                      <Button
-                        isDisabled={busy}
+                      <LoadingButton
+                        isLoading={loading('recover')}
+                        isDisabled={held('recover')}
                         onClick={() =>
                           void run(async () => {
                             const result = await call<{ message: string }>(
@@ -182,11 +191,11 @@ export function Settings({
                               target,
                             );
                             setMessage(result.message);
-                          })
+                          }, 'recover')
                         }
                       >
                         Check outcome
-                      </Button>
+                      </LoadingButton>
                     </Inline>
                     <Checkbox
                       isDisabled={busy}
@@ -195,8 +204,9 @@ export function Settings({
                       onChange={(e) => setAck(e.target.checked === true)}
                     />
                     <Inline space="space.100" shouldWrap>
-                      <Button
-                        isDisabled={busy || !ack}
+                      <LoadingButton
+                        isLoading={loading('resolve')}
+                        isDisabled={held('resolve') || !ack}
                         onClick={() =>
                           void run(async () => {
                             await call('settings-resolve', {
@@ -207,11 +217,11 @@ export function Settings({
                             await refresh(
                               'Resolution acknowledged. Select the existing type and work types for screens, then review the change.',
                             );
-                          })
+                          }, 'resolve')
                         }
                       >
                         Acknowledge resolution
-                      </Button>
+                      </LoadingButton>
                     </Inline>
                   </Stack>
                 </SectionMessage>
@@ -231,11 +241,13 @@ export function Settings({
                 onChange={(event) => setRefreshAfterSave(event.target.checked === true)}
               />
               <Inline space="space.100" shouldWrap>
-                <Button
+                <LoadingButton
+                  isLoading={loading('preferences')}
                   isDisabled={
-                    busy ||
-                    !!health.state.data.pending ||
-                    refreshAfterSave === (health.state.data.refreshAfterSave === true)
+                    held('preferences') ||
+                    (!busy &&
+                      (!!health.state.data.pending ||
+                        refreshAfterSave === (health.state.data.refreshAfterSave === true)))
                   }
                   onClick={() =>
                     void run(async () => {
@@ -245,11 +257,11 @@ export function Settings({
                         refreshAfterSave,
                       });
                       await refresh('Preferences saved.');
-                    })
+                    }, 'preferences')
                   }
                 >
                   Save
-                </Button>
+                </LoadingButton>
               </Inline>
             </Stack>
           </Box>

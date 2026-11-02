@@ -391,7 +391,6 @@ test('pending setup remains inspectable and manually resolvable when diagnostics
     const health = await f.settings.health(c);
     assert.deepEqual(health.state, f.state());
     assert.equal(health.project.id, c.projectId);
-    assert.equal(health.canConfigure, false);
     assert.ok(
       health.checks.some((check) => !check.ok && /could not be checked/.test(check.detail)),
     );
@@ -457,7 +456,11 @@ test('failed diagnostics still block previews and provisioning without making wr
     f.s[method] = async () => {
       throw new UserError('Diagnostic unavailable');
     };
-    assert.equal((await f.settings.health(c)).canConfigure, false);
+    assert.ok(
+      (await f.settings.health(c)).checks.some(
+        (check) => !check.ok && /could not be checked/.test(check.detail),
+      ),
+    );
     await assert.rejects(f.settings.preview(c, { name: 'Runbook' }), /Diagnostic unavailable/);
     await assert.rejects(
       f.settings.apply(c, { name: 'Runbook', fingerprint: plan.fingerprint }),
@@ -835,7 +838,6 @@ test('twenty previous types are retained and a twenty-first replacement is block
 test('a partly listed shared scheme allows selecting a type it has, never adding one', async () => {
   const f = fixture();
   Object.assign(f.scheme, { projectIds: [], projects: [], complete: false });
-  assert.equal((await f.settings.health(c)).canConfigure, true);
   const plan = await f.settings.preview(c, { type: '4' });
   assert.equal(plan.attach, false);
   await f.settings.apply(c, { type: '4', fingerprint: plan.fingerprint });
@@ -938,13 +940,31 @@ test('a screen shared with another space needs approval; incomplete impact block
   );
   assert.deepEqual(g.writes, []);
 });
+test('a screen this space uses is never reviewed as unshared when its impact leaves the space out', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', '*', '200');
+  f.screens.use('2', '4', '*', '200');
+  // Jira can omit a screen scheme's users; the impact then misses this space and every other.
+  const impact = f.s.screenImpact;
+  f.s.screenImpact = async (id) => (id === '200' ? { projects: [], complete: true } : impact(id));
+  await assert.rejects(
+    f.settings.preview(c, { type: '3', screenTypes: ['4'] }),
+    (error) =>
+      error instanceof JiraUnavailable &&
+      /spaces using the screen Screen 200 could not be read completely/.test(error.message),
+  );
+  f.s.screenImpact = impact;
+  const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  assert.ok(plan.screens.changes.find((ch) => ch.screen.id === '200').impact.shared);
+  assert.deepEqual(f.writes, []);
+});
 test('a step stops before its first write when the request has too little time left', async () => {
   const f = fixture();
   f.screens.use('1', '4', '*', '200');
   const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
   const input = { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint };
-  // One screen change and up to two type writes need 3 + 3 seconds.
-  f.screens.clock.left = 5_999;
+  // One screen change and up to two type writes need 3 seconds, plus the 4-second reserve.
+  f.screens.clock.left = 6_999;
   await assert.rejects(
     f.settings.apply(c, input),
     (error) =>
@@ -956,7 +976,7 @@ test('a step stops before its first write when the request has too little time l
   );
   assert.deepEqual(f.writes, []);
   assert.equal((await f.settings.health(c)).state.data.pending, undefined);
-  f.screens.clock.left = 6_000;
+  f.screens.clock.left = 7_000;
   await f.settings.apply(c, input);
   assert.deepEqual(f.writes[0], 'add 200 customfield_1');
 });
@@ -974,10 +994,10 @@ test('after the type is attached, the screen changes are fitted again to the tim
   const attach = f.s.attach;
   f.s.attach = async (...args) => {
     await attach(...args);
-    f.screens.clock.left = 4_000;
+    f.screens.clock.left = 5_000;
   };
   const outcome = await f.settings.apply(c, { ...input, fingerprint: plan.fingerprint });
-  // Four seconds leave one change after the three-second margin.
+  // Five seconds leave one change after the four-second reserve.
   assert.equal(f.writes.filter((w) => w.startsWith('add')).length, 1);
   assert.equal(outcome.remaining.length, reviewed - 1);
   assert.equal(f.state().data.type, '6');
@@ -998,8 +1018,8 @@ test('a step makes the screen changes that fit its time and reports the rest', a
   let plan = await f.settings.preview(c, input);
   assert.equal(plan.blocked, undefined);
   assert.equal(plan.screens.changes.length, 14);
-  // Eight seconds leave room for three changes after the type writes and a three-second margin.
-  f.screens.clock.left = 8_000;
+  // Nine seconds leave room for three changes after the type writes and the four-second reserve.
+  f.screens.clock.left = 9_000;
   const first = await f.settings.apply(c, { ...input, fingerprint: plan.fingerprint });
   assert.deepEqual(
     f.writes.filter((w) => w.startsWith('add')),
@@ -1131,6 +1151,35 @@ test('screen faults: a rejected first write changes nothing; later or lost write
     run(f),
     (error) => !(error instanceof NotApplied) && /uncertain/.test(error.message),
   );
+});
+test('a rejected first Jira write after a recorded join stops without an outcome check', async () => {
+  const f = fixture();
+  f.screens.use('1', '4', 'edit', '200', ['summary', FIELD]);
+  f.screens.use('1', '4', 'view', '201');
+  // Another space's setup already put the field on 200, so this space only joins its record.
+  f.screens.records.set('200', { revision: 1, data: { field: FIELD, projects: ['2'] } });
+  const plan = await f.settings.preview(c, { type: '3', screenTypes: ['4'] });
+  assert.deepEqual(
+    plan.screens.changes.map((ch) => [ch.action, ch.screen.id]),
+    [
+      ['join', '200'],
+      ['add', '201'],
+    ],
+  );
+  f.s.addScreenField = async () => {
+    f.writes.push('add');
+    throw new JiraRejected(404, 'Jira rejected adding a field to a screen (HTTP 404).');
+  };
+  await assert.rejects(
+    f.settings.apply(c, { type: '3', screenTypes: ['4'], fingerprint: plan.fingerprint }),
+    (error) =>
+      error instanceof NotApplied &&
+      !error.retryable &&
+      /Nothing was changed in Jira; .* Review this space again\.$/.test(error.message),
+  );
+  assert.deepEqual(f.writes, ['config', 'add']);
+  assert.deepEqual(f.screens.records.get('200').data.projects, ['1', '2']);
+  assert.deepEqual(f.state().data.screens, ['200']);
 });
 test('screen selection is validated against the space’s work types before any Jira read', async () => {
   const f = fixture();

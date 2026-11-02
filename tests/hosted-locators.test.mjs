@@ -56,6 +56,7 @@ const notAppText = new Map([
   ["'Select label'", "Jira's default editor for a list field, which the app replaces"],
   ['/^Agent Prompts/', "the field's name as Jira labels it on the work item"],
   ['/^Close/', "Jira's Create form close button"],
+  ['/^Reporter/', "a field label near the end of Jira's Create form"],
   ['/expand content/i', "the expand toggle in Jira's Description editor"],
   ["'Switch to sidebar'", "the button on Jira's work item modal over a board"],
   ["'Jira work item'", "the heading of Jira's work item side panel on a board"],

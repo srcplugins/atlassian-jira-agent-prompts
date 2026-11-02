@@ -489,9 +489,13 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
               : busy
                 ? 'Loading space configuration…'
                 : checked ||
-                  'Select spaces, then choose Check selected to check their configuration.'}
+                  (error
+                    ? ''
+                    : 'Select spaces, then choose Check selected to check their configuration.')}
           </Text>
         </Inline>
+        {/* Inventory and progress errors replace the prompt here, so they are announced. */}
+        {error && <Text>{error}</Text>}
       </Box>
       {incomplete && (
         <Text>
@@ -614,7 +618,6 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
         }))}
         emptyView={<Text>{busy ? 'Loading spaces…' : 'No spaces match your filters.'}</Text>}
       />
-      {error && <Text>{error}</Text>}
       {picked && !configure && (
         <Modal
           width="large"

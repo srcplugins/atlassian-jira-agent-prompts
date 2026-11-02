@@ -147,6 +147,21 @@ test('denial and malformed responses fail at once; a network failure is read thr
     assert.equal(s.calls.length, response instanceof Error ? 3 : 1);
   }
 });
+test("Forge's missing-access error leaves reads and writes unchanged, once, so Forge can prompt", async () => {
+  // Shape from @forge/api: NeedsAuthenticationError sets this name (out/api/errors.js).
+  const consent = () =>
+    Object.assign(new Error('Authentication Required'), { name: 'NEEDS_AUTHENTICATION_ERR' });
+  const read = sdk(consent());
+  await assert.rejects(registerResolvers(read).setup({ context }), {
+    name: 'NEEDS_AUTHENTICATION_ERR',
+  });
+  assert.equal(read.calls.length, 1);
+  const write = sdk(consent());
+  await assert.rejects(createPorts(write).update('10', { description: null }), {
+    name: 'NEEDS_AUTHENTICATION_ERR',
+  });
+  assert.equal(write.calls.length, 1);
+});
 test('work item edits distinguish documented rejections from uncertain failures without retry', async () => {
   for (const status of [400, 401, 403, 404, 409, 422, 429]) {
     const s = sdk({ status, body: { errorMessages: ['PRIVATE'] } });
@@ -157,6 +172,8 @@ test('work item edits distinguish documented rejections from uncertain failures 
         error.message,
         status === 429 ? /limiting requests/ : new RegExp(`HTTP ${status}`),
       );
+      // A save can write the description with the field; a 400 names both.
+      if (status === 400) assert.match(error.message, /Agent Prompts field and Description/);
       assert.doesNotMatch(error.message, /PRIVATE|Reload prompts/);
       return true;
     });
@@ -521,6 +538,51 @@ test('preference and resolution resolvers reject extra authority fields, bad rev
   const definitions = registerResolvers(sdk());
   for (const removed of ['settings-preview', 'settings-apply', 'settings-unlink'])
     assert.equal(definitions[removed], undefined);
+});
+test('a non-administrator is refused with the fixed message before any other Jira request or storage access', async () => {
+  const issueContext = { ...context, extension: { project: { id: '1' }, issue: { id: '10' } } };
+  for (const [name, payload, global] of [
+    ['configuration-options', { projectId: '1' }, true],
+    ['configuration-preview', { projectId: '1', type: '3', unlink: true }, true],
+    [
+      'configuration-start',
+      { entries: [{ projectId: '1', fingerprint: 'f' }], revision: 0, unlink: true },
+      true,
+    ],
+    ['configuration-advance', { id: 'run', revision: 1, key: 'k' }, true],
+    ['configuration-stop', { id: 'run', revision: 1, key: 'k', acknowledged: true }, true],
+    ['resolve-save', { revision: 1, fingerprint: 'review', acknowledged: true }, false],
+    ['settings-recover', { projectId: '1' }, false],
+  ]) {
+    const storage = [];
+    const s = {
+      ...sdk({ body: { permissions: { ADMINISTER: { havePermission: false } } } }),
+      kvs: { entity: () => storage.push(name) && {} },
+    };
+    const result = await registerResolvers(s)[name]({
+      context: name === 'resolve-save' ? issueContext : context,
+      payload,
+    });
+    assert.deepEqual(
+      result,
+      { ok: false, error: 'This needs the Jira permission Administer Jira.' },
+      name,
+    );
+    assert.deepEqual(
+      s.calls.map((c) => [c.actor, c.method, c.path]),
+      [
+        [
+          'asUser',
+          'GET',
+          global
+            ? '/rest/api/3/mypermissions?permissions=ADMINISTER'
+            : '/rest/api/3/mypermissions?projectId=1&permissions=ADMINISTER',
+        ],
+      ],
+      name,
+    );
+    assert.deepEqual(storage, [], name);
+  }
 });
 test('settings requests name their space by numeric ID only, refused before any Jira read', async () => {
   for (const projectId of ['TEST', '0', '1.5', 7, ' 1']) {
@@ -1523,4 +1585,108 @@ test('a read failing near the end of the write time is not tried again, so the s
   const late = await confirm(21_500, { status: 503 }, names, placed);
   assert.match(late.outcome.error.message, /HTTP 503/);
   assert.equal(late.s.calls.length, 1);
+});
+test('a company-managed health check reads each screen scheme and screen once, however many work types share them', async () => {
+  // Six selected work types in three screen schemes, each scheme with its own edit and view
+  // screen: six screens, the field on four. Jira is answered by path, since tab reads run
+  // concurrently.
+  const types = ['11', '12', '13', '14', '15', '16'];
+  const schemeOf = (type) => String(40 + Math.floor((Number(type) - 11) / 2));
+  const screensOf = (scheme) => ({ edit: `${scheme}1`, view: `${scheme}2` });
+  const withField = ['401', '402', '411', '412'];
+  const routes = {
+    '/rest/api/3/mypermissions?projectId=1&permissions=ADMINISTER': {
+      permissions: { ADMINISTER: { havePermission: true } },
+    },
+    '/rest/api/3/project/1': {
+      ...project,
+      issueTypes: [{ id: '3', name: 'Prompt', subtask: false }],
+    },
+    '/rest/api/3/issuetype': [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+    '/rest/api/3/issuetypescheme/project?projectId=1': {
+      isLast: true,
+      values: [{ issueTypeScheme: { id: '9' } }],
+    },
+    '/rest/api/3/issuetypescheme?id=9&expand=projects': {
+      isLast: true,
+      values: [{ id: '9', name: 'Scheme', projects: { isLast: true, values: [{ id: '1' }] } }],
+    },
+    '/rest/api/3/field': [{ id: 'customfield_1', schema: { custom: 'exact-field' } }],
+    '/rest/api/3/issue/createmeta/1/issuetypes/3?startAt=0&maxResults=200': {
+      total: 2,
+      fields: [{ fieldId: 'summary' }, { fieldId: 'description' }],
+    },
+    '/rest/api/3/issuetypescreenscheme/project?projectId=1': {
+      isLast: true,
+      values: [{ issueTypeScreenScheme: { id: '30' }, projectIds: ['1'] }],
+    },
+    '/rest/api/3/issuetypescreenscheme/mapping?issueTypeScreenSchemeId=30&startAt=0&maxResults=100':
+      {
+        startAt: 0,
+        isLast: true,
+        values: types.map((t) => ({
+          issueTypeScreenSchemeId: '30',
+          issueTypeId: t,
+          screenSchemeId: schemeOf(t),
+        })),
+      },
+    '/rest/api/3/screenscheme?id=40&id=41&id=42&maxResults=100': {
+      isLast: true,
+      values: ['40', '41', '42'].map((id) => ({ id: Number(id), screens: screensOf(id) })),
+    },
+    '/rest/api/3/screens?id=401&id=402&id=411&id=412&id=421&id=422&maxResults=100': {
+      isLast: true,
+      values: ['401', '402', '411', '412', '421', '422'].map((id) => ({
+        id: Number(id),
+        name: `Screen ${id}`,
+      })),
+    },
+    '/rest/api/3/field/customfield_1/screens?startAt=0&maxResults=100&expand=tab': {
+      startAt: 0,
+      isLast: true,
+      values: withField.map((id) => ({ id: Number(id), tab: { id: Number(`${id}0`) } })),
+    },
+    '/rest/api/3/screens/421/tabs': [{ id: 4210 }],
+    '/rest/api/3/screens/422/tabs': [{ id: 4220 }],
+  };
+  const calls = [];
+  const s = {
+    ...sdk(),
+    api: {
+      asUser: () => ({
+        requestJira: async (path, options) => {
+          calls.push(`${options?.method ?? 'GET'} ${path}`);
+          const body = routes[path];
+          if (body === undefined) throw Error(`Unexpected SDK request: ${path}`);
+          return { ok: true, status: 200, json: async () => structuredClone(body) };
+        },
+      }),
+    },
+    kvs: {
+      entity: () => ({
+        get: async (key) =>
+          key === 'config-1' ? { revision: 1, data: { type: '3', screenTypes: types } } : undefined,
+      }),
+    },
+  };
+  const result = await registerResolvers(s)['settings-health']({ context, payload: {} });
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(
+    result.value.checks.find((x) => x.label === 'Agent Prompts on screens'),
+    {
+      label: 'Agent Prompts on screens',
+      ok: false,
+      detail:
+        'The field is missing from Screen 421, Screen 422. Use Reconfigure space to review the screen changes.',
+    },
+  );
+  // Fourteen requests: one per route above, so none is repeated, and only the two screens without
+  // the field have their tabs read.
+  assert.deepEqual(
+    calls.toSorted(),
+    Object.keys(routes)
+      .map((path) => `GET ${path}`)
+      .toSorted(),
+  );
+  assert.equal(calls.length, 14);
 });

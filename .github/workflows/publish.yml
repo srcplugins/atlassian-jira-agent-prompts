@@ -1,23 +1,27 @@
 # Shared srcplugins file, synchronized across repositories.
 name: Publish
 
-# Manual release to Forge production with verifiable provenance. Run it for a pushed vX.Y.Z tag
-# on main: it checks the tag and source, uploads one Forge build tagged with the commit (stamped
+# Manual release to Forge production with verifiable provenance. Run it on main: it releases the
+# version in package.json from main's head (or the given commit on main), refusing a version
+# whose vX.Y.Z tag already exists. It uploads one Forge build tagged with the commit (stamped
 # into the app's settings page), attests that bundle, runs the release suite against exactly that
-# build on development, then deploys the same build to production and writes the GitHub release
-# notes. By default it rehearses: set `production` to deploy. Uploading a build needs a Forge
-# role that can deploy production (the Developer role gets "Permission denied"), so the build
-# job uses the `production` environment's deploy account too: every run waits for the owner's
-# approval before building, and a production run waits again before deploying. After the deploy,
-# a read-only smoke checks the production installation on the primary owned site and adds its
-# outcome to the release notes; without a production target it reports skipped, never passed.
+# build on development, then deploys the same build to production, creates the vX.Y.Z tag on
+# that commit and writes the GitHub release notes. So a version is tagged only once it shipped:
+# a rehearsal, a rejected approval or a failed suite leaves no tag, and the fix reruns Publish
+# under the same version. By default it rehearses: set `production` to deploy. Uploading a build
+# needs a Forge role that can deploy production (the Developer role gets "Permission denied"), so
+# the build job uses the `production` environment's deploy account too: every run waits for the
+# owner's approval before building, and a production run waits again before deploying. After the
+# deploy, a read-only smoke checks the production installation on the primary owned site and adds
+# its outcome to the release notes; without a production target it reports skipped, never passed.
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Release tag (vX.Y.Z), already pushed and on main
-        required: true
+      commit:
+        description: Full commit hash on main to release (leave empty for main's head)
+        required: false
+        default: ''
       production:
         description: Deploy the tested build to production (leave off to rehearse)
         type: boolean
@@ -52,22 +56,33 @@ jobs:
     outputs:
       build: ${{ steps.build.outputs.build }}
       sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
       attestation: ${{ steps.attest.outputs.attestation-url }}
-    env:
-      TAG: ${{ inputs.tag }}
     steps:
+      - name: The run is on main
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Run Publish on main"; exit 1; }
+          [ -z "$COMMIT" ] || [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+            { echo "::error::commit must be a full commit hash"; exit 1; }
+      # A rerun keeps the dispatched commit: github.sha is main's head when the run started.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.commit || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: The tag is a release on main
+      - name: The commit is an untagged release on main
         id: source
         run: |
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag must be vX.Y.Z"; exit 1; }
-          [ "v$(node -p "require('./package.json').version")" = "$TAG" ] ||
-            { echo "::error::package.json version differs from $TAG"; exit 1; }
-          git merge-base --is-ancestor HEAD origin/main || { echo "::error::$TAG is not on main"; exit 1; }
+          version=$(node -p "require('./package.json').version")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::package.json version must be X.Y.Z"; exit 1; }
+          tag="v$version"
+          git merge-base --is-ancestor HEAD origin/main || { echo "::error::The commit is not on main"; exit 1; }
+          # Publish creates the tag after the production deploy; one that exists already shipped.
+          ! git rev-parse -q --verify "refs/tags/$tag" > /dev/null ||
+            { echo "::error::$tag already exists: bump the version to release again"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -97,10 +112,11 @@ jobs:
           npm run check
           node config/check-plugin.mjs --release
       # Credentials are scoped to the Forge steps, never to the install and check steps.
-      - name: Upload one Forge build of the tagged commit
+      - name: Upload one Forge build of the commit
         id: build
         env:
           SHA: ${{ steps.source.outputs.sha }}
+          TAG: ${{ steps.source.outputs.tag }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
         run: |
@@ -131,7 +147,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/hosted.yml
     with:
-      # The commit that was built and attested, even if the tag moves meanwhile.
+      # The commit that was built and attested, even if main moves meanwhile.
       ref: ${{ needs.build.outputs.sha }}
       deploy_tag: ${{ needs.build.outputs.build }}
       suite: release
@@ -144,10 +160,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: production
+    # The only job that writes the repository: the tag and the release notes, after the deploy.
     permissions:
       contents: write
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ needs.build.outputs.tag }}
+      SHA: ${{ needs.build.outputs.sha }}
       BUILD: ${{ needs.build.outputs.build }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -191,10 +209,22 @@ jobs:
           [ "$APPROVE_MAJOR" = "true" ] && approve=(--approve MAJOR_VERSION_RULE)
           # Without approve_major, a major version stops here with the linter's reason.
           node config/forge.mjs deploy --tag "$BUILD" -e production --non-interactive "${approve[@]}"
+      # A rerun after a failed later step finds its own tag; a tag on another commit stops it.
+      - name: Tag the deployed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .object.sha")
+          if [ -z "$tagged" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" > /dev/null
+          elif [ "$tagged" != "$SHA" ]; then
+            echo "::error::$TAG already names $tagged, not the deployed commit $SHA"; exit 1
+          fi
+          echo "Tagged $SHA as $TAG."
       - name: Release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.build.outputs.sha }}
           ATTESTATION: ${{ needs.build.outputs.attestation }}
         run: |
           notes="Deployed to Forge production from commit $SHA as build $BUILD. Build provenance: $ATTESTATION. Release changes are in CHANGELOG.md."
@@ -218,7 +248,7 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ needs.build.outputs.tag }}
       SHA: ${{ needs.build.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

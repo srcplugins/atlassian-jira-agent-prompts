@@ -8,12 +8,13 @@ import {
   type SettingsRecord,
 } from './settings';
 import {
+  batchLimit,
   createConfigurationBatch,
   type BatchPorts,
   type BatchRecord,
   type InventoryProject,
 } from './configuration-batch';
-import { resolveSafely } from './shared/resolver.mjs';
+import { needsConsent, resolveSafely } from './shared/resolver.mjs';
 import {
   JiraHttpError,
   isDefinitiveRejection,
@@ -136,7 +137,9 @@ function requester({ api }: Sdk, deadline?: number) {
         },
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
-    } catch {
+    } catch (error) {
+      // Forge refused before sending, for missing access: it must leave the resolver to prompt.
+      if (needsConsent(error)) throw error;
       throw new JiraUnavailable('Jira connection failed. No write was retried.');
     }
     if (!response.ok)
@@ -317,7 +320,9 @@ export function createPorts({ api, route, kvs, Filter, FilterConditions, fieldTy
         // transports and unreadable successes stay uncertain.
         classifyWrite(e, 'issue-edit', (status) =>
           status === 400
-            ? 'Jira rejected this save (HTTP 400). Check that the Agent Prompts field is available on this work item and that the description is not too long, then save again.'
+            ? // A save that changes the description writes it with the field, so both must be on
+              // the work type's edit screen.
+              'Jira rejected this save (HTTP 400). Check that the Agent Prompts field and Description are on this work item’s edit screen and that the description is not too long, then save again.'
             : `Jira rejected this save (HTTP ${status}). Review your selection and save again.`,
         );
       }
@@ -605,9 +610,10 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
       });
     },
     // Names come from one bulk read and where the field sits from one field read, so only a
-    // screen without the field (for its first tab) or one in `full` reads its tabs. Reads stop at
+    // screen without the field (for its first tab) or one in `full` (unless `only` names its tabs)
+    // reads its tabs. Reads stop at
     // the review cutoff; reads confirming writes may also use the time set aside for the writes.
-    screens: async (ids, field, full = [], confirm = false) => {
+    screens: async (ids, field, full = [], confirm = false, only = {}) => {
       const due = () => {
         if (confirm ? Date.now() > started + 22_000 : late())
           throw new JiraUnavailable(
@@ -636,11 +642,15 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
         if (name === undefined) return undefined;
         const tab = placed.get(id);
         if (tab && !full.includes(id)) return { id, name, tabs: [{ id: tab, fields: [field] }] };
-        due();
-        const tabs = await request(route`/rest/api/3/screens/${id}/tabs`);
-        if (!Array.isArray(tabs) || tabs.length > 50)
-          throw new UserError('A screen’s tabs could not be read.');
-        const tabIds = tabs.map((t) => numeric(String(t?.id)));
+        // A confirmation knows the tabs it wrote, so it reads just their fields.
+        let tabIds = full.includes(id) ? only[id] : undefined;
+        if (!tabIds) {
+          due();
+          const tabs = await request(route`/rest/api/3/screens/${id}/tabs`);
+          if (!Array.isArray(tabs) || tabs.length > 50)
+            throw new UserError('A screen’s tabs could not be read.');
+          tabIds = tabs.map((t) => numeric(String(t?.id)));
+        }
         if (!full.includes(id))
           return { id, name, tabs: tabIds.map((t) => ({ id: t, fields: [] })) };
         const read = await limited(tabIds, async (tabId) => {
@@ -944,7 +954,7 @@ export function createBatchPorts(
     },
     get: () => readState<BatchRecord>(kvs, batchStorageKey),
     cas: async (revision, data) => {
-      if (Buffer.byteLength(JSON.stringify(data), 'utf8') > 190_000)
+      if (Buffer.byteLength(JSON.stringify(data), 'utf8') > batchLimit)
         throw new UserError('Configuration contains too many spaces. Select a smaller group.');
       try {
         await kvs
@@ -1154,8 +1164,10 @@ export function registerResolvers(sdk: Sdk) {
                   : [];
           if (Object.keys(payload).some((k) => !allowed.includes(k)))
             throw new UserError('Unexpected request fields.');
-          // Recovery of an unresolved save stays available without a license.
-          if (name !== 'save-status' && name !== 'resolve-save') requireLicense(sdk.appContext());
+          // The space settings page's read of its space, and recovery of an unresolved save, stay
+          // available without a license.
+          if (name !== 'setup' && name !== 'save-status' && name !== 'resolve-save')
+            requireLicense(sdk.appContext());
           if (name === 'save-status') return service.saveStatus(c);
           if (name === 'resolve-save')
             return service.resolveSave(

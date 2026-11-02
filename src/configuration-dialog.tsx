@@ -23,6 +23,7 @@ import {
   Stack,
   Text,
   Textfield,
+  xcss,
 } from '@forge/react';
 import { call } from './client';
 import { readSpaces } from './space-reads';
@@ -53,6 +54,8 @@ const appearance = {
   Change: 'moved',
   Keep: 'default',
 } as const;
+// A badge keeps its full width when the change beside it wraps; Lozenge alone shrinks to "Ch…".
+const badge = xcss({ minWidth: 'max-content' });
 /** The changes of one reviewed space, in words; record-only screen changes are not listed. */
 function changes(plan: Plan, typeName: (id: string) => string): Change[] {
   const unlink = 'unlink' in plan && plan.unlink;
@@ -473,6 +476,10 @@ export function ConfigurationDialog({
   async function apply() {
     // A removal leaves out the spaces that have no setup, so the result counts only real removals.
     const applied = mode === 'unlink' ? plans.filter((p) => removes(p.value!)) : plans;
+    // The new run starts from the saved run's revision, which is no longer shown: until the new
+    // run is recorded the dialog shows only its progress, never the earlier run's spaces.
+    const revision = record?.revision ?? 0;
+    setRecord(null);
     setAttempted(true);
     setUncertain(true);
     setProgress({ done: 0, total: applied.length });
@@ -489,7 +496,7 @@ export function ConfigurationDialog({
             ? { type: p.value!.type! }
             : { screenTypes: p.value!.screenTypes }),
       })),
-      revision: record?.revision ?? 0,
+      revision,
     });
     runKeys.set(current.data.id, key);
     setRecord(current);
@@ -906,7 +913,9 @@ export function ConfigurationDialog({
                           ) : lines.length ? (
                             lines.map((line, i) => (
                               <Inline key={i} space="space.100" alignBlock="center">
-                                <Lozenge appearance={appearance[line.op]}>{line.op}</Lozenge>
+                                <Box xcss={badge}>
+                                  <Lozenge appearance={appearance[line.op]}>{line.op}</Lozenge>
+                                </Box>
                                 <Text>{line.text}</Text>
                               </Inline>
                             ))
@@ -1117,7 +1126,10 @@ export function ConfigurationDialog({
                                   ? 'Outcome needs inspection'
                                   : e.remaining
                                     ? `${e.applied ?? 0} of ${(e.applied ?? 0) + e.remaining.length} screen changes made`
-                                    : 'Not yet configured'}
+                                    : // A run too large to continue keeps only the count.
+                                      e.applied
+                                      ? `${e.applied} screen changes made`
+                                      : 'Not yet configured'}
                             </Text>
                           ),
                         },
@@ -1127,9 +1139,12 @@ export function ConfigurationDialog({
                   {record.data.message && <Text>{record.data.message}</Text>}
                 </>
               )}
+              {/* Like the footer buttons, a pressed body button shows that it is working and
+                  stays mounted and enabled, so it keeps keyboard focus. */}
               {!done && (
-                <Button
-                  isDisabled={busy}
+                <LoadingButton
+                  isLoading={loading('check')}
+                  isDisabled={held('check')}
                   onClick={() =>
                     void run(async () => {
                       setChecking(true);
@@ -1138,65 +1153,69 @@ export function ConfigurationDialog({
                       } finally {
                         setChecking(false);
                       }
-                    })
+                    }, 'check')
                   }
                 >
                   Check saved progress
-                </Button>
+                </LoadingButton>
               )}
-              {!uncertain && ownRun && record?.data.status === 'ready' && (
-                <Button
-                  isDisabled={busy}
+              {(!uncertain || loading('continue')) && ownRun && record?.data.status === 'ready' && (
+                <LoadingButton
+                  isLoading={loading('continue')}
+                  isDisabled={held('continue')}
                   onClick={() =>
                     void run(async () => {
                       setUncertain(true);
                       await advance(record);
                       setUncertain(false);
-                    })
+                    }, 'continue')
                   }
                 >
                   Continue reviewed changes
-                </Button>
+                </LoadingButton>
               )}
-              {active && !uncertain && (!ownRun || record.data.status !== 'ready') && (
-                <>
-                  <Text>
-                    Only the page that started this configuration can continue its changes. If it
-                    was closed or reloaded, or its administrator is unavailable, inspect the saved
-                    results and any affected space in Jira before releasing the abandoned
-                    configuration. An uncertain or in-flight step requires a two-minute wait;
-                    releasing it cannot stop a delayed Jira request. Completed changes and space
-                    recovery records are kept.
-                  </Text>
-                  <Checkbox
-                    label="I confirmed this configuration is abandoned and inspected its affected Jira changes."
-                    isChecked={abandonedAck}
-                    isDisabled={busy}
-                    onChange={(event) => setAbandonedAck(event.target.checked === true)}
-                  />
-                  <Button
-                    isDisabled={busy || !abandonedAck}
-                    onClick={() =>
-                      void run(async () => {
-                        setAttempted(true);
-                        setUncertain(true);
-                        setRecord(
-                          await call<BatchRecord>('configuration-stop', {
-                            id: record.data.id,
-                            revision: record.revision,
-                            key: runKeys.get(record.data.id),
-                            acknowledged: abandonedAck,
-                          }),
-                        );
-                        setUncertain(false);
-                        setAbandonedAck(false);
-                      })
-                    }
-                  >
-                    Release abandoned configuration
-                  </Button>
-                </>
-              )}
+              {active &&
+                (!uncertain || loading('release')) &&
+                (!ownRun || record.data.status !== 'ready') && (
+                  <>
+                    <Text>
+                      Only the page that started this configuration can continue its changes. If it
+                      was closed or reloaded, or its administrator is unavailable, inspect the saved
+                      results and any affected space in Jira before releasing the abandoned
+                      configuration. An uncertain or in-flight step requires a two-minute wait;
+                      releasing it cannot stop a delayed Jira request. Completed changes and space
+                      recovery records are kept.
+                    </Text>
+                    <Checkbox
+                      label="I confirmed this configuration is abandoned and inspected its affected Jira changes."
+                      isChecked={abandonedAck}
+                      isDisabled={busy}
+                      onChange={(event) => setAbandonedAck(event.target.checked === true)}
+                    />
+                    <LoadingButton
+                      isLoading={loading('release')}
+                      isDisabled={held('release') || !abandonedAck}
+                      onClick={() =>
+                        void run(async () => {
+                          setAttempted(true);
+                          setUncertain(true);
+                          setRecord(
+                            await call<BatchRecord>('configuration-stop', {
+                              id: record.data.id,
+                              revision: record.revision,
+                              key: runKeys.get(record.data.id),
+                              acknowledged: abandonedAck,
+                            }),
+                          );
+                          setUncertain(false);
+                          setAbandonedAck(false);
+                        }, 'release')
+                      }
+                    >
+                      Release abandoned configuration
+                    </LoadingButton>
+                  </>
+                )}
             </>
           )}
           {/* Mounted empty, so progress and outcomes such as a lost response are announced. */}

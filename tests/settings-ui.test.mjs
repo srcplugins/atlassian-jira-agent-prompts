@@ -102,7 +102,6 @@ test('failed diagnostics leave pending recovery reachable across resolver, bridg
     const ui = fixture(invoke, { initialHealth: scanned.value });
     await ui.mount();
     assert.equal(replies[0].ok, true);
-    assert.equal(replies[0].value.canConfigure, false);
     assert.equal(replies[0].value.scheme, undefined);
     assert.deepEqual(replies[0].value.state, stored);
     assert.equal(ui.labels().includes('Check outcome'), pending);
@@ -131,7 +130,6 @@ test('Acknowledge resolution sends the acknowledgement the server requires', asy
     state: { revision: 2, data: { type: '3', pending: { type: '4', started: 1 } } },
     checks: [],
     types: [],
-    canConfigure: false,
   };
   const calls = [];
   const ui = fixture(
@@ -146,7 +144,12 @@ test('Acknowledge resolution sends the acknowledgement the server requires', asy
     .find((n) => n.props.label.startsWith('I inspected'))
     .props.onChange({ target: { checked: true } });
   ui.render();
-  await ui.click('Acknowledge resolution');
+  const resolving = ui.click('Acknowledge resolution');
+  ui.render();
+  assert.equal(ui.button('Acknowledge resolution').props.isLoading, true);
+  assert.equal(ui.button('Acknowledge resolution').props.isDisabled, false);
+  assert.equal(ui.button('Check outcome').props.isDisabled, true);
+  await resolving;
   assert.deepEqual(calls[0], [
     'settings-resolve',
     { projectId: '1', revision: 2, acknowledged: true },
@@ -159,7 +162,6 @@ test('space details open with the scan check without another read', async () => 
     state: { data: { type: '4' } },
     checks: [],
     types: [],
-    canConfigure: false,
   };
   const calls = [];
   const ui = fixture(
@@ -313,13 +315,15 @@ test('preferences preserve revision validation and explicit save, including fail
       { initialHealth: health },
     );
     await ui.mount();
-    assert.equal(
-      ui.nodes('Button').find((n) => n.props.children[0] === 'Save').props.isDisabled,
-      true,
-    );
+    assert.equal(ui.button('Save').props.isDisabled, true);
     ui.change('Checkbox', (n) => n.props.label.startsWith('Reload'), { target: { checked: true } });
     assert.equal(calls.length, 0);
-    await ui.click('Save');
+    const saving = ui.click('Save');
+    ui.render();
+    // The pressed button shows that it is working instead of being disabled, so it keeps focus.
+    assert.equal(ui.button('Save').props.isLoading, true);
+    assert.equal(ui.button('Save').props.isDisabled, false);
+    await saving;
     assert.deepEqual(calls[0], {
       name: 'settings-preferences',
       payload: { projectId: '1', revision: 2, refreshAfterSave: true },
@@ -364,7 +368,6 @@ test('the settings status region exists before any outcome is announced', async 
       state: { revision: 0, data: {} },
       checks: [],
       types: [],
-      canConfigure: true,
     },
   });
   const regions = v.nodes('Box').filter((box) => box.props.role === 'status');

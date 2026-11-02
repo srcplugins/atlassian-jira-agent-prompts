@@ -96,6 +96,7 @@ function ui(
         'List',
         'ListItem',
       ),
+      xcss: (value) => value,
     },
   });
   const v = view(hooks, () =>
@@ -236,6 +237,58 @@ test('a completed prior run does not prevent opening a fresh review', async () =
   await v.click('Review changes');
   assert.equal(v.hasButton('Apply changes'), true);
   assert.equal(v.hasButton('Done'), false);
+});
+
+test('after Apply the progress shows only the new run, never the previous run’s spaces', async () => {
+  const f = batchFixture();
+  let r = await f.start();
+  while (r.data.status === 'ready') r = await f.api.advance('admin', r.data.id, r.revision);
+  const v = ui(f, [f.projects.get('7')]);
+  await v.mount();
+  v.change('Select', 'configuration-type', { value: '5' });
+  await v.click('Next');
+  await v.click('Review changes');
+  const original = f.batch.start;
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  f.batch.start = async (...args) => {
+    await pending;
+    return original(...args);
+  };
+  const action = v.click('Apply changes');
+  v.render();
+  assert.match(v.text(), /Applying reviewed configuration/);
+  assert.equal(v.nodes('DynamicTable').length, 0);
+  assert.doesNotMatch(v.text(), /PR1|PR2/);
+  release();
+  await action;
+  assert.match(v.text(), /1 of 1 spaces configured\.\nPR7 — Project 7\nConfigured/);
+  assert.doesNotMatch(v.text(), /PR1|PR2/);
+  assert.deepEqual(
+    f.state().data.entries.map((e) => e.projectId),
+    ['7'],
+  );
+});
+
+test('review badges keep their full width beside a change that wraps', async () => {
+  const f = batchFixture();
+  const v = ui(f, [f.projects.get('1')]);
+  await v.mount();
+  v.change('Select', 'configuration-mode', { value: 'create' });
+  v.change('Textfield', 'configuration-name', {
+    target: { value: 'Review preview long prompt work type name for layout checkin' },
+  });
+  await v.click('Next');
+  await v.click('Review changes');
+  const badges = v.nodes('Lozenge');
+  assert.ok(badges.length > 0);
+  const kept = v
+    .nodes('Box')
+    .filter((box) => box.props.xcss?.minWidth === 'max-content')
+    .flatMap((box) => [box.props.children].flat().filter((c) => c?.type === 'Lozenge'));
+  assert.equal(kept.length, badges.length);
 });
 
 test('shared review lists unselected affected spaces and requires acknowledgment before applying', async () => {
@@ -579,6 +632,61 @@ test('the starting page continues its run without an abandoned-run control', asy
   assert.equal(v.hasButton('Continue reviewed changes'), true);
 });
 
+test('a pressed body button shows that it is working and stays enabled, so it keeps focus', async () => {
+  const hold = (target, method) => {
+    const original = target[method];
+    let release;
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    target[method] = async (...args) => {
+      await pending;
+      return original(...args);
+    };
+    return () => {
+      target[method] = original;
+      release();
+    };
+  };
+  const pressed = async (v, button, others, target, method) => {
+    const done = hold(target, method);
+    const action = v.click(button);
+    v.render();
+    assert.equal(v.button(button).props.isLoading, true);
+    assert.ok(!v.disabled(button));
+    for (const other of others) assert.equal(v.disabled(other), true);
+    done();
+    await action;
+  };
+  const own = batchFixture();
+  await own.start();
+  const v = ui(own);
+  await v.mount();
+  await pressed(v, 'Check saved progress', ['Continue reviewed changes'], own.api, 'status');
+  await pressed(v, 'Continue reviewed changes', ['Check saved progress'], own.batch, 'advance');
+  assert.equal(own.state().data.status, 'complete');
+
+  const other = batchFixture();
+  const r = await other.start();
+  await other.api.advance('admin', r.data.id, r.revision);
+  other.page = 'other';
+  const w = ui(other);
+  await w.mount();
+  w.change(
+    'Checkbox',
+    'I confirmed this configuration is abandoned and inspected its affected Jira changes.',
+    { target: { checked: true } },
+  );
+  await pressed(
+    w,
+    'Release abandoned configuration',
+    ['Check saved progress'],
+    other.batch,
+    'stop',
+  );
+  assert.equal(other.state().data.status, 'stopped');
+});
+
 test('setup removal remains reviewable when type discovery, inventory or the catalog request fails', async () => {
   for (const failure of ['types', 'inventory', 'catalog']) {
     const f = batchFixture();
@@ -907,7 +1015,7 @@ function manyTypes(f) {
     f.screens.use('1', type.id, 'view', String(301 + 2 * i));
     options.push({ value: type.id, label: type.name });
   }
-  f.screens.clock.left = 9_000;
+  f.screens.clock.left = 10_000;
   return options;
 }
 async function applyMany(f) {
@@ -945,6 +1053,22 @@ test('a run stopped between steps shows the screen changes already made', async 
   assert.match(v.text(), /4 of 14 screen changes made/);
   assert.match(v.text(), /No further change was made for this space/);
 });
+test('a run stopped as too large still counts a partly configured space’s screen changes', async () => {
+  const f = batchFixture();
+  const v = await applyMany(f);
+  // The run kept only the count when the changes left for later no longer fitted.
+  const advance = f.batch.advance;
+  f.batch.advance = async (...a) => {
+    const r = await advance(...a);
+    const { remaining, ...entry } = r.data.entries[0];
+    assert.ok(remaining.length);
+    const data = { ...r.data, entries: [entry], status: 'stopped', message: 'Too large.' };
+    await f.w.cas(r.revision, data);
+    return { revision: r.revision + 1, data };
+  };
+  await v.click('Apply changes');
+  assert.match(v.text(), /PR1 — Project 1\n4 screen changes made/);
+});
 /** The type writes of space 1's first step use up its request, so that step makes no screen
  * change; every later step has time for four again. `during` runs right after the type writes. */
 function typeOnlyFirstStep(f, during = () => {}) {
@@ -959,7 +1083,7 @@ function typeOnlyFirstStep(f, during = () => {}) {
     try {
       return await advance(...a);
     } finally {
-      f.screens.clock.left = 9_000;
+      f.screens.clock.left = 10_000;
     }
   };
 }

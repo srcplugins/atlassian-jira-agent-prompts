@@ -17,9 +17,10 @@
     "test": "node --test tests/*.test.mjs",
     "licenses:check": "node config/check-licenses.mjs .",
     "notices": "node config/check-licenses.mjs . --write-notices",
-    "check": "npm run format:check && npm run lint && npm run knip && npm run typecheck && npm run build:ui --if-present && npm test && npm run plugin:check && npm run licenses:check",
+    "check": "npm run format:check && npm run lint && npm run knip && npm run typecheck && npm run build:ui --if-present && npm test && npm run plugin:check && npm run licenses:check && node config/commit-gate.mjs record",
     "plugin:check": "node config/check-plugin.mjs",
-    "knip": "knip --no-progress"
+    "knip": "knip --no-progress",
+    "hosted": "node config/commit-gate.mjs suite"
   },
   "dependencies": {
     "@atlaskit/button": "25.4.2",
@@ -38,7 +39,7 @@
     "@eslint/js": "10.0.1",
     "@forge/cli": "file:.local/toolchain/forge-cli-14.0.0.tgz",
     "@playwright/test": "1.63.0",
-    "@srcplugins/atlassian-forge-test-framework": "github:srcplugins/atlassian-forge-test-framework#165e2eb98b0cf5b4c0d19b089ca497ac32418455",
+    "@srcplugins/atlassian-forge-test-framework": "github:srcplugins/atlassian-forge-test-framework#552279d8a716cbffd0921bedbc7b70c6467d49ba",
     "@types/node": "24.19.0",
     "@types/react": "18.3.31",
     "@types/react-dom": "18.3.7",
@@ -60,16 +61,16 @@
       "@babel/core": "7.29.6",
       "adm-zip": "0.6.1",
       "ajv@^6": "6.14.0",
-      "body-parser@^1": "1.20.6",
+      "body-parser@^1": "1.20.9",
       "brace-expansion@^1": "1.1.21",
       "brace-expansion@^5": "5.0.12",
       "browserslist": "4.28.7",
       "diff": "8.0.3",
       "fast-uri": "3.1.9",
-      "follow-redirects": "1.16.0",
+      "follow-redirects": "1.16.2",
       "form-data": "4.0.6",
       "http-proxy-middleware@^2": "2.0.10",
-      "launch-editor": "2.14.1",
+      "launch-editor": "2.14.2",
       "lodash": "4.18.1",
       "minimatch@^3": "3.1.4",
       "path-to-regexp@^0.1": "0.1.13",
@@ -88,6 +89,8 @@
     "sockjs": {
       "uuid": "11.1.1"
     },
-    "brace-expansion@^5": "5.0.12"
+    "brace-expansion@^5": "5.0.12",
+    "zod": "4.6.7",
+    "glob@^13": "14.0.3"
   }
 }
