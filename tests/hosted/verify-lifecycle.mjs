@@ -165,8 +165,9 @@ try {
     const baseline = await health();
     assert.ok(!baseline.state.data.type, 'Fixture must start unconfigured');
     state.lifecycle.baseline = baseline;
-    const type = project.issueTypes.find((t) => !t.subtask && t.name === 'Story');
-    assert.ok(type, 'An existing Story type is required; never create a global type here');
+    // Jira's built-in work types are refused as the prompt type.
+    const type = project.issueTypes.find((t) => !t.subtask && t.name === 'Prompt');
+    assert.ok(type, 'The space must already have the Prompt type; never create a global type here');
     state.lifecycle.type = type;
     owned.run.persist();
     await configure(type);

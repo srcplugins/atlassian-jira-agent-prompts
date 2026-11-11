@@ -13,7 +13,14 @@ interface Loaded extends PromptPage {
   loadWarning?: string;
   ids: string[];
   revision: number;
+  /** The space's prompt type, when it still has it. */
+  typeName?: string;
 }
+/** The field has nothing to offer on this work item; it says why, and there is nothing to retry. */
+interface Notice {
+  notice: string;
+}
+const noticeOf = (value: Loaded | Notice) => ('notice' in value ? value.notice : '');
 // Keep pointer actions stable while the in-flow menu is open. Blurring on
 // mousedown collapses the menu and moves these buttons before mouseup/click.
 function retainSearchFocus(event: React.MouseEvent<HTMLButtonElement>) {
@@ -24,6 +31,11 @@ function focusLost() {
   const active = document.activeElement;
   return !active || active === document.body || active.matches(':disabled');
 }
+/** The picker's text when the space has no prompts to offer. */
+const emptyText = (typeName?: string) =>
+  typeName
+    ? `No ${typeName} work items in this space yet. Create one to use it as a prompt.`
+    : 'No available prompts in this space yet.';
 const focusPicker = () => document.getElementById('agent-prompts')?.focus();
 /** What a save did with prompts that are gone: it says what happened, never asks for anything. */
 function droppedNote(dropped: string[]) {
@@ -46,6 +58,7 @@ export function Field() {
   const [recovery, setRecovery] = useState(false);
   const [recoveryStatus, setRecoveryStatus] = useState<SaveStatus>();
   const [loadError, setLoadError] = useState('');
+  const [notice, setNotice] = useState('');
   // The button whose save is running.
   const [saving, setSaving] = useState<'' | 'Save' | 'Sync'>('');
   // Set by a button whose work may disable or remove it; focus returns to the picker afterwards.
@@ -61,13 +74,19 @@ export function Field() {
     setBusy(true);
     setLoadError('');
     try {
-      const value = await call<Loaded>('load');
+      const value = await call<Loaded | Notice>('load');
+      setMessage('');
+      setRecovery(false);
+      if ('notice' in value) {
+        setData(undefined);
+        setNotice(noticeOf(value));
+        return;
+      }
+      setNotice('');
       setData(value);
       resetSearch(value);
       remember(value);
       setIds(value.ids);
-      setMessage('');
-      setRecovery(false);
     } catch (e) {
       const error = e instanceof Error ? e.message : 'Could not load prompts. Reopen this field.';
       // Only an unresolved earlier save needs saved-state recovery. Configuration, screen and
@@ -95,7 +114,13 @@ export function Field() {
     refocus.current = true;
     setBusy(true);
     try {
-      const value = await call<Loaded>('load');
+      const value = await call<Loaded | Notice>('load');
+      if ('notice' in value) {
+        setData(undefined);
+        setRecovery(false);
+        setNotice(noticeOf(value));
+        return;
+      }
       setData(value);
       resetSearch(value);
       remember(value);
@@ -145,7 +170,13 @@ export function Field() {
       // Reconcile once with a read; never repeat an uncertain Jira write.
       const error = e instanceof Error ? e.message : 'Could not save prompts.';
       try {
-        const current = await call<Loaded>('load');
+        const current = await call<Loaded | Notice>('load');
+        if ('notice' in current) {
+          setData(undefined);
+          setRecovery(false);
+          setNotice(noticeOf(current));
+          return;
+        }
         setData(current);
         remember(current);
         // Keep a real draft. Without one (every Sync), show the saved selection: keeping the old
@@ -221,7 +252,7 @@ export function Field() {
                       : // The menu hides selected options, so suggestions can all be hidden.
                         search.items.length
                         ? 'All suggested prompts are selected. Search to find others.'
-                        : 'No available prompts in this space yet.')
+                        : emptyText(data.typeName))
             }
             isSearchable={!data.cleanupOnly}
             inputValue={search.query}
@@ -258,11 +289,7 @@ export function Field() {
       <p role="status">
         {data && !data.cleanupOnly
           ? search.error ||
-            (empty
-              ? search.query.trim()
-                ? 'No matching prompts'
-                : 'No available prompts in this space yet.'
-              : '')
+            (empty ? (search.query.trim() ? 'No matching prompts' : emptyText(data.typeName)) : '')
           : ''}
       </p>
       {data && (
@@ -314,7 +341,7 @@ export function Field() {
       )}
       {data?.loadWarning && <p>{data.loadWarning}</p>}
       {/* Present from the first render so assistive technology announces each outcome. */}
-      <p role="status">{loadError || message}</p>
+      <p role="status">{notice || loadError || message}</p>
       {/* Pressing it removes it; the picker or a new Try again starts with focus afterwards. */}
       {loadError && !busy && (
         <Button onMouseDown={retainSearchFocus} autoFocus onClick={() => void load()}>

@@ -162,6 +162,8 @@ export function ConfigurationDialog({
   const [promptChoice, setPromptChoice] = useState<Record<string, string>>({});
   // Each team-managed space's saved type, from that read, for the "Was:" note and Remove setup.
   const [savedPrompt, setSavedPrompt] = useState<Record<string, string>>({});
+  // The saved type's name where it is one of Jira's built-in work types, which aren't offered.
+  const [savedBuiltIn, setSavedBuiltIn] = useState<Record<string, string>>({});
   // A space's work types could not be read; the team-managed screen offers to read them again.
   const [optionsFailed, setOptionsFailed] = useState(false);
   const [screenChoice, setScreenChoice] = useState<Record<string, string[]>>({});
@@ -256,7 +258,8 @@ export function ConfigurationDialog({
   }
   const affectedLabel = (scheme: Plan['scheme'], id: string) => {
     const p =
-      scheme.projects?.find((p) => p.id === id) ?? inventory.projects.find((p) => p.id === id);
+      scheme.projects?.find((project) => project.id === id) ??
+      inventory.projects.find((project) => project.id === id);
     return p?.key ? `${p.key}${p.name ? ` — ${p.name}` : ''}` : `Space ID ${id}`;
   };
 
@@ -322,7 +325,9 @@ export function ConfigurationDialog({
   // A space outside the loaded inventory (or the stand-in used when the inventory failed, whose
   // key is its ID) is labelled by ID rather than shown as a bare number.
   const label = (id: string) => {
-    const p = inventory.projects.find((p) => p.id === id) ?? projects.find((p) => p.id === id);
+    const p =
+      inventory.projects.find((project) => project.id === id) ??
+      projects.find((project) => project.id === id);
     return p && p.key !== p.id ? `${p.key} — ${p.name}` : `Space ID ${id}`;
   };
   const typeName = (id: string) =>
@@ -403,6 +408,10 @@ export function ConfigurationDialog({
     );
     setPromptChoice((c) => ({ ...ownChoice, ...c }));
     setSavedPrompt((s) => ({ ...ownSaved, ...s }));
+    setSavedBuiltIn((s) => ({
+      ...Object.fromEntries(own.flatMap((p) => (p.value.builtIn ? [[p.id, p.value.builtIn]] : []))),
+      ...s,
+    }));
     const failed = read.find((p) => !p.value);
     setOptionsFailed(!!failed);
     if (failed) {
@@ -612,11 +621,13 @@ export function ConfigurationDialog({
                       !!savedPrompt[id] && !own.some((o) => o.value === savedPrompt[id]);
                     const was =
                       savedPrompt[id] && promptChoice[id] !== savedPrompt[id]
-                        ? `Was: ${typeName(savedPrompt[id])}${stale ? ', which is no longer one of this space’s standard work types' : ''}. `
+                        ? savedBuiltIn[id]
+                          ? `Was: ${savedBuiltIn[id]}, one of Jira’s built-in work types, which can’t hold prompts. `
+                          : `Was: ${typeName(savedPrompt[id])}${stale ? ', which is no longer one of this space’s standard work types' : ''}. `
                         : '';
                     const hint =
                       promptOptions[id] && !own.length
-                        ? 'This space has no standard work type. Create one in Space settings → Work types, then reopen this dialog.'
+                        ? 'This space has no work type that can hold prompts. Create one only for prompts, such as Prompt, in Space settings → Work types, then reopen this dialog.'
                         : layoutHint(layouts[id]);
                     return (
                       <Stack key={id} space="space.050">
@@ -897,7 +908,7 @@ export function ConfigurationDialog({
                   )}
                   {plans.length > 0 &&
                     pageOf(ids, page).map((id) => {
-                      const p = plans.find((p) => p.id === id);
+                      const p = plans.find((plan) => plan.id === id);
                       const lines = p?.value ? changes(p.value, typeName) : [];
                       return (
                         <Stack key={id} space="space.075">

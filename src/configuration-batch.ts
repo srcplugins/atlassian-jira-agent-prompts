@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   createSettings,
   NotApplied,
+  offered,
   reloadInput,
   screenTypesInput,
   screenWrite,
@@ -145,10 +146,8 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
       const [types] = await Promise.allSettled([s.types()]);
       return {
         typesAvailable: types.status === 'fulfilled',
-        types:
-          types.status === 'fulfilled'
-            ? types.value.filter((t) => t.hierarchyLevel === 0 && !t.subtask && !t.scope)
-            : [],
+        // Jira's built-in work types are never offered for prompts.
+        types: types.status === 'fulfilled' ? types.value.filter(offered) : [],
       };
     },
     async status() {
@@ -296,7 +295,9 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
               : 'A company-managed space uses the run’s prompt work type.',
           );
         const facts = Object.fromEntries(
-          Object.entries(fresh).filter(([key]) => !['fingerprint', 'screenProjects'].includes(key)),
+          Object.entries(fresh).filter(
+            ([name]) => !['fingerprint', 'screenProjects'].includes(name),
+          ),
         );
         // A shared screen this run already changed now shows that change as made: the app's
         // record lists an earlier space, or Summary/Description is already on the create screen.
@@ -354,8 +355,10 @@ export function createConfigurationBatch(p: Ports, s: SettingsPorts, w: BatchPor
             );
             if (removal) {
               const earlier = (fresh.screenProjects[removal.screen.id] ?? [])
-                .filter((p) => d.entries.slice(0, d.index).some((e) => e.projectId === p.id))
-                .map((p) => p.key ?? `Space ID ${p.id}`);
+                .filter((project) =>
+                  d.entries.slice(0, d.index).some((e) => e.projectId === project.id),
+                )
+                .map((project) => project.key ?? `Space ID ${project.id}`);
               throw new UserError(
                 `${earlier.length ? earlier.join(', ') : 'An earlier space in this run'} stopped using Agent Prompts on the screen ${removal.screen.name} earlier in this run, so this space is now the last one relying on it and would remove the field from it. Review this space again to approve that removal.`,
               );

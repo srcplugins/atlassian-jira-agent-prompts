@@ -651,16 +651,16 @@ try {
       )
         return route.continue();
       call.functionKey = 'settings-projects';
-      const response = await route.fetch({ postData: JSON.stringify(body) });
-      const text = await response.text();
-      const find = (value) =>
+      const forwarded = await route.fetch({ postData: JSON.stringify(body) });
+      const text = await forwarded.text();
+      const findOutcome = (value) =>
         !value || typeof value !== 'object'
           ? null
           : typeof value.ok === 'boolean'
             ? value
-            : Object.values(value).map(find).find(Boolean);
-      refused = find(JSON.parse(text)) ?? null;
-      return route.fulfill({ response, body: text });
+            : Object.values(value).map(findOutcome).find(Boolean);
+      refused = findOutcome(JSON.parse(text)) ?? null;
+      return route.fulfill({ response: forwarded, body: text });
     });
     // Like openField, click again only while Jira still shows the read view.
     const refusal = editor(member).getByText('This needs the Jira permission Administer Jira.', {
@@ -752,8 +752,8 @@ try {
     error instanceof Error ? error.stack : 'Unknown failure',
     { mode: 0o600 },
   );
-  const pages = browser?.contexts().flatMap((context) => context.pages()) ?? [];
-  for (const [index, page] of pages.entries())
+  const openPages = browser?.contexts().flatMap((context) => context.pages()) ?? [];
+  for (const [index, page] of openPages.entries())
     await page
       .screenshot({ path: `${directory}/${id}-failure-${index}.png`, fullPage: true })
       .catch(() => {});

@@ -4,6 +4,7 @@ import { snapshotContent, DescriptionError, synchronizeDescription, hash } from 
 export { hash };
 import { JiraHttpError, UserError, requireSoftwareSpace } from './shared/jira.mjs';
 import { sectionLocalId } from './names';
+import { builtInConfigured, builtInType } from './built-in-types';
 export { UserError };
 /** The request never got an HTTP response from Jira. */
 export class JiraUnavailable extends UserError {}
@@ -166,6 +167,8 @@ function landed(issue: Issue, field: string, pending: Pending) {
       : [pending.beforeField, hash(['field', pending.keys])];
   return before !== after && fieldHash(issue, field) === after;
 }
+const promptItemNotice =
+  'This work item is a prompt, so it can’t use other prompts. Open a work item of another type, such as a Bug, to add prompts.';
 const notFound = (error: unknown) => error instanceof JiraHttpError && error.status === 404;
 /** "PLS-1", "PLS-1 and PLS-2", "PLS-1, PLS-2 and PLS-3". */
 function list(labels: string[]) {
@@ -193,7 +196,7 @@ interface SaveInput {
   revision?: number;
 }
 export function createService(p: Ports) {
-  async function scope(c: Context) {
+  async function configured(c: Context) {
     numeric(c.projectId);
     const type = await p.config(c.projectId);
     if (!type)
@@ -201,6 +204,23 @@ export function createService(p: Ports) {
         'This space is not set up for Agent Prompts. Ask a Jira administrator to set it up in Space settings.',
       );
     return numeric(type);
+  }
+  /** The prompt type's name in the space, when the space still has it. */
+  async function promptTypeName(c: Context, type: string) {
+    const project = await p.project(c.projectId);
+    return project.issueTypes.find((t) => t.id === type)?.name;
+  }
+  /** A space set up with one of Jira's built-in work types is stopped until it is configured
+   * again. Removing its setup is a settings change, which never reads this. */
+  async function typeName(c: Context, type: string) {
+    const name = await promptTypeName(c, type);
+    if (name !== undefined && builtInType(name)) throw new UserError(builtInConfigured);
+    return name;
+  }
+  async function scope(c: Context) {
+    const type = await configured(c);
+    await typeName(c, type);
+    return type;
   }
   async function target(c: Context, field: string) {
     if (!c.issueId) throw new UserError('Open Agent Prompts on an existing work item.');
@@ -313,7 +333,16 @@ export function createService(p: Ports) {
       limit: PromptQuery['limit'] = 10,
     ) {
       const query = promptQuery(input, limit);
-      return p.search(c.projectId, await scope(c), query);
+      const type = await configured(c);
+      // The type check reads the space alongside the search, so the picker waits for one round;
+      // its refusal comes before any search failure.
+      const [named, page] = await Promise.allSettled([
+        typeName(c, type),
+        p.search(c.projectId, type, query),
+      ]);
+      if (named.status === 'rejected') throw named.reason;
+      if (page.status === 'rejected') throw page.reason;
+      return page.value;
     },
     async read(c: Context, id: string) {
       const type = await scope(c);
@@ -331,16 +360,18 @@ export function createService(p: Ports) {
         }),
       };
     },
+    /** The field's prompts and saved selection, or only a `notice` where the field has nothing to
+     * offer: the space's prompt type is a built-in one, or this work item is itself a prompt with
+     * no prompts saved. */
     async load(c: Context) {
-      const type = await scope(c);
-      const field = await p.field();
+      const type = await configured(c);
+      const [name, field] = await Promise.all([promptTypeName(c, type), p.field()]);
       const issue = await target(c, field);
+      // An unverified earlier save still fails the load, so the field offers its recovery.
       const stored = await state(issue, field);
+      if (name !== undefined && builtInType(name)) return { notice: builtInConfigured };
       const cleanupOnly = issue.fields.issuetype.id === type;
-      if (cleanupOnly && !stored.data.ids.length)
-        throw new UserError(
-          'A prompt cannot use other prompts. It can only remove prompts it already has.',
-        );
+      if (cleanupOnly && !stored.data.ids.length) return { notice: promptItemNotice };
       let retainedUnavailable = false;
       let refreshUnavailable = false;
       const [library, retained, refreshAfterSave] = await Promise.all([
@@ -362,7 +393,7 @@ export function createService(p: Ports) {
         }),
       ]);
       for (const id of stored.data.ids.filter(
-        (id) => !library.prompts.some((item) => item.id === id),
+        (storedId) => !library.prompts.some((item) => item.id === storedId),
       )) {
         try {
           const source = await p.issue(id);
@@ -400,6 +431,7 @@ export function createService(p: Ports) {
         .join(' ');
       return {
         ...library,
+        ...(name !== undefined ? { typeName: name } : {}),
         cleanupOnly,
         refreshAfterSave,
         ...(loadWarning ? { loadWarning } : {}),
@@ -434,12 +466,11 @@ export function createService(p: Ports) {
       const ids = sync ? stored.data.ids : chosen!;
       if (!sync) {
         if (ids.includes(issue.id)) throw new UserError('A prompt cannot use itself.');
-        if (
-          issue.fields.issuetype.id === type &&
-          (!stored.data.ids.length || ids.some((id) => !stored.data.ids.includes(id)))
-        )
+        if (issue.fields.issuetype.id === type && !stored.data.ids.length)
+          throw new UserError(promptItemNotice);
+        if (issue.fields.issuetype.id === type && ids.some((id) => !stored.data.ids.includes(id)))
           throw new UserError(
-            'A prompt cannot use other prompts. It can only remove prompts it already has.',
+            'This work item is a prompt, so it can’t use other prompts. You can only remove the prompts it already has.',
           );
         if (stored.revision !== input.revision)
           throw new UserError('The work item changed. Review your selection and save again.');

@@ -10,6 +10,7 @@ import {
   type Ports,
 } from './service';
 import { JiraHttpError, requireSoftwareSpace } from './shared/jira.mjs';
+import { builtInRefusal, builtInType } from './built-in-types';
 
 /** A configuration step that provably changed nothing in Jira and left no claim in storage.
  * `retryable` means repeating the reviewed step can succeed (a brief outage); otherwise the
@@ -54,6 +55,12 @@ interface WorkType {
 function eligible(type: WorkType) {
   return type.hierarchyLevel === 0 && !type.subtask && !type.scope;
 }
+/** A global work type the Configure picker offers for prompts. */
+export function offered(type: WorkType) {
+  return eligible(type) && !builtInType(type.name);
+}
+const builtInConfiguredDetail = (name: string) =>
+  `${name} is one of Jira’s built-in work types, so Agent Prompts is stopped in this space. Use Reconfigure space to choose or create a work type only for prompts.`;
 /** A team-managed space's standard work types. All of its work types are its own: Jira can't add
  * global types to a team-managed space. */
 function ownTypes(project: { issueTypes: Omit<WorkType, 'scope'>[] }) {
@@ -336,7 +343,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       } else if (owned.includes(id)) {
         if (!listed || !info || !tab)
           changes.push({ action: 'drop', screen, field, types, record: revision });
-        else if (ours!.projects.some((p) => p !== projectId))
+        else if (ours!.projects.some((owner) => owner !== projectId))
           changes.push({ action: 'leave', screen, field, types, record: revision });
         else write({ action: 'remove', tab: tab.id, field, types });
       }
@@ -371,7 +378,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       // so an impact without it is incomplete (Jira left out a scheme's users), never unshared.
       if (
         (change.action === 'add' || change.action === 'require') &&
-        !impact.projects.some((p) => p.id === projectId)
+        !impact.projects.some((project) => project.id === projectId)
       )
         throw new JiraUnavailable(
           `The spaces using the screen ${screen.name} could not be read completely. Review this space again.`,
@@ -383,8 +390,8 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         record: change.action === 'require' ? 0 : revision,
         impact: {
           spaces: impact.projects.length,
-          shared: impact.projects.some((p) => p.id !== projectId),
-          digest: hash(impact.projects.map((p) => p.id)),
+          shared: impact.projects.some((project) => project.id !== projectId),
+          digest: hash(impact.projects.map((project) => project.id)),
         },
       });
     }
@@ -407,15 +414,18 @@ export function createSettings(p: Ports, s: SettingsPorts) {
   ) {
     const types = ownTypes(project);
     const selected = types.find((t) => t.id === state.data.type);
+    const builtIn = !!selected && builtInType(selected.name);
     const checks: { label: string; ok: boolean; detail: string }[] = [
       {
         label: 'Work type',
-        ok: !!selected,
+        ok: !!selected && !builtIn,
         detail: !state.data.type
           ? 'Choose the space’s prompt work type.'
-          : selected
-            ? `${selected.name} is this space’s prompt work type. Renames are supported.`
-            : 'The configured type was deleted or is no longer a standard work type of this space. Choose a replacement.',
+          : builtIn
+            ? builtInConfiguredDetail(selected.name)
+            : selected
+              ? `${selected.name} is this space’s prompt work type. Renames are supported.`
+              : 'The configured type was deleted or is no longer a standard work type of this space. Choose a replacement.',
       },
     ];
     let field: string | undefined;
@@ -575,6 +585,7 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       const type = numeric(input.type);
       const chosen = ownTypes(project).find((t) => t.id === type);
       if (!chosen) throw new UserError('Choose one of this space’s standard work types.');
+      if (builtInType(chosen.name)) throw new UserError(builtInRefusal);
       const previousTypes = previousTypesAfter(state.data, type);
       const { screens, labels } = noScreens();
       const result = {
@@ -606,13 +617,15 @@ export function createSettings(p: Ports, s: SettingsPorts) {
     )
       throw new UserError('Choose a work type name of 1–60 characters.');
     if (creating && input.type) throw new UserError('Create a type or choose an existing one.');
+    if (creating && builtInType(name!)) throw new UserError(builtInRefusal);
     if (creating && value.types.some((t) => t.name.toLowerCase() === name!.toLowerCase()))
       throw new UserError(
         'That work type name already exists. Choose another name or select an existing standard global work type.',
       );
     const type = creating ? undefined : numeric(input.type);
-    if (type && !value.types.some((t) => t.id === type && eligible(t)))
-      throw new UserError('Choose an available standard global work type.');
+    const existing = type ? value.types.find((t) => t.id === type && eligible(t)) : undefined;
+    if (type && !existing) throw new UserError('Choose an available standard global work type.');
+    if (existing && builtInType(existing.name)) throw new UserError(builtInRefusal);
     const attach = creating || !value.project.issueTypes.some((t) => t.id === type);
     if (attach && value.scheme.isDefault)
       throw new UserError(
@@ -725,18 +738,21 @@ export function createSettings(p: Ports, s: SettingsPorts) {
         !!selected &&
         eligible(selected) &&
         project.issueTypes.some((t) => t.id === selected.id && !t.subtask);
+      const builtIn = !!selected && builtInType(selected.name);
       checks.push({
         label: 'Work type',
-        ok: available,
+        ok: available && !builtIn,
         detail: !types
           ? 'Work types could not be checked. Inspect Jira settings before resolving any pending operation, then check the space again.'
           : !state.data.type
             ? 'Choose or create a work type.'
-            : !selected || !eligible(selected)
-              ? 'The configured type is deleted, unavailable or no longer a standard global work type. Choose a replacement.'
-              : available
-                ? `${selected.name} is available in this space. Renames are supported.`
-                : `${selected.name} exists but is missing from this space. Use Reconfigure space to review a repair.`,
+            : builtIn
+              ? builtInConfiguredDetail(selected.name)
+              : !selected || !eligible(selected)
+                ? 'The configured type is deleted, unavailable or no longer a standard global work type. Choose a replacement.'
+                : available
+                  ? `${selected.name} is available in this space. Renames are supported.`
+                  : `${selected.name} exists but is missing from this space. Use Reconfigure space to review a repair.`,
       });
       if (!scheme)
         checks.push({
@@ -844,10 +860,16 @@ export function createSettings(p: Ports, s: SettingsPorts) {
     /** The Work types step's data for a space: the work types it offers for the Agent Prompts
      * field and its saved selection among them. The dialog leaves out the prompt type it knows;
      * the review checks the selection against the prompt type again. A team-managed space gets
-     * its own standard work types and its saved prompt type, which may no longer be one of them,
-     * so its setup can still be removed. */
+     * its own standard work types other than Jira's built-in ones, and its saved prompt type, which
+     * may no longer be one of them, so its setup can still be removed. `builtIn` names a saved
+     * type that is one of Jira's built-in work types. */
     async options(c: Context): Promise<
-      | { teamManaged: true; promptTypes: { id: string; name: string }[]; type?: string }
+      | {
+          teamManaged: true;
+          promptTypes: { id: string; name: string }[];
+          type?: string;
+          builtIn?: string;
+        }
       | {
           teamManaged?: undefined;
           availableTypes: { id: string; name: string }[];
@@ -859,7 +881,14 @@ export function createSettings(p: Ports, s: SettingsPorts) {
       // A team-managed space offers its own work types for its prompt type instead.
       if (project.teamManaged) {
         const type = record?.data.type;
-        return { teamManaged: true, promptTypes: ownTypes(project), ...(type ? { type } : {}) };
+        const own = ownTypes(project);
+        const saved = own.find((t) => t.id === type);
+        return {
+          teamManaged: true,
+          promptTypes: own.filter((t) => !builtInType(t.name)),
+          ...(type ? { type } : {}),
+          ...(saved && builtInType(saved.name) ? { builtIn: saved.name } : {}),
+        };
       }
       const availableTypes = project.issueTypes
         .map((t) => ({ id: t.id, name: t.name }))

@@ -161,13 +161,13 @@ export function Settings({
               <Inline space="space.200" alignBlock="center" shouldWrap>
                 {configurationAction}
               </Inline>
-              {health.checks.some((check) => !check.ok) && (
+              {health.checks.some((item) => !item.ok) && (
                 <SectionMessage appearance="warning" title="Review configuration">
                   {health.checks
-                    .filter((check) => !check.ok)
-                    .map((check) => (
-                      <Text key={check.label}>
-                        {check.label} — {check.detail}
+                    .filter((item) => !item.ok)
+                    .map((item) => (
+                      <Text key={item.label}>
+                        {item.label} — {item.detail}
                       </Text>
                     ))}
                 </SectionMessage>

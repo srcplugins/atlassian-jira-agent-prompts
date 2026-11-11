@@ -152,7 +152,7 @@ export function HealthProjects({ projectId }: { projectId?: string }) {
   async function checkHealth(ids: string[], { counted }: { counted: boolean }) {
     const read = await readSpaces(
       ids,
-      (projectId) => call<Health>('settings-health', { projectId }),
+      (spaceId) => call<Health>('settings-health', { projectId: spaceId }),
       (updates) => {
         if (!mounted.current) return;
         if (counted) setCompleted(updates.length);

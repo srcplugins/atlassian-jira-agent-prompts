@@ -122,14 +122,14 @@ export function spaceLeftovers(
    * Leftovers of the deleted spaces `keys`, or of every runner space key not in `live`.
    * @param {{ keys?: string[], live?: Set<string> }} options
    */
-  async function find({ keys, live = new Set() }) {
+  async function find({ keys, live: liveKeys = new Set() }) {
     if (keys && !keys.length) return [];
     const found = new Map();
     for (const k of kinds)
       for (const key of k.everyKey || !keys ? [''] : keys)
         for (const x of await k.find(key)) {
           const owner = x.name?.match(k.owner)?.[1];
-          if (!owner || live.has(owner) || (keys && !keys.includes(owner))) continue;
+          if (!owner || liveKeys.has(owner) || (keys && !keys.includes(owner))) continue;
           const id = String(x.id);
           found.set(`${k.kind} ${id}`, { kind: k.kind, id, name: x.name, key: owner });
         }

@@ -156,7 +156,7 @@ try {
             await expect(read(page)).toBeVisible();
             // Jira can render its read view before attaching the edit handler.
             await page.waitForTimeout(1500);
-            const started = performance.now();
+            const openStarted = performance.now();
             const loaded = await observeAction(
               page,
               'load',
@@ -164,7 +164,7 @@ try {
               t,
             );
             await expect(combo(page)).toBeEnabled();
-            record(scale, 'picker-open', started, session);
+            record(scale, 'picker-open', openStarted, session);
             assert.equal(loaded.prompts.length, 10);
             const found = await search(page, `prompt ${term}`, scale, session);
             assert.equal(found.prompts.length, 10);
