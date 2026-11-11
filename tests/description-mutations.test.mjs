@@ -135,6 +135,11 @@ function world(seed) {
     refreshAfterSave: async () => false,
     retainedTypes: async () => [],
     config: async () => '3',
+    // The space's prompt type, read for its name.
+    project: async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+    }),
     field: async () => FIELD,
     allowed: async () => {},
     search: async () => ({
@@ -330,7 +335,7 @@ const tampering = {
     d.content.splice(Math.floor(w.r() * (d.content.length + 1)), 0, otherSection(w, w.r() < 0.3));
   },
   "add a block of the user's own with the title": (w, d) => {
-    const block = {
+    const own = {
       type: 'expand',
       attrs: { title: w.pick(['Agent Prompts', 'AGENT PROMPTS', ' agent  prompts ']) },
       content: [paragraph(`My own list ${w.hex()}`)],
@@ -338,7 +343,7 @@ const tampering = {
     d.content.splice(
       Math.floor(w.r() * (d.content.length + 1)),
       0,
-      w.r() < 0.3 ? nest(w, block) : block,
+      w.r() < 0.3 ? nest(w, own) : own,
     );
   },
   'rewrite the whole description': (w, d) => {

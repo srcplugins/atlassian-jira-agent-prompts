@@ -18,6 +18,8 @@ Stop repeating the same instructions across Jira work items. Create reusable pro
 
 Agent Prompts works in company-managed and team-managed software spaces (team-managed spaces require manual configuration).
 
+Every work item of a space's prompt work type is a prompt, so use a work type only for prompts, such as **Prompt**. Jira's built-in work types, such as Story, Task or Bug, aren't offered and are refused; a space set up with one before stops until an administrator chooses a dedicated type. Types are recognized by name: a built-in type that was renamed is accepted, and a type of your own named like a built-in one, such as Feature, is refused.
+
 Jira doesn't let apps change a team-managed space's settings, so a space admin adds the Agent Prompts field to the space and to the layouts of the work types that use prompts, and creates the prompt work type, in **Space settings**. A Jira administrator then chooses that work type in **Configure**, and the space's details show which work types have the field.
 
 For installation, configuration, usage and troubleshooting, see the [website documentation](https://srcplugins.com/plugins/atlassian/agent-prompts-for-jira/).

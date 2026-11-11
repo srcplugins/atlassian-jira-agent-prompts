@@ -105,7 +105,7 @@ test('duplicate advance calls cannot create two types; stale calls and other pag
     f.api.advance('admin', r.data.id, r.revision),
     f.api.advance('admin', r.data.id, r.revision),
   ]);
-  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
   assert.equal(f.writes.filter((x) => x === 'create').length, 1);
   await assert.rejects(f.api.advance('admin', r.data.id, r.revision), /changed/);
 });
@@ -602,7 +602,7 @@ test('a run without room to record a step’s outcome stops and never stays runn
     Array.from({ length: n }, (_, i) => ({
       projectId: String(1000 + i),
       fingerprint: 'a'.repeat(64),
-      screenTypes: Array.from({ length: 50 }, (_, t) => String(100_000_000_000 + t)),
+      screenTypes: Array.from({ length: 50 }, (_slot, t) => String(100_000_000_000 + t)),
     }));
   const input = { name: 'Prompt', reloadAfterSave: 'keep' };
   assert.ok(bytes({ entries: entries(200) }) < batchLimit);
@@ -638,7 +638,7 @@ test('one space leaving a shared screen does not stop another space joining it i
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'complete', r.data.message);
   f.writes.length = 0;
-  // Space 1 deselects Task (leave: space 7 still relies on the field); space 2 selects it (join).
+  // Space 1 deselects Checklist (leave: space 7 still relies on the field); space 2 selects it (join).
   r = await f.start({ type: '5', allowSharedScreens: true }, ['1', '2'], { 1: [], 2: ['3'] });
   r = await f.api.advance('admin', r.data.id, r.revision);
   assert.equal(r.data.status, 'ready', r.data.message);
@@ -995,7 +995,7 @@ function teamSpaces(f, ids) {
       style: 'next-gen',
       issueTypes: [
         { id: `${id}0`, name: 'Prompt', subtask: false, hierarchyLevel: 0 },
-        { id: `${id}1`, name: 'Task', subtask: false, hierarchyLevel: 0 },
+        { id: `${id}1`, name: 'Checklist', subtask: false, hierarchyLevel: 0 },
       ],
     });
   const scheme = f.s.scheme;
@@ -1120,4 +1120,18 @@ test('a team-managed space whose saved entry names another type stops the run un
   );
   await refused(f, r, /changed after review/);
   assert.equal(f.configs.has('7'), false);
+});
+
+test('the catalog never offers Jira’s built-in work types for prompts', async () => {
+  const f = fixture();
+  f.types.push(
+    { id: '10', name: 'Story', subtask: false, hierarchyLevel: 0 },
+    { id: '11', name: '[System] Service request', subtask: false, hierarchyLevel: 0 },
+    { id: '12', name: 'improvement', subtask: false, hierarchyLevel: 0 },
+    { id: '13', name: 'Prompt', subtask: false, hierarchyLevel: 0 },
+  );
+  assert.deepEqual(
+    (await f.api.catalog()).types.map((t) => t.name),
+    ['Checklist', 'Prompt'],
+  );
 });

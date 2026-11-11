@@ -1191,7 +1191,8 @@ test('screen selection is validated against the space’s work types before any 
   await assert.rejects(f.settings.preview(c, { unlink: true, screenTypes: [] }), /Removing setup/);
 });
 
-/** A team-managed space: its own work types, the field on the Task layout only, and every port
+/** A team-managed space: its own work types (Task is a built-in one, Review and Prompt are the
+ * space's own), the field on the Task layout only, and every port
  * that would read or change schemes, global types or screens failing the test. */
 function teamFixture({ stored, fields, timeLeft = () => 20_000 } = {}) {
   let record = stored;
@@ -1206,7 +1207,7 @@ function teamFixture({ stored, fields, timeLeft = () => 20_000 } = {}) {
       { id: '10424', name: 'Epic', subtask: false, hierarchyLevel: 1 },
       { id: '10425', name: 'Subtask', subtask: true, hierarchyLevel: -1 },
       { id: '10426', name: 'Task', subtask: false, hierarchyLevel: 0 },
-      { id: '10427', name: 'Story', subtask: false, hierarchyLevel: 0 },
+      { id: '10427', name: 'Review', subtask: false, hierarchyLevel: 0 },
       { id: '10430', name: 'Prompt', subtask: false, hierarchyLevel: 0 },
     ],
   };
@@ -1343,14 +1344,14 @@ test('team-managed health lists where the field is placed and reads only create 
       ['Agent Prompts on layouts', true],
     ],
   );
-  assert.equal(health.checks[3].detail, 'The field is on the layout of Task. It isn’t on Story.');
+  assert.equal(health.checks[3].detail, 'The field is on the layout of Task. It isn’t on Review.');
   assert.deepEqual(health.layouts, [
     { id: '10426', name: 'Task', present: true },
-    { id: '10427', name: 'Story', present: false },
+    { id: '10427', name: 'Review', present: false },
   ]);
   assert.deepEqual(
     health.types.map((t) => t.name),
-    ['Task', 'Story', 'Prompt'],
+    ['Task', 'Review', 'Prompt'],
   );
   // One create metadata read per standard work type, the prompt type's shared by both checks.
   assert.deepEqual(f.reads.sort(), ['10426', '10427', '10430']);
@@ -1376,8 +1377,8 @@ test('team-managed health lists where the field is placed and reads only create 
   );
   assert.doesNotMatch(byLabel['Agent Prompts on layouts'].detail, /on no work type’s layout/);
   assert.match(byLabel['Agent Prompts on layouts'].detail, /It isn’t on Task\./);
-  assert.match(byLabel['Agent Prompts on layouts'].detail, /Story could not be checked/);
-  assert.deepEqual(health.layouts[1], { id: '10427', name: 'Story' });
+  assert.match(byLabel['Agent Prompts on layouts'].detail, /Review could not be checked/);
+  assert.deepEqual(health.layouts[1], { id: '10427', name: 'Review' });
 
   // Every read failed: nothing was checked, so nothing is reported as missing.
   f = teamFixture({
@@ -1391,7 +1392,7 @@ test('team-managed health lists where the field is placed and reads only create 
   assert.equal(layoutsCheck.ok, false);
   assert.equal(
     layoutsCheck.detail,
-    'No work type’s layout could be checked. Task, Story could not be checked. Check the Create work items permission in this space.',
+    'No work type’s layout could be checked. Task, Review could not be checked. Check the Create work items permission in this space.',
   );
 
   // Not set up yet, or its type deleted: every standard type is listed and the type check fails.
@@ -1405,7 +1406,7 @@ test('team-managed health lists where the field is placed and reads only create 
     assert.match(health.checks[0].detail, pattern);
     assert.deepEqual(
       health.layouts.map((l) => l.name),
-      ['Task', 'Story', 'Prompt'],
+      ['Task', 'Review', 'Prompt'],
     );
   }
 });
@@ -1413,9 +1414,9 @@ test('the Work types step offers a team-managed space its own standard work type
   const f = teamFixture({ stored: { revision: 1, data: { type: '10430' } } });
   assert.deepEqual(await f.settings.options(c), {
     teamManaged: true,
+    // Task is one of Jira's built-in work types, so it isn't offered.
     promptTypes: [
-      { id: '10426', name: 'Task' },
-      { id: '10427', name: 'Story' },
+      { id: '10427', name: 'Review' },
       { id: '10430', name: 'Prompt' },
     ],
     type: '10430',
@@ -1461,4 +1462,90 @@ test('team-managed health stops starting layout reads when ten seconds of the re
   // A layout not read in time is not known, never counted as missing the field.
   assert.equal(health.layouts.filter((l) => 'present' in l).length, 5);
   assert.equal(health.layouts.length, 49);
+});
+
+const builtInRefusal =
+  /^Error: Choose or create a work type only for prompts, such as Prompt\. Jira’s built-in work types like Story or Task are already used for other work\.$/;
+const builtInNotApplied = new RegExp(
+  `${builtInRefusal.source.slice(0, -1)} Nothing was changed\\.$`,
+);
+test('Jira’s built-in work types are refused as a prompt type, by name, case and [System] prefix', async () => {
+  for (const name of ['Story', 'TASK', ' bug ', '[System] Incident', '[SYSTEM] Service request']) {
+    const f = fixture();
+    f.types[1].name = name;
+    f.project.issueTypes[1].name = name;
+    await assert.rejects(f.settings.preview(c, { type: '4' }), builtInRefusal, name);
+    // A reviewed choice of the same type is refused too, even if the request skips the review.
+    await assert.rejects(f.settings.apply(c, { type: '4', fingerprint: 'x' }), builtInNotApplied);
+    assert.deepEqual(f.writes, []);
+  }
+  // Names that only look like one are the administrator's own types.
+  for (const name of ['Prompt', 'Stories', 'Task list', 'System Story']) {
+    const f = fixture();
+    f.types[1].name = name;
+    f.project.issueTypes[1].name = name;
+    assert.equal((await f.settings.preview(c, { type: '4' })).typeName, name);
+  }
+});
+test('a new prompt type can’t take a built-in name, even one the site doesn’t have', async () => {
+  for (const name of [
+    'Story',
+    'incident',
+    'Post-incident review',
+    'New Feature',
+    'feature',
+    '[System] Idea',
+  ]) {
+    const f = fixture();
+    await assert.rejects(f.settings.preview(c, { name }), builtInRefusal, name);
+    await assert.rejects(f.settings.apply(c, { name, fingerprint: 'x' }), builtInNotApplied);
+    assert.deepEqual(f.writes, []);
+  }
+  const f = fixture();
+  assert.equal((await f.settings.preview(c, { name: 'Prompt' })).typeName, 'Prompt');
+});
+test('a space set up with a built-in work type needs attention, and its setup can still be removed', async () => {
+  const f = fixture();
+  f.types[0].name = 'Story';
+  f.project.issueTypes[0].name = 'Story';
+  const health = await f.settings.health(c);
+  assert.equal(health.checks[0].ok, false);
+  assert.equal(
+    health.checks[0].detail,
+    'Story is one of Jira’s built-in work types, so Agent Prompts is stopped in this space. Use Reconfigure space to choose or create a work type only for prompts.',
+  );
+  // The saved type is still named, so the health view can say which one it is.
+  assert.equal(health.selected.name, 'Story');
+  const removal = await f.settings.preview(c, { unlink: true });
+  await f.settings.apply(c, { unlink: true, fingerprint: removal.fingerprint });
+  assert.deepEqual(f.state().data, { previousTypes: ['3'] });
+  // Choosing a dedicated type replaces it.
+  const g = fixture();
+  g.types[0].name = 'Story';
+  g.project.issueTypes[0].name = 'Story';
+  const plan = await g.settings.preview(c, { type: '4' });
+  await g.settings.apply(c, { type: '4', fingerprint: plan.fingerprint });
+  assert.deepEqual(g.state().data, { type: '4', previousTypes: ['3'] });
+});
+test('a team-managed space is offered and accepts only its own non-built-in types', async () => {
+  const f = teamFixture({ stored: { revision: 1, data: { type: '10426' } } });
+  assert.deepEqual(await f.settings.options(c), {
+    teamManaged: true,
+    promptTypes: [
+      { id: '10427', name: 'Review' },
+      { id: '10430', name: 'Prompt' },
+    ],
+    type: '10426',
+    builtIn: 'Task',
+  });
+  await assert.rejects(
+    f.settings.preview(c, { type: '10426', reloadAfterSave: 'keep' }),
+    builtInRefusal,
+  );
+  const health = await f.settings.health(c);
+  assert.equal(health.checks[0].ok, false);
+  assert.match(health.checks[0].detail, /^Task is one of Jira’s built-in work types/);
+  const removal = await f.settings.preview(c, { unlink: true });
+  await f.settings.apply(c, { unlink: true, fingerprint: removal.fingerprint });
+  assert.deepEqual(f.state().data, { previousTypes: ['10426'] });
 });

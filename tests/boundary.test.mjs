@@ -237,7 +237,12 @@ test('Rovo trusts the hosted principal, ignores payload identity and returns bou
   );
   assert.equal(denied.calls.length, 0);
   // With a principal, identity fields in the payload change nothing: every call is still asUser.
-  const injected = sdk({ body: project }, { body: { issues: [], isLast: true } });
+  // Rovo reads the space by its key, then the service reads it by ID for the prompt type's name.
+  const injected = sdk(
+    { body: project },
+    { body: project },
+    { body: { issues: [], isLast: true } },
+  );
   injected.kvs.entity = () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) });
   const ignored = await registerRovo(injected)(
     { projectKey: 'TEST', query: 'x', accountId: 'injected', context: { accountId: 'injected' } },
@@ -269,6 +274,7 @@ test('Rovo trusts the hosted principal, ignores payload identity and returns bou
   // Jira keys are case-insensitive: a key typed in lower case reads the same prompt.
   const lower = sdk(
     { body: project },
+    { body: project },
     {
       expect: { path: /^\/rest\/api\/3\/issue\/TEST-2\?/ },
       body: {
@@ -296,6 +302,7 @@ test('Rovo trusts the hosted principal, ignores payload identity and returns bou
   assert.equal(read.ok, true, read.error);
   assert.equal(read.value.key, 'TEST-2');
   const s = sdk(
+    { body: project },
     { body: project },
     {
       body: {
@@ -795,7 +802,9 @@ test('search text cannot inject JQL and invalid handler payloads never access Ji
   );
   // Boundaries: 200 characters and an 8,192-character cursor are accepted.
   const accepted = sdk(
+    { body: project },
     { body: { issues: [], isLast: true } },
+    { body: project },
     { body: { issues: [], isLast: true } },
   );
   const kvs = { entity: () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) }) };
@@ -821,7 +830,7 @@ test('search text cannot inject JQL and invalid handler payloads never access Ji
 test('discovery follows cursors through every page without increasing any request size', async () => {
   const pages = Array.from({ length: 7 }, (_, page) => ({
     body: {
-      issues: Array.from({ length: 20 }, (_, i) => ({
+      issues: Array.from({ length: 20 }, (_slot, i) => ({
         id: String(1 + page * 20 + i),
         key: `TEST-${1 + page * 20 + i}`,
         fields: { summary: 'Prompt', project: { id: '1' }, issuetype: { id: '3' } },
@@ -840,7 +849,7 @@ test('discovery follows cursors through every page without increasing any reques
       limit: 20,
       ...(cursor ? { cursor } : {}),
     });
-    ids.push(...page.prompts.map((p) => p.id));
+    ids.push(...page.prompts.map((prompt) => prompt.id));
     cursor = page.nextCursor;
   } while (cursor);
   assert.equal(ids.length, 140);
@@ -988,6 +997,7 @@ test('Rovo search returns at most twenty matches and reports more', async () => 
   const s = {
     ...sdk(
       { body: { ...project, id: '1' } },
+      { body: project },
       { body: { issues, isLast: false, nextPageToken: 'next' } },
     ),
     kvs: { entity: () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) }) },
@@ -999,7 +1009,7 @@ test('Rovo search returns at most twenty matches and reports more', async () => 
   assert.equal(result.ok, true);
   assert.equal(result.value.prompts.length, 20);
   assert.equal(result.value.incomplete, true);
-  assert.equal(JSON.parse(s.calls[1].body).maxResults, 20);
+  assert.equal(JSON.parse(s.calls[2].body).maxResults, 20);
 });
 
 test('Rovo searches a team-managed space by its own configured work type', async () => {
@@ -1007,6 +1017,7 @@ test('Rovo searches a team-managed space by its own configured work type', async
   const s = {
     ...sdk(
       { body: { ...project, id: '1', style: 'next-gen' } },
+      { body: { ...project, style: 'next-gen' } },
       {
         body: {
           issues: [
@@ -1032,15 +1043,41 @@ test('Rovo searches a team-managed space by its own configured work type', async
     ['TEST-100'],
   );
   assert.match(
-    JSON.parse(s.calls[1].body).jql,
+    JSON.parse(s.calls[2].body).jql,
     /^project = 1 AND issuetype = 10430 AND statusCategory != Done ORDER BY/,
   );
-  assert.equal(s.calls.length, 2);
+  assert.equal(s.calls.length, 3);
+});
+
+test('Rovo refuses a space set up with a built-in work type, before reading any prompt’s instructions', async () => {
+  const { registerRovo } = await import('../src/integration.ts');
+  const story = { ...project, issueTypes: [{ id: '3', name: 'Story', subtask: false }] };
+  for (const payload of [
+    { projectKey: 'TEST', query: 'x' },
+    { projectKey: 'TEST', query: '', promptKey: 'TEST-2' },
+  ]) {
+    // A search (titles only) is sent alongside the space read so the picker waits one round, and
+    // its result is discarded; a read by key waits for the space read and reads no work item.
+    const s = sdk(
+      { body: project },
+      { body: story },
+      ...(payload.promptKey ? [] : [{ body: { issues: [], isLast: true } }]),
+    );
+    s.kvs.entity = () => ({ get: async () => ({ revision: 1, data: { type: '3' } }) });
+    const result = await registerRovo(s)(payload, { principal: { accountId: 'actor' } });
+    assert.deepEqual(result, {
+      ok: false,
+      error:
+        'Agent Prompts isn’t set up for this space: its prompt type is one of Jira’s built-in work types. Ask a Jira administrator to choose a dedicated prompt type.',
+    });
+    s.assertDrained();
+  }
 });
 
 test('Rovo still reads a retired prompt by its exact key', async () => {
   const { registerRovo } = await import('../src/integration.ts');
   const s = sdk(
+    { body: project },
     { body: project },
     {
       expect: { path: /^\/rest\/api\/3\/issue\/TEST-2\?fields=.*%2Cstatus%2Csecurity$/ },

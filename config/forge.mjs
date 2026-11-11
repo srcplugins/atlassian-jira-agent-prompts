@@ -48,22 +48,21 @@ if (
 )
   throw Error('This app is already registered. Never register an existing app again.');
 
-// Environment first; locally the test framework's configuration may name a Keychain item.
-let email = process.env.FORGE_EMAIL || process.env.JIRA_EMAIL;
-let token = process.env.FORGE_API_TOKEN || process.env.JIRA_API_KEY;
+// ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN name the account, and no other variable is read.
+// Locally the test framework's configuration may store the same values (an email, a keyring item).
+let { ATLASSIAN_EMAIL: email, ATLASSIAN_API_TOKEN: token } = process.env;
 if (!email || !token) {
   try {
     const { atlassianCredentials } =
       await import('@srcplugins/atlassian-forge-test-framework/core');
-    const credentials = atlassianCredentials();
-    email ||= credentials.forgeEmail;
-    token ||= credentials.forgeToken;
+    ({ email, token } = atlassianCredentials());
   } catch {
     // No framework configuration: only the environment applies.
   }
 }
-if (!email || !token) {
-  console.error('Set FORGE_EMAIL and FORGE_API_TOKEN (or JIRA_EMAIL and JIRA_API_KEY).');
+const missing = [!email && 'ATLASSIAN_EMAIL', !token && 'ATLASSIAN_API_TOKEN'].filter(Boolean);
+if (missing.length) {
+  console.error(`Set ${missing.join(' and ')}.`);
   process.exit(1);
 }
 if (['build', 'deploy', 'lint', 'tunnel'].includes(command)) {
@@ -76,6 +75,7 @@ if (['build', 'deploy', 'lint', 'tunnel'].includes(command)) {
 const result = spawnSync(`${root}/node_modules/.bin/forge`, args.length ? args : ['--help'], {
   cwd: root,
   stdio: 'inherit',
+  // The Forge CLI reads these names; they are set here and never read.
   env: { ...process.env, FORGE_EMAIL: email, FORGE_API_TOKEN: token },
 });
 if (result.error) console.error(result.error.message);

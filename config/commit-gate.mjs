@@ -189,8 +189,8 @@ export function runSuite(cwd, args, command = ['npx', 'forge-test', 'suite']) {
  * amend) is dropped first, so only a current match carries one. Comment lines (an editor's) stay
  * last.
  */
-export function withLocalSuite(message, { branch, tree, recorded }) {
-  const lines = message.split('\n');
+export function withLocalSuite(original, { branch, tree, recorded }) {
+  const lines = original.split('\n');
   const comments = lines.findIndex((line) => line.startsWith('#'));
   const body = comments < 0 ? lines : lines.slice(0, comments);
   const tail = comments < 0 ? [] : lines.slice(comments);
@@ -203,7 +203,7 @@ export function withLocalSuite(message, { branch, tree, recorded }) {
     covering.includes(recorded?.suite) &&
     text !== '' &&
     !/^Hosted:/m.test(text);
-  if (!matches) return kept.length === body.length ? message : [...kept, ...tail].join('\n');
+  if (!matches) return kept.length === body.length ? original : [...kept, ...tail].join('\n');
   const paragraphs = text.split(/\n\s*\n/);
   // Join an existing trailer block (a last paragraph of "Token: value" lines after the subject).
   const block =

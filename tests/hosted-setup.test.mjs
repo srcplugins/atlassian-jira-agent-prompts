@@ -38,10 +38,10 @@ test('setup runner cleanup tolerates its planned detach but creation requires at
 });
 
 test('multi-space cleanup allows only the complete journaled scheme scope', () => {
-  const scope = { type: '30', schemes: ['2', '3'], defaultScheme: '1', attached: true };
-  verifyTypeMappings(baseline, [...baseline, '2:30', '3:30'].sort(), scope);
-  assert.throws(() => verifyTypeMappings(baseline, [...baseline, '2:30'].sort(), scope));
+  const multiScope = { type: '30', schemes: ['2', '3'], defaultScheme: '1', attached: true };
+  verifyTypeMappings(baseline, [...baseline, '2:30', '3:30'].sort(), multiScope);
+  assert.throws(() => verifyTypeMappings(baseline, [...baseline, '2:30'].sort(), multiScope));
   assert.throws(() =>
-    verifyTypeMappings(baseline, [...baseline, '2:30', '3:30', '4:30'].sort(), scope),
+    verifyTypeMappings(baseline, [...baseline, '2:30', '3:30', '4:30'].sort(), multiScope),
   );
 });

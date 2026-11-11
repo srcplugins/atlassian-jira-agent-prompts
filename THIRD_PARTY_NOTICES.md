@@ -219,7 +219,7 @@ Production dependencies included in this app and its UI bundles.
 | memoize-one | 6.0.0 | MIT |
 | mime-db | 1.52.0 | MIT |
 | mime-types | 2.1.35 | MIT |
-| minimatch | 11.0.3 | BlueOak-1.0.0 |
+| minimatch | 11.0.4 | BlueOak-1.0.0 |
 | minipass | 7.1.3 | BlueOak-1.0.0 |
 | ms | 2.1.3 | MIT |
 | nth-check | 2.1.1 | BSD-2-Clause |

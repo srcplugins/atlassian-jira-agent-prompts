@@ -794,7 +794,7 @@ test('a second Apply or Next click delivered before the host re-renders is ignor
 });
 test('work types chosen per space put Agent Prompts on their screens, and shared screens need their own approval', async () => {
   const f = batchFixture();
-  // Spaces 1 and 2 share one Task screen; space 7 keeps its own.
+  // Spaces 1 and 2 share one Checklist screen; space 7 keeps its own.
   f.screens.use('1', '3', '*', '200');
   f.screens.use('2', '3', '*', '200');
   const v = ui(f);
@@ -804,9 +804,9 @@ test('work types chosen per space put Agent Prompts on their screens, and shared
   await v.click('Next');
   assert.match(v.text(), /Choose the work types that show the Agent Prompts field in each space/);
   // Choosing types clears the review, and the next review sends the choice.
-  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
-  v.change('Select', 'screen-types-2', [{ value: '3', label: 'Task' }]);
-  v.change('Select', 'screen-types-7', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Checklist' }]);
+  v.change('Select', 'screen-types-2', [{ value: '3', label: 'Checklist' }]);
+  v.change('Select', 'screen-types-7', [{ value: '3', label: 'Checklist' }]);
   await v.click('Review changes');
   assert.match(v.text(), /^Agent Prompts to Screen 200$/m);
   assert.match(v.text(), /^Agent Prompts to Screen 1007$/m);
@@ -834,7 +834,7 @@ test('removing setup reviews the screens the app added the field to and hides th
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
   await v.click('Next');
-  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Checklist' }]);
   await v.click('Review changes');
   await v.click('Apply changes');
   assert.ok(f.writes.includes('add 1001 customfield_1'));
@@ -851,13 +851,13 @@ test('removing setup reviews the screens the app added the field to and hides th
   assert.ok(f.writes.includes('remove 1001 customfield_1'));
   assert.equal(f.screens.records.has('1001'), false);
 });
-async function configureWithTask(f) {
+async function configureWithChecklist(f) {
   const v = ui(f, [f.projects.get('1')]);
   await v.mount();
   v.change('Select', 'configuration-mode', { value: 'create' });
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
   await v.click('Next');
-  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Checklist' }]);
   await v.click('Review changes');
   await v.click('Apply changes');
   assert.equal(f.state().data.status, 'complete');
@@ -865,8 +865,8 @@ async function configureWithTask(f) {
 const picker = (v, id) => v.nodes('Select').find((n) => n.props.inputId === `screen-types-${id}`);
 test('a space blocked by a screen still offers its work types, so another selection can unblock it', async () => {
   const f = batchFixture();
-  await configureWithTask(f);
-  // Task's edit screen in space 1 is moved in Jira to a screen whose impact can't be reviewed.
+  await configureWithChecklist(f);
+  // Checklist's edit screen in space 1 is moved in Jira to a screen whose impact can't be reviewed.
   f.screens.use('1', '3', 'edit', '300');
   f.screens.incomplete.add('300');
   const v = ui(f, [f.projects.get('1')]);
@@ -927,7 +927,7 @@ test('a review that returns after the selection changed is dropped', async () =>
   const select = picker(v, '1');
   // The picker change arrives before the disabled tree reaches the host.
   v.button('Review changes').props.onClick();
-  select.props.onChange([{ value: '3', label: 'Task' }]);
+  select.props.onChange([{ value: '3', label: 'Checklist' }]);
   await v.settle();
   assert.deepEqual(
     picker(v, '1').props.value.map((o) => o.value),
@@ -951,7 +951,7 @@ test('changing one space’s work types reviews only that space again', async ()
   assert.equal(previews().length, 3);
   assert.equal(v.hasButton('Apply changes'), true);
   await v.click('Back');
-  v.change('Select', 'screen-types-2', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-2', [{ value: '3', label: 'Checklist' }]);
   await v.click('Review changes');
   assert.equal(previews().length, 4);
   assert.deepEqual(previews()[3].payload.projectId, '2');
@@ -969,12 +969,12 @@ test('Apply to all reviews again only the spaces whose choice changed', async ()
   v.change('Textfield', 'configuration-name', { target: { value: 'Prompt' } });
   const previews = () => v.payloads.filter((c) => c.name === 'configuration-preview');
   await v.click('Next');
-  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'screen-types-1', [{ value: '3', label: 'Checklist' }]);
   await v.click('Review changes');
   assert.equal(previews().length, 3);
   await v.click('Back');
-  // Space 1 already has Task, so only spaces 2 and 7 change.
-  v.change('Select', 'bulk-types', [{ value: '3', label: 'Task' }]);
+  // Space 1 already has Checklist, so only spaces 2 and 7 change.
+  v.change('Select', 'bulk-types', [{ value: '3', label: 'Checklist' }]);
   await v.click('Apply to all');
   await v.click('Review changes');
   assert.equal(previews().length, 5);
@@ -1191,10 +1191,10 @@ test('Apply to all gives each space the chosen types it has, and the review grou
   const bulk = v.nodes('Select').find((n) => n.props.inputId === 'bulk-types');
   assert.deepEqual(
     [...bulk.props.options].map((o) => o.label),
-    ['Task', 'Bug'],
+    ['Checklist', 'Bug'],
   );
   v.change('Select', 'bulk-types', [
-    { value: '3', label: 'Task' },
+    { value: '3', label: 'Checklist' },
     { value: '4', label: 'Bug' },
   ]);
   await v.click('Apply to all');
@@ -1211,7 +1211,7 @@ test('Apply to all gives each space the chosen types it has, and the review grou
   await v.click('Review changes');
   assert.match(
     v.text(),
-    /^PR1 — Project 1\nPrompt type: Task → Prompt\nPrompt work type to Scheme 1/m,
+    /^PR1 — Project 1\nPrompt type: Checklist → Prompt\nPrompt work type to Scheme 1/m,
   );
   assert.deepEqual(
     v
@@ -1245,7 +1245,7 @@ test('Next reads each space’s work types once; Review reviews the spaces', asy
   await v.click('Next');
   assert.equal(count('configuration-options'), 3);
   assert.equal(count('configuration-preview'), 0);
-  v.change('Select', 'bulk-types', [{ value: '3', label: 'Task' }]);
+  v.change('Select', 'bulk-types', [{ value: '3', label: 'Checklist' }]);
   await v.click('Apply to all');
   await v.click('Back');
   await v.click('Next');
@@ -1311,7 +1311,7 @@ test('a space whose work types could not be read keeps the dialog on the first s
   assert.deepEqual(f.writes, []);
 });
 
-/** Makes `ids` team-managed spaces with their own Prompt and Task work types, and returns the
+/** Makes `ids` team-managed spaces with their own Prompt and Checklist work types, and returns the
  * selection the health view passes. */
 function teamManaged(f, ids) {
   for (const id of ids)
@@ -1319,7 +1319,7 @@ function teamManaged(f, ids) {
       style: 'next-gen',
       issueTypes: [
         { id: `${id}0`, name: 'Prompt', subtask: false, hierarchyLevel: 0 },
-        { id: `${id}1`, name: 'Task', subtask: false, hierarchyLevel: 0 },
+        { id: `${id}1`, name: 'Checklist', subtask: false, hierarchyLevel: 0 },
       ],
     });
   return [...f.projects.values()].map((p) => ({
@@ -1348,10 +1348,10 @@ test('team-managed spaces are configured on one screen, then confirmed and saved
     '70',
   );
   assert.equal(v.disabled('Review changes'), true);
-  v.change('Select', 'prompt-type-8', { value: '81', label: 'Task' });
+  v.change('Select', 'prompt-type-8', { value: '81', label: 'Checklist' });
   await v.click('Review changes');
   assert.match(v.text('Heading'), /Confirm changes/);
-  assert.match(v.text(), /Prompt type: Task/);
+  assert.match(v.text(), /Prompt type: Checklist/);
   assert.match(v.text(), /Nothing in these spaces’ Jira settings changes/);
   assert.deepEqual(
     v.payloads.find((p) => p.name === 'configuration-preview' && p.payload.projectId === '8')
@@ -1380,7 +1380,7 @@ test('a team-managed space changes its saved type, or removes setup behind its o
   const v = ui(f, selected);
   await v.mount();
   assert.equal(v.disabled('Review changes'), false);
-  v.change('Select', 'prompt-type-7', { value: '71', label: 'Task' });
+  v.change('Select', 'prompt-type-7', { value: '71', label: 'Checklist' });
   assert.match(v.text(), /Was: Prompt\./);
   await v.click('Remove setup…');
   assert.match(v.text('Heading'), /Remove setup\?/);
@@ -1396,7 +1396,7 @@ test('a team-managed space changes its saved type, or removes setup behind its o
   assert.equal(v.button('Review changes').props.autoFocus, true);
   await v.click('Review changes');
   assert.match(v.text('Heading'), /Confirm changes/);
-  assert.match(v.text(), /Prompt type: Prompt → Task/);
+  assert.match(v.text(), /Prompt type: Prompt → Checklist/);
   await v.click('Save changes');
   assert.deepEqual(f.configs.get('7').data, { type: '71', previousTypes: ['70'] });
   assert.deepEqual(f.writes, []);
@@ -1635,4 +1635,51 @@ test('a team-managed space still needing a type on another page is named', async
   await v.click('Previous spaces');
   assert.doesNotMatch(v.text(), /still needed/);
   assert.equal(v.disabled('Review changes'), false);
+});
+
+test('a team-managed space saved with a built-in type isn’t offered it again, and says why', async () => {
+  const f = batchFixture(['7']);
+  const selected = teamManaged(f, ['7']);
+  f.projects
+    .get('7')
+    .issueTypes.push({ id: '72', name: 'Story', subtask: false, hierarchyLevel: 0 });
+  f.configs.set('7', { revision: 1, data: { type: '72' } });
+  const v = ui(f, selected);
+  await v.mount();
+  const select = v.nodes('Select').find((n) => n.props.inputId === 'prompt-type-7');
+  assert.deepEqual(
+    select.props.options.map((o) => o.label),
+    ['Prompt', 'Checklist'],
+  );
+  assert.equal(select.props.value, null);
+  assert.match(
+    v.text(),
+    /Was: Story, one of Jira’s built-in work types, which can’t hold prompts\./,
+  );
+  v.change('Select', 'prompt-type-7', { value: '70', label: 'Prompt' });
+  await v.click('Review changes');
+  await v.click('Save changes');
+  assert.deepEqual(f.configs.get('7').data, { type: '70', previousTypes: ['72'] });
+});
+
+test('a team-managed space with only built-in types is told it has none that can hold prompts', async () => {
+  const f = batchFixture(['7']);
+  const selected = teamManaged(f, ['7']);
+  f.projects.get('7').issueTypes = [
+    { id: '72', name: 'Story', subtask: false, hierarchyLevel: 0 },
+    { id: '73', name: 'Task', subtask: false, hierarchyLevel: 0 },
+  ];
+  f.configs.set('7', { revision: 1, data: { type: '73' } });
+  const v = ui(f, selected);
+  await v.mount();
+  const select = v.nodes('Select').find((n) => n.props.inputId === 'prompt-type-7');
+  assert.equal(select.props.isDisabled, true);
+  // Story and Task are standard work types, so the space isn't said to have none.
+  assert.doesNotMatch(v.text(), /no standard work type/);
+  assert.match(
+    v.text(),
+    /Was: Task, one of Jira’s built-in work types, which can’t hold prompts\. This space has no work type that can hold prompts\. Create one only for prompts, such as Prompt, in Space settings → Work types, then reopen this dialog\./,
+  );
+  // Its setup can still be removed.
+  assert.ok(v.button('Remove setup…'));
 });

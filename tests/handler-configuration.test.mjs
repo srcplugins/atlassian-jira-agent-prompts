@@ -10,7 +10,7 @@ const FIELD = 'customfield_10001';
 const context = { accountId: 'admin', extension: {} };
 
 function jira() {
-  const task = { id: '10', name: 'Task', subtask: false, hierarchyLevel: 0 };
+  const task = { id: '10', name: 'Checklist', subtask: false, hierarchyLevel: 0 };
   const project = {
     id: '1',
     key: 'ONE',
@@ -20,10 +20,10 @@ function jira() {
     issueTypes: [task],
   };
   const types = [task];
-  // One screen (50) serves every work type and operation; screen 51 serves Task's edit and view.
+  // One screen (50) serves every work type and operation; screen 51 serves Checklist's edit and view.
   const screens = {
     50: { name: 'Default screen', tabs: { 60: ['summary', 'description'] } },
-    51: { name: 'Task screen', tabs: { 61: ['summary'], 62: [] } },
+    51: { name: 'Checklist screen', tabs: { 61: ['summary'], 62: [] } },
   };
   const screenSchemes = {
     40: { default: 50 },
@@ -302,7 +302,7 @@ test('configure, review, apply and finish through the resolvers creates one type
   const catalog = await h.call('configuration-catalog', {});
   assert.deepEqual(
     catalog.types.map((t) => t.name),
-    ['Task'],
+    ['Checklist'],
   );
   assert.equal('projects' in catalog, false);
   assert.deepEqual(h.site.reads, ['GET /rest/api/3/mypermissions', 'GET /rest/api/3/issuetype']);
@@ -310,7 +310,7 @@ test('configure, review, apply and finish through the resolvers creates one type
   // the space. No work type, scheme or screen reads.
   const optionReads = h.site.reads.length;
   const options = await h.call('configuration-options', { projectId: '1' });
-  assert.deepEqual(options, { availableTypes: [{ id: '10', name: 'Task' }], screenTypes: [] });
+  assert.deepEqual(options, { availableTypes: [{ id: '10', name: 'Checklist' }], screenTypes: [] });
   assert.deepEqual(h.site.reads.slice(optionReads), [
     'GET /rest/api/3/mypermissions',
     'GET /rest/api/3/mypermissions',
@@ -526,10 +526,10 @@ test('selected work types get the field on a shared screen with approval, and lo
   h.site.mapping.push({ issueTypeId: '10', screenSchemeId: '41' });
   const input = { name: 'Prompt', reloadAfterSave: 'keep', screenTypes: ['10'] };
   const preview = await h.call('configuration-preview', { projectId: '1', ...input });
-  assert.deepEqual(preview.availableTypes, [{ id: '10', name: 'Task' }]);
+  assert.deepEqual(preview.availableTypes, [{ id: '10', name: 'Checklist' }]);
   assert.deepEqual(
     preview.screens.changes.map((ch) => [ch.action, ch.screen, ch.tab, ch.impact.shared]),
-    [['add', { id: '51', name: 'Task screen' }, '61', true]],
+    [['add', { id: '51', name: 'Checklist screen' }, '61', true]],
   );
   assert.deepEqual(
     preview.screenProjects['51'].map((p) => p.key),
@@ -767,7 +767,7 @@ test('a reload preference checked just before a screen-only step claims the run 
   });
   const deferred = () => {
     let resolve;
-    return { promise: new Promise((r) => (resolve = r)), resolve };
+    return { promise: new Promise((settle) => (resolve = settle)), resolve };
   };
   const checked = deferred();
   const resume = deferred();
@@ -926,11 +926,8 @@ test('team-managed spaces are configured through the resolvers with three reads 
       const options = await h.call('configuration-options', { projectId: id });
       assert.deepEqual(options, {
         teamManaged: true,
-        promptTypes: [
-          { id: `${id}0`, name: 'Prompt' },
-          { id: `${id}1`, name: 'Task' },
-          { id: `${id}2`, name: 'Story' },
-        ],
+        // Task and Story are Jira's built-in work types, so only Prompt is offered.
+        promptTypes: [{ id: `${id}0`, name: 'Prompt' }],
       });
       const preview = await h.call('configuration-preview', {
         projectId: id,

@@ -31,6 +31,14 @@ export function manifestFindings(source, nodeMajor) {
   if (manifest.providers?.auth) failures.push('External authentication needs explicit review.');
   if (manifest.app?.runtime?.name !== `nodejs${nodeMajor}.x`)
     failures.push(`Runtime must be nodejs${nodeMajor}.x to match .nvmrc.`);
+  // A paid app lets Forge skip background work for unlicensed sites (Forge standards).
+  if (manifest.app?.licensing?.enabled === true)
+    for (const type of ['trigger', 'scheduledTrigger'])
+      for (const module of manifest.modules?.[type] ?? [])
+        if (module?.filter?.appIsLicensed !== true)
+          failures.push(
+            `${type} ${module?.key} must set filter.appIsLicensed: true in a paid app.`,
+          );
   return failures;
 }
 

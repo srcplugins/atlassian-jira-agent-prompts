@@ -92,7 +92,7 @@ function render(call, calls, props, ownRuns = []) {
     check(label, value) {
       // UI Kit associates a Label with its control through labelFor ↔ id (both host-prefixed).
       const id = v.nodes('Label').find((l) => l.props.children[0] === label)?.props.labelFor;
-      const c = v.nodes('Checkbox').find((c) => c.props.id === id);
+      const c = v.nodes('Checkbox').find((box) => box.props.id === id);
       assert.equal(c?.props['aria-labelledby'], undefined);
       assert.ok(c);
       c.props.onChange({ target: { checked: value } });

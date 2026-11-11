@@ -2,8 +2,10 @@
 
 User-facing changes in each released version of Agent Prompts for Jira.
 
-## 1.0.6 (unreleased)
+## 1.0.6
 
+- **Built-in work types aren't prompt types.** Every work item of a space's prompt type is a prompt, so Jira's built-in work types, such as Story, Task or Bug, are no longer offered or accepted as the prompt type. A space already set up with one shows **Needs attention** in Space configuration, and the field and the Rovo assistant say a Jira administrator needs to choose a dedicated prompt type; **Reconfigure space** fixes it, and removing setup still works.
+- **Prompt field messages.** On a prompt with no prompts saved, the field explains that a prompt can't use other prompts, instead of showing an error with **Try again**. An empty picker names the space's prompt work type and says to create one.
 - **Configuration progress.** After **Apply changes**, the progress shows only the new configuration. It no longer briefly shows an earlier configuration's spaces and results.
 - **Review at narrow widths.** The Add, Change, Remove and Keep labels on the Review step stay readable when the text beside them wraps.
 - **Keyboard and screen readers.** Check saved progress, Continue reviewed changes, Release abandoned configuration, Check outcome, Acknowledge resolution and the Preferences Save button show that they are working and keep keyboard focus, instead of being disabled while they run. A Check saved state that finds the save still unresolved, and errors loading the space list or saved progress, are announced.

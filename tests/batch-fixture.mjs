@@ -5,7 +5,8 @@ const { screenFixture } = await import('./screen-fixture.mjs');
 export function batchFixture(ids = ['1', '2', '7']) {
   let run;
   const configs = new Map();
-  const types = [{ id: '3', name: 'Task', subtask: false, hierarchyLevel: 0 }];
+  // A dedicated work type: Jira's built-in ones, like Task, are refused as prompt types.
+  const types = [{ id: '3', name: 'Checklist', subtask: false, hierarchyLevel: 0 }];
   const projects = new Map(
     ids.map((id) => [
       id,
@@ -92,20 +93,20 @@ export function batchFixture(ids = ['1', '2', '7']) {
   };
   /** `screenTypes` maps a space to the work types reviewed for its screens. Like Configure, a
    * configuration names a reload choice; keep unless the test chooses one. */
-  async function start(options = { name: 'Prompt' }, ids = ['1', '2'], screenTypes = {}) {
+  async function start(options = { name: 'Prompt' }, spaceIds = ['1', '2'], screenTypes = {}) {
     const input = options.unlink ? options : { reloadAfterSave: 'keep', ...options };
     const entries = [];
-    for (const projectId of ids) {
-      const types = screenTypes[projectId];
+    for (const projectId of spaceIds) {
+      const reviewedTypes = screenTypes[projectId];
       entries.push({
         projectId,
         fingerprint: (
           await api.preview('admin', projectId, {
             ...input,
-            ...(types ? { screenTypes: types } : {}),
+            ...(reviewedTypes ? { screenTypes: reviewedTypes } : {}),
           })
         ).fingerprint,
-        ...(types ? { screenTypes: types } : {}),
+        ...(reviewedTypes ? { screenTypes: reviewedTypes } : {}),
       });
     }
     return api.start('admin', input, entries, run?.revision ?? 0);
