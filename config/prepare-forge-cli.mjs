@@ -71,7 +71,7 @@ if (JSON.stringify(after.sort()) !== JSON.stringify(expected))
 const verify = path.join(work, 'verify');
 mkdirSync(verify);
 run('tar', ['-xzf', candidate, '-C', verify]);
-for (const entry of after.filter((entry) => !entry.endsWith('/'))) {
+for (const entry of after.filter((name) => !name.endsWith('/'))) {
   if (!readFileSync(path.join(work, entry)).equals(readFileSync(path.join(verify, entry))))
     throw Error(`Unexpected source change: ${entry}`);
 }

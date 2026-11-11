@@ -21,6 +21,8 @@ const notAppText = new Map([
   ["'1/5 selected · Unsaved changes'", 'computed selection count'],
   ['/^0\\/5 selected/', 'computed selection count'],
   ["'Owner only'", 'issue security level the access runner creates in Jira'],
+  ["'Description section'", 'Jira’s work item view'],
+  ["'Edit Description, edit'", 'Jira’s work item view'],
   ["'Configure 2 spaces'", 'computed button label'],
   ['/^Agent Prompts to /', 'review change line; the field name is computed'],
   ['/^Description to /', 'review change line; the field name is computed'],

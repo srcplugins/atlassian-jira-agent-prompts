@@ -255,8 +255,8 @@ export function setupCleanup({ j, api, persist, accepted = [] }) {
     }
     if (planned) await stepsCleanup();
     if (!j.type && j.typeIntent) {
-      const matches = (await api('/issuetype')).filter(
-        (x) => x.name === j.typeName || x.name === j.renamed,
+      const matches = (await api('/issuetype')).filter((x) =>
+        [j.typeName, j.renamed, j.builtInName].includes(x.name),
       );
       assert.equal(matches.length, 1, 'Type outcome is ambiguous; inspect without retry');
       j.type = matches[0];
@@ -266,7 +266,7 @@ export function setupCleanup({ j, api, persist, accepted = [] }) {
       const t = await api(`/issuetype/${j.type.id}`);
       if (t === null) assert.equal(j.typeDeleteIntent, true);
       else {
-        assert.ok([j.typeName, j.renamed].includes(t.name));
+        assert.ok([j.typeName, j.renamed, j.builtInName].includes(t.name));
         assert.equal(
           t.description,
           'Reusable instructions managed through Agent Prompts for Jira.',
@@ -321,6 +321,33 @@ export function setupCleanup({ j, api, persist, accepted = [] }) {
         await api(`/issuetypescheme/${f.scheme.id}`, 'DELETE');
         assert.equal((await pages(`/issuetypescheme?id=${f.scheme.id}`)).length, 0);
       }
+    }
+    // The run's own existing prompt type, once no scheme of the run holds it.
+    const e = j.existing;
+    if (e?.intent && !e.gone) {
+      if (!e.id) {
+        const matches = (await api('/issuetype')).filter((x) => x.name === e.name);
+        assert.ok(matches.length <= 1, 'Existing type outcome is ambiguous; inspect without retry');
+        e.id = matches[0] && String(matches[0].id);
+        persist();
+      }
+      const t = e.id && (await api(`/issuetype/${e.id}`));
+      if (t) {
+        assert.equal(t.name, e.name);
+        assert.equal(t.description, e.marker);
+        const found = await api('/search/jql', 'POST', {
+          jql: `issuetype = ${t.id}`,
+          fields: ['summary'],
+          maxResults: 1,
+        });
+        assert.equal(found.issues.length, 0);
+        e.deleteIntent = true;
+        persist();
+        await api(`/issuetype/${t.id}`, 'DELETE');
+        assert.equal(await api(`/issuetype/${t.id}`), null);
+      }
+      e.gone = true;
+      persist();
     }
     // The rest of what Jira created with the spaces stays after them.
     if (!j.leftovers) {

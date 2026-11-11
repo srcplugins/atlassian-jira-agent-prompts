@@ -85,8 +85,9 @@ export async function runIsolationProbe({
   await observeAction(page, 'setup', () => spaceSettings(page, project.key), target);
   assert.ok(!(await page.locator('body').innerText()).includes(foreign.sourceFields.summary));
   owned.run.check('Same space key on another tenant does not inherit configuration or source name');
-  const type = project.issueTypes.find((t) => !t.subtask && t.name === 'Story');
-  assert.ok(type);
+  // Jira's built-in work types are refused as the prompt type.
+  const type = project.issueTypes.find((t) => !t.subtask && t.name === 'Prompt');
+  assert.ok(type, 'The space must already have the Prompt type; never create a global type here');
   state.lifecycle.type = type;
   owned.run.persist();
   await configure(type);

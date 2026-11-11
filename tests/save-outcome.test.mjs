@@ -38,6 +38,11 @@ function fixture() {
     refreshAfterSave: async () => false,
     retainedTypes: async () => [],
     config: async () => '3',
+    // The space's prompt type, read for its name.
+    project: async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+    }),
     field: async () => FIELD,
     allowed: async (_project, permission) => {
       if (!f.allowed.has(permission)) throw Error(`denied ${permission}`);

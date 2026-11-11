@@ -111,6 +111,8 @@ const j =
           marker: setupRunSpace(id, n),
         })),
         typeName: `Setup ${id}`,
+        // An existing type only for prompts: Jira's built-in work types are refused.
+        existing: { name: `Existing ${id}`, marker: `Setup run ${id} existing type.` },
         stage: 'preflight',
         clean: false,
       };
@@ -297,6 +299,28 @@ try {
       persist();
       await emptyProject(f);
     }
+    // The run's own existing prompt type, in every space's own scheme before any is shared.
+    const made = j.existing;
+    stage('existing-type');
+    assert.ok(!(await api('/issuetype')).some((x) => x.name === made.name));
+    made.intent = true;
+    persist();
+    made.id = String(
+      (
+        await api('/issuetype', 'POST', {
+          name: made.name,
+          description: made.marker,
+          hierarchyLevel: 0,
+        })
+      ).id,
+    );
+    persist();
+    for (const f of j.fixtures) {
+      await emptyProject(f);
+      f.existingIntent = true;
+      persist();
+      await api(`/issuetypescheme/${f.scheme.id}/issuetype`, 'PUT', { issueTypeIds: [made.id] });
+    }
     const primary = j.fixtures[0];
     const original = await emptyProject(primary);
     if (j.shared) {
@@ -444,13 +468,13 @@ try {
     }
     const choose = (f, name) => chooseScreenTypes(page, f.key, name);
     const appField = async () => (await agentPromptsField(api, t)).id;
-    const task = original.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
-    assert.ok(task);
+    const dedicated = original.issueTypes.find((x) => String(x.id) === made.id);
+    assert.ok(dedicated);
     if (bulk) {
       j.field = await appField();
-      // Task is the prompt type; another work type with its own screens gets the field.
-      const own = await screenType(primary, original.issueTypes, task);
-      const second = await screenType(j.fixtures[1], original.issueTypes, task);
+      // The run's own type is the prompt type; another work type with its own screens gets the field.
+      const own = await screenType(primary, original.issueTypes, dedicated);
+      const second = await screenType(j.fixtures[1], original.issueTypes, dedicated);
       assert.equal(second.type.id, own.type.id);
       const kind = own.type;
       // Journaled before any write, so cleanup removes the field from all of them.
@@ -496,7 +520,7 @@ try {
         stage(`bulk-configure-${reload ? 'reload' : 'plain'}`);
         await openConfiguration();
         await dialog(primary.key.slice(0, -1));
-        await chooseExisting(task.name);
+        await chooseExisting(dedicated.name);
         const choice = `${reload ? 'On' : 'Off'} for all selected spaces`;
         const picker = page.getByRole('combobox', {
           name: 'Reload work item after saving prompts',
@@ -526,7 +550,7 @@ try {
         assert.equal(done.data.entries.length, 2);
         assert.deepEqual(done.data.screenEffects ?? [], []);
         for (const f of j.fixtures)
-          assert.deepEqual(await configured(f), { type: task.id, reload, screens: [kind.id] });
+          assert.deepEqual(await configured(f), { type: dedicated.id, reload, screens: [kind.id] });
         await ownFieldOn(true);
         for (const x of j.requiredRemoved) assert.ok(await fieldTab(x.screen, x.field), x.field);
         assert.deepEqual(known(await mappings()), j.mappingBaseline);
@@ -547,7 +571,11 @@ try {
       await expect(line('No changes')).toHaveCount(0);
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
       for (const f of j.fixtures)
-        assert.deepEqual(await configured(f), { type: task.id, reload: true, screens: [kind.id] });
+        assert.deepEqual(await configured(f), {
+          type: dedicated.id,
+          reload: true,
+          screens: [kind.id],
+        });
       await ownFieldOn(true);
       stage('bulk-remove-setup');
       await openConfiguration();
@@ -566,7 +594,7 @@ try {
       stage('bulk-reconfigure');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
-      await chooseExisting(task.name);
+      await chooseExisting(dedicated.name);
       await next();
       await review();
       // Removing setup cleared the work types, so reconfiguring changes no screen.
@@ -576,13 +604,13 @@ try {
       await apply();
       await finish();
       for (const f of j.fixtures)
-        assert.deepEqual(await configured(f), { type: task.id, reload: false, screens: [] });
+        assert.deepEqual(await configured(f), { type: dedicated.id, reload: false, screens: [] });
       await ownFieldOn(false);
       assert.deepEqual(known(await mappings()), j.mappingBaseline);
       stage('bulk-select-type');
       await openConfiguration();
       await dialog(primary.key);
-      await chooseExisting(task.name);
+      await chooseExisting(dedicated.name);
       await next();
       await choose(primary, kind.name);
       await review();
@@ -594,7 +622,7 @@ try {
       stage('bulk-deselect-type');
       await openConfiguration();
       await dialog(primary.key);
-      await chooseExisting(task.name);
+      await chooseExisting(dedicated.name);
       await next();
       // The picker starts on the saved selection, so emptying it notes what it was.
       await choose(primary);
@@ -642,7 +670,7 @@ try {
         assert.equal(now.length, 1);
         assert.equal(String(now[0].issueTypeScreenScheme.id), String(itss.id));
       }
-      const own = await screenType(primary, original.issueTypes, task);
+      const own = await screenType(primary, original.issueTypes, dedicated);
       for (const f of j.fixtures.slice(1))
         assert.deepEqual((await typeScreens(f, own.type.id)).sort(), [...own.screens].sort());
       const kind = own.type;
@@ -658,7 +686,7 @@ try {
       stage('shared-screens-configure');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
-      await chooseExisting(task.name);
+      await chooseExisting(dedicated.name);
       await next();
       for (const f of j.fixtures.slice(0, 2)) await choose(f, kind.name);
       await review();
@@ -685,7 +713,7 @@ try {
       stage('shared-screens-deselect');
       await openConfiguration();
       await dialog(primary.key);
-      await chooseExisting(task.name);
+      await chooseExisting(dedicated.name);
       await next();
       await choose(primary);
       await review();
@@ -900,18 +928,18 @@ try {
             response
               .json()
               .then(find)
-              .then((r) => {
-                const d = r?.value?.data;
+              .then((outcome) => {
+                const d = outcome?.value?.data;
                 const e = d?.entries?.[0];
                 seen.push(
-                  r?.ok
+                  outcome?.ok
                     ? {
                         status: d.status,
                         applied: e.applied,
                         remaining: e.remaining?.length,
                         message: e.message,
                       }
-                    : { error: r?.error ?? 'unreadable' },
+                    : { error: outcome?.error ?? 'unreadable' },
                 );
               }),
           );
@@ -961,7 +989,7 @@ try {
       stage('steps-configure');
       await openConfiguration();
       await dialog(primary.key);
-      await chooseExisting(task.name);
+      await chooseExisting(dedicated.name);
       await next();
       for (const x of s.types) await choose(primary, x.name);
       const reviewed = Date.now();
@@ -990,7 +1018,7 @@ try {
       );
       for (const screen of j.screens) assert.ok(await fieldTab(screen), `Field on ${screen}`);
       const health = await openConfiguration();
-      assert.equal(health.state.data.type, task.id);
+      assert.equal(health.state.data.type, dedicated.id);
       assert.deepEqual([...health.state.data.screenTypes].sort(), s.types.map((x) => x.id).sort());
       assert.equal(
         health.checks.find((c) => c.label === 'Agent Prompts on screens')?.ok,
@@ -1097,12 +1125,10 @@ try {
       j.passed = true;
       persist();
     } else if (abandoned) {
-      const existing = original.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
-      assert.ok(existing);
       stage('abandoned-start');
       await openConfiguration();
       await dialog(primary.key.slice(0, -1));
-      await chooseExisting(existing.name);
+      await chooseExisting(dedicated.name);
       await reviewConfiguration(page, t);
       // Admin A walks away after the first space: the second step never reaches the app.
       const pattern = '**/gateway/api/graphql/**';
@@ -1182,7 +1208,7 @@ try {
         await b.getByRole('checkbox', { name: `Select ${j.fixtures[1].key}`, exact: true }).click();
         await b.getByRole('button', { name: 'Configure selected', exact: true }).click();
         await b.getByRole('combobox', { name: 'Existing type', exact: true }).click();
-        await b.getByRole('option', { name: existing.name, exact: true }).click();
+        await b.getByRole('option', { name: dedicated.name, exact: true }).click();
         await nextStep(b);
         await reviewStep(b);
         await b.getByRole('button', { name: 'Apply changes', exact: true }).click();
@@ -1197,7 +1223,7 @@ try {
       page = reviewer;
       for (const f of j.fixtures) {
         const health = await openConfiguration(f);
-        assert.equal(health.state.data.type, existing.id);
+        assert.equal(health.state.data.type, dedicated.id);
       }
       assert.deepEqual(known(await mappings()), j.mappingBaseline);
       j.abandonedVerified = { firstByOwner: true, releasedBySecond: true, secondCompleted: true };
@@ -1320,6 +1346,38 @@ try {
       health = await openConfiguration();
       assert.equal(health.selected.name, j.renamed);
       assert.equal(health.state.data.type, j.type.id);
+      // Renamed to one of Jira's built-in names the site doesn't use, the configured type makes
+      // the space need attention; Configure no longer offers it, and setup can still be removed.
+      stage('built-in-name');
+      const taken = new Set((await api('/issuetype')).map((x) => x.name.toLowerCase()));
+      j.builtInName = [
+        'Post-incident review',
+        'Emailed request',
+        'IT help',
+        'Idea',
+        'Feature',
+      ].find((name) => !taken.has(name.toLowerCase()));
+      assert.ok(j.builtInName, 'Every candidate built-in name is in use on the site');
+      persist();
+      await api(`/issuetype/${j.type.id}`, 'PUT', { name: j.builtInName });
+      health = await openConfiguration();
+      assert.equal(health.state.data.type, j.type.id);
+      assert.equal(health.checks[0].ok, false);
+      assert.match(health.checks[0].detail, /is one of Jira’s built-in work types/);
+      await dialog(primary.key);
+      await page.getByRole('combobox', { name: 'Existing type', exact: true }).click();
+      await expect(page.getByRole('option', { name: j.renamed, exact: true })).toHaveCount(0);
+      await expect(page.getByRole('option', { name: j.builtInName, exact: true })).toHaveCount(0);
+      await page.keyboard.press('Escape');
+      await chooseMode('Remove setup from selected spaces');
+      await review();
+      await expect(line('App setup and preferences')).toHaveCount(1);
+      await expect(page.getByRole('button', { name: 'Apply changes', exact: true })).toBeEnabled();
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await api(`/issuetype/${j.type.id}`, 'PUT', { name: j.renamed });
+      health = await openConfiguration();
+      assert.equal(health.selected.name, j.renamed);
+      assert.equal(health.checks[0].ok, true);
       stage('repair');
       for (const f of j.shared ? j.fixtures : [primary]) await emptyProject(f);
       j.detachIntent = true;
@@ -1332,13 +1390,11 @@ try {
       assert.equal(repair.attach, true);
       assert.deepEqual(known(await mappings()), j.createdMappings);
       stage('replace');
-      const replacement = original.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
-      assert.ok(replacement);
       await openConfiguration();
-      const change = await applyExisting(replacement.name);
+      const change = await applyExisting(dedicated.name);
       assert.equal(change.old, j.type.id);
       health = await openConfiguration();
-      assert.equal(health.state.data.type, replacement.id);
+      assert.equal(health.state.data.type, dedicated.id);
       assert.ok(health.state.data.previousTypes.includes(j.type.id));
       await emptyProject(primary);
       j.passed = true;
@@ -1354,8 +1410,8 @@ try {
     error instanceof Error ? error.stack : 'Unknown failure',
     { mode: 0o600 },
   );
-  const pages = browser?.contexts().flatMap((context) => context.pages()) ?? [];
-  for (const [index, page] of pages.entries())
+  const openPages = browser?.contexts().flatMap((context) => context.pages()) ?? [];
+  for (const [index, page] of openPages.entries())
     await page
       .screenshot({ path: `${directory}/${id}-failure-${index}.png`, fullPage: true })
       .catch(() => {});

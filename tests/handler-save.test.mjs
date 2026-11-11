@@ -85,6 +85,11 @@ function store() {
 }
 
 const get = (path, body) => ({ expect: { method: 'GET', path }, body });
+// The space, read for its prompt type's name before the field.
+const space = get('/rest/api/3/project/1', {
+  id: '1',
+  issueTypes: [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+});
 const fieldList = get('/rest/api/3/field', [{ id: FIELD, schema: { custom: 'exact-field' } }]);
 const fields = 'project%2Cissuetype%2Csummary%2Cdescription%2Cupdated%2Cstatus%2Csecurity';
 const target = (description, keys) =>
@@ -112,6 +117,7 @@ function harness(...responses) {
 
 // The read half of the protocol, through the real load resolver.
 const loadResponses = () => [
+  space,
   fieldList,
   target(original, []),
   {
@@ -125,6 +131,7 @@ const permission = get('/rest/api/3/mypermissions?projectId=1&issueId=10&permiss
 // A save reads the work item, checks Edit, reads each prompt, then reads the work item again and
 // writes over that.
 const saveReads = (description, keys, sources) => [
+  space,
   fieldList,
   target(description, keys),
   permission,
@@ -369,6 +376,7 @@ test('a linked prompt the user may not see stops Sync with a permission message 
   });
   // The save stops before it reads the work item a second time.
   const h = harness(
+    space,
     fieldList,
     target(saved, ['TEST-20', 'TEST-21']),
     permission,
@@ -455,7 +463,7 @@ test('save input outside the contract is refused before any Jira or storage acce
     assert.equal(h.kv.conditions.length, 0);
   }
   // Five distinct prompts is within the limit: unlike six, it passes validation and reaches Jira
-  // (the harness has no field to read, so the save then fails for another reason).
+  // (the harness has no space to read, so the save then fails for another reason).
   const six = await harness().resolvers.save({
     context,
     payload: { ids: ['1', '2', '3', '4', '5', '6'], revision: 0 },
@@ -467,5 +475,5 @@ test('save input outside the contract is refused before any Jira or storage acce
   });
   assert.equal(result.ok, false);
   assert.notEqual(result.error, six.error);
-  assert.equal(five.contract.calls[0].path, '/rest/api/3/field');
+  assert.equal(five.contract.calls[0].path, '/rest/api/3/project/1');
 });

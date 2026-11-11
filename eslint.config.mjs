@@ -13,8 +13,12 @@ export default defineConfig([
     files: ['**/*.{js,mjs,cjs,ts,tsx}'],
     extends: [js.configs.recommended, comments.recommended],
     linterOptions: { reportUnusedDisableDirectives: 'error', reportUnusedInlineConfigs: 'error' },
-    // Every lint exception must state its reason next to the code it exempts.
-    rules: { '@eslint-community/eslint-comments/require-description': 'error' },
+    rules: {
+      // Every lint exception must state its reason next to the code it exempts.
+      '@eslint-community/eslint-comments/require-description': 'error',
+      // A local name that hides an outer one sent a hosted journey's helper call to itself.
+      'no-shadow': 'error',
+    },
   },
   {
     files: ['**/*.{mjs,cjs}', 'src/index.ts'],

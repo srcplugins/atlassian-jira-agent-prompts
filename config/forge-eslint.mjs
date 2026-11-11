@@ -126,6 +126,11 @@ export function forgeConfig({
       ...config,
       files: [`${base}**/*.{ts,tsx}`],
     })),
+    {
+      // The TypeScript version knows types and values live apart, which the core rule doesn't.
+      files: [`${base}**/*.{ts,tsx}`],
+      rules: { 'no-shadow': 'off', '@typescript-eslint/no-shadow': 'error' },
+    },
     { files: [...tsx, `${base}**/ui/*.js`], languageOptions: { globals: globals.browser } },
     // Scanner fixtures model Forge functions, which run on the Node runtime.
     ...(nodeFixtures.length

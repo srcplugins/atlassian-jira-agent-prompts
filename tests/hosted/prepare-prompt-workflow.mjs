@@ -129,10 +129,10 @@ try {
     if (existing[0]) assert.equal(existing[0].statusCategory, 'DONE', 'Prompt retired is not Done');
     const retired = existing[0]?.id ?? randomUUID();
     const available = before.workflow.statuses[0].statusReference;
-    const transition = (id, name, from, to) => ({
+    const transition = (id, transitionName, from, to) => ({
       id,
       type: 'DIRECTED',
-      name,
+      name: transitionName,
       description: '',
       toStatusReference: to,
       links: [{ fromStatusReference: from }],
@@ -143,13 +143,15 @@ try {
     });
     const payload = {
       statuses: [
-        ...before.statuses.map(({ id, name, statusCategory, statusReference, description }) => ({
-          id,
-          name,
-          statusCategory,
-          statusReference,
-          description,
-        })),
+        ...before.statuses.map(
+          ({ id, name: statusName, statusCategory, statusReference, description }) => ({
+            id,
+            name: statusName,
+            statusCategory,
+            statusReference,
+            description,
+          }),
+        ),
         {
           ...(existing[0] ? { id: retired } : {}),
           name: RETIRED,

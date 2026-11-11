@@ -1,6 +1,6 @@
 {
   "name": "@srcplugins/atlassian-jira-agent-prompts",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "description": "Agent Prompts for Jira: reusable coding-agent prompts as Jira work items, copied into the work items that use them.",
   "license": "SEE LICENSE IN LICENSE.md",
@@ -39,7 +39,7 @@
     "@eslint/js": "10.0.1",
     "@forge/cli": "file:.local/toolchain/forge-cli-14.0.0.tgz",
     "@playwright/test": "1.63.0",
-    "@srcplugins/atlassian-forge-test-framework": "github:srcplugins/atlassian-forge-test-framework#552279d8a716cbffd0921bedbc7b70c6467d49ba",
+    "@srcplugins/atlassian-forge-test-framework": "github:srcplugins/atlassian-forge-test-framework#beea703938494d893b79a1eeadbd112ce4e25243",
     "@types/node": "24.19.0",
     "@types/react": "18.3.31",
     "@types/react-dom": "18.3.7",
@@ -72,10 +72,9 @@
       "http-proxy-middleware@^2": "2.0.10",
       "launch-editor": "2.14.2",
       "lodash": "4.18.1",
-      "minimatch@^3": "3.1.4",
       "path-to-regexp@^0.1": "0.1.13",
       "picomatch@^2": "2.3.2",
-      "qs": "6.16.0",
+      "qs": "6.16.2",
       "shell-quote": "1.12.0",
       "tar-fs@^2": "2.1.4",
       "tmp": "0.2.7",
@@ -91,6 +90,7 @@
     },
     "brace-expansion@^5": "5.0.12",
     "zod": "4.6.7",
-    "glob@^13": "14.0.3"
+    "glob@^13": "14.0.3",
+    "minimatch": "11.0.4"
   }
 }

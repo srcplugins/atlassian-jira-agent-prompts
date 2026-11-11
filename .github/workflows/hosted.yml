@@ -119,9 +119,13 @@ jobs:
             return 1
           }
           # The same JSON with the root version removed (the lockfile also records it for "").
+          # A failed read or jq counts as different, so the suite runs.
           same() {
             local filter='del(.version) | if .packages? then del(.packages[""].version) else . end'
-            [ "$(git show "$BEFORE:$1" | jq -S "$filter")" = "$(git show "$GITHUB_SHA:$1" | jq -S "$filter")" ]
+            local before after
+            before=$(git show "$BEFORE:$1" | jq -S "$filter") || return 1
+            after=$(git show "$GITHUB_SHA:$1" | jq -S "$filter") || return 1
+            [ "$before" = "$after" ]
           }
           only=false
           # A new branch, or a push whose previous commit isn't here, runs the suite.
@@ -333,21 +337,21 @@ jobs:
       - name: Forge CLI settings
         # The guarded wrapper requires credentials for every Forge command.
         env:
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         run: node config/forge.mjs settings set usage-analytics false
       - name: Deploy the published build to development
         if: env.DEPLOY_TAG != ''
         env:
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         run: node config/forge.mjs deploy --tag "$DEPLOY_TAG" -e development --non-interactive
       - name: Hosted suite
         if: env.CLEANUP == ''
         env:
           FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
           # The real repository's runs (landings and releases) go first on the site; a development
           # copy (it sets these variables) pauses its suite between steps for them.
           FORGE_TEST_LEASE_PRIORITY: ${{ vars.SRCPLUGINS_REPO_OWNER == '' && vars.SRCPLUGINS_REPO_PREFIX == '' && '1' || '0' }}
@@ -358,8 +362,8 @@ jobs:
         if: env.CLEANUP != ''
         env:
           FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         # A plugin lists its own runners' cleanup in tests/hosted/cleanup.json:
         # { "<target>": { "command": ["node", "<runner>", "cleanup"], "env": { "NAME": "value" } } }.
         # The run UUID is appended to the command. Any other target is a fixture app.
@@ -374,7 +378,7 @@ jobs:
             while IFS= read -r part; do command+=("$part"); done < <(jq -r --arg t "$target" '.[$t].command[]' "$runners")
             while IFS= read -r variable; do
               # Plain opt-in flags only; never credentials, Forge guards or the toolchain.
-              [[ "$variable" =~ ^[A-Z][A-Z0-9_]*=[^[:space:]]*$ && ! "$variable" =~ ^(FORGE_|JIRA_|GITHUB_|RUNNER_|NODE_|NPM_|PATH=) ]] ||
+              [[ "$variable" =~ ^[A-Z][A-Z0-9_]*=[^[:space:]]*$ && ! "$variable" =~ ^(ATLASSIAN_|FORGE_|JIRA_|GITHUB_|RUNNER_|NODE_|NPM_|PATH=) ]] ||
                 { echo "::error::Unsupported environment entry for $target"; exit 1; }
               export "$variable"
             done < <(jq -r --arg t "$target" '.[$t].env // {} | to_entries[] | "\(.key)=\(.value)"' "$runners")

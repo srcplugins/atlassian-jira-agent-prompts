@@ -105,6 +105,8 @@ test('source text and formatted output have separate limits without accepting em
 test('the actual Rovo read handler returns faithful numbered instructions with actor-bound reads', async () => {
   const sdk = forgeContract(
     { body: { id: '1', key: 'TEST', projectTypeKey: 'software', style: 'classic' } },
+    // The space again, by ID, for the prompt type's name.
+    { body: { id: '1', issueTypes: [{ id: '3', name: 'Prompt', subtask: false }] } },
     {
       body: {
         id: '20',
@@ -127,6 +129,6 @@ test('the actual Rovo read handler returns faithful numbered instructions with a
   );
   assert.equal(result.ok, true);
   assert.equal(result.value.content, numberedText);
-  assert.equal(sdk.calls.length, 2);
+  assert.equal(sdk.calls.length, 3);
   assert.ok(sdk.calls.every((call) => call.actor === 'asUser' && (call.method ?? 'GET') === 'GET'));
 });

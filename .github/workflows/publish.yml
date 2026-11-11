@@ -117,8 +117,8 @@ jobs:
         env:
           SHA: ${{ steps.source.outputs.sha }}
           TAG: ${{ steps.source.outputs.tag }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         run: |
           sed -i "s/^export const build = 'development';$/export const build = '${SHA::12}';/" src/build-info.ts
           grep -q "'${SHA::12}'" src/build-info.ts || { echo "::error::Build stamp failed"; exit 1; }
@@ -201,8 +201,8 @@ jobs:
         env:
           FORGE_ALLOW_PRODUCTION: '1'
           APPROVE_MAJOR: ${{ inputs.approve_major }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         run: |
           node config/forge.mjs settings set usage-analytics false
           approve=()
@@ -294,8 +294,8 @@ jobs:
       - name: Read-only checks of the production installation
         env:
           FORGE_TEST_CONFIG: ${{ secrets.FORGE_TEST_CONFIG }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_KEY: ${{ secrets.JIRA_API_KEY }}
+          ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
         run: EXPECT_BUILD="${SHA::12}" node config/production-smoke.mjs "$RUNNER_TEMP/production-smoke.json"
       # Always, so a failed or crashed smoke is in the release notes too.
       - name: Smoke result in the release notes

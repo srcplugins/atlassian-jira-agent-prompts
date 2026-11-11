@@ -73,6 +73,11 @@ function world(seed, features) {
     refreshAfterSave: async () => false,
     retainedTypes: async () => [],
     config: async () => (await gate(), '3'),
+    // The space's prompt type, read for its name.
+    project: async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+    }),
     field: async () => (await gate(), FIELD),
     allowed: async () => void (await gate()),
     search: async () => (await gate(), { prompts: [], incomplete: false }),

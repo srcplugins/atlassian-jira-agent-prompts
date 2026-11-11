@@ -704,3 +704,48 @@ test('with no prompts saved, Sync is still offered, to remove a section someone 
   await f.click('Sync');
   assert.deepEqual(JSON.parse(JSON.stringify(f.calls.at(-1).payload)), { sync: true });
 });
+
+test('a notice from the load is shown on its own: no picker, buttons or Try again', async () => {
+  for (const notice of [
+    'This work item is a prompt, so it can’t use other prompts. Open a work item of another type, such as a Bug, to add prompts.',
+    'Agent Prompts isn’t set up for this space: its prompt type is one of Jira’s built-in work types. Ask a Jira administrator to choose a dedicated prompt type.',
+  ]) {
+    const f = fixture({ script: [{ notice }] });
+    await f.mount();
+    // The search status region stays mounted, empty.
+    assert.equal(f.text().trim(), notice);
+    assert.equal(f.nodes('Select').length, 0);
+    for (const label of ['Try again', 'Save', 'Sync']) assert.equal(f.button(label), undefined);
+    assert.equal(f.nodes('SaveRecovery').length, 0);
+    // Nothing failed, so saved-state recovery isn't checked.
+    assert.deepEqual(
+      f.calls.map((c) => c.name),
+      ['load'],
+    );
+  }
+});
+
+test('a failed save that finds the work item is now a prompt shows the notice instead of the picker', async () => {
+  const notice =
+    'This work item is a prompt, so it can’t use other prompts. Open a work item of another type, such as a Bug, to add prompts.';
+  const f = fixture({
+    script: [
+      { ids: [], prompts: [{ id: '1', key: 'TEST-1', name: 'Saved' }], revision: 1 },
+      { notice },
+    ],
+  });
+  await f.mount();
+  f.select(['1']);
+  await f.click('Save');
+  assert.equal(f.nodes('Select').length, 0);
+  assert.ok(f.text().includes(notice));
+});
+
+test('an empty picker names the space’s prompt type and says how to add one', async () => {
+  const f = fixture({ script: [{ ids: [], prompts: [], revision: 1, typeName: 'Prompt' }] });
+  await f.mount();
+  f.results([]);
+  const empty = 'No Prompt work items in this space yet. Create one to use it as a prompt.';
+  assert.match(f.text(), new RegExp(empty));
+  assert.equal(f.nodes('Select')[0].props.noOptionsMessage(), empty);
+});

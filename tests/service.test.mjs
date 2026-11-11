@@ -43,6 +43,11 @@ function fixture() {
     refreshAfterSave: async () => false,
     retainedTypes: async () => [],
     config: async () => '3',
+    // The space's prompt type, read for its name.
+    project: async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+    }),
     field: async () => 'customfield_1',
     allowed: async () => {},
     search: async () => ({
@@ -393,17 +398,107 @@ test('changing setup to a type whose prompts are selected permits only cleanup w
   assert.deepEqual(f.target.fields.description, doc('Keep this'));
 });
 
-test('prompt targets without selected prompts still reject loading and forged save inputs', async () => {
+test('a prompt without saved prompts loads as a notice, not an error, and refuses forged saves', async () => {
   const f = fixture();
   f.target.fields.issuetype.id = '3';
-  await assert.rejects(f.service.load(c), /cannot use other prompts/);
+  assert.deepEqual(await f.service.load(c), {
+    notice:
+      'This work item is a prompt, so it can’t use other prompts. Open a work item of another type, such as a Bug, to add prompts.',
+  });
   for (const ids of [[], ['20']]) {
     await assert.rejects(
       f.service.save(c, { ids, revision: 0, fingerprint: 'unused' }),
-      /only remove/,
+      /This work item is a prompt, so it can’t use other prompts\. Open a work item of another type/,
     );
   }
   assert.equal(f.calls(), 0);
+});
+
+test('a prompt with saved prompts can only remove them', async () => {
+  const f = fixture();
+  await f.service.save(c, { ...(await f.service.load(c)), ids: ['20'] });
+  f.target.fields.issuetype.id = '3';
+  const loaded = await f.service.load(c);
+  assert.equal(loaded.cleanupOnly, true);
+  await assert.rejects(
+    f.service.save(c, { ids: ['20', '21'], revision: loaded.revision }),
+    /^Error: This work item is a prompt, so it can’t use other prompts\. You can only remove the prompts it already has\.$/,
+  );
+});
+
+test('the field names the space’s prompt type for the empty picker', async () => {
+  const f = fixture();
+  assert.equal((await f.service.load(c)).typeName, 'Prompt');
+  // A prompt type the space no longer has is not named.
+  f.ports.project = async (id) => ({ id, issueTypes: [] });
+  assert.equal('typeName' in (await f.service.load(c)), false);
+});
+
+test('a space set up with a built-in work type stops the field, search, read and save', async () => {
+  for (const name of [
+    'Story',
+    ' task ',
+    '[System] Bug',
+    '[SYSTEM] Service request with approvals',
+  ]) {
+    const f = fixture();
+    f.ports.project = async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name, subtask: false, hierarchyLevel: 0 }],
+    });
+    const message =
+      'Agent Prompts isn’t set up for this space: its prompt type is one of Jira’s built-in work types. Ask a Jira administrator to choose a dedicated prompt type.';
+    assert.deepEqual(await f.service.load(c), { notice: message }, name);
+    const refused = new RegExp(`^Error: ${message}$`);
+    await assert.rejects(f.service.search(c, { query: 'x' }), refused);
+    await assert.rejects(f.service.read(c, '20'), refused);
+    await assert.rejects(f.service.save(c, { ids: [], revision: 0 }), refused);
+    await assert.rejects(f.service.save(c, { sync: true }), refused);
+    assert.equal(f.calls(), 0, name);
+  }
+});
+
+test('a stopped space still reports an unverified earlier save, so the field offers its recovery', async () => {
+  const f = fixture();
+  f.ports.project = async (id) => ({
+    id,
+    issueTypes: [{ id: '3', name: 'Story', subtask: false, hierarchyLevel: 0 }],
+  });
+  // A save sent before the upgrade whose outcome Jira doesn't show.
+  await f.ports.cas('10', 0, {
+    ids: [],
+    pending: {
+      ids: ['20'],
+      keys: ['TEST-20'],
+      before: 'before',
+      after: 'after',
+      beforeField: 'field-before',
+      attemptId: 'attempt',
+      phase: 'submitted',
+      started: Date.now() - 300_000,
+    },
+  });
+  // As an error, not a notice: the field then checks saved state and shows recovery.
+  await assert.rejects(f.service.load(c), /^Error: The previous save could not be verified\./);
+  assert.equal((await f.service.saveStatus(c)).pending, true);
+  // Once released, the field shows the stopped space's notice again.
+  await f.ports.cas('10', 1, { ids: [] });
+  assert.deepEqual(await f.service.load(c), {
+    notice:
+      'Agent Prompts isn’t set up for this space: its prompt type is one of Jira’s built-in work types. Ask a Jira administrator to choose a dedicated prompt type.',
+  });
+  assert.equal(f.calls(), 0);
+});
+
+test('a renamed or merely similar type name is not taken for a built-in one', async () => {
+  for (const name of ['Prompt', 'Stories', 'Story prompt', 'Taskbar']) {
+    const f = fixture();
+    f.ports.project = async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name, subtask: false, hierarchyLevel: 0 }],
+    });
+    assert.equal((await f.service.load(c)).typeName, name);
+  }
 });
 
 test('cleanup after a target becomes a prompt needs Edit work items and rewrites a changed section', async () => {

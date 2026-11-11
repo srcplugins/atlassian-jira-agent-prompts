@@ -375,11 +375,11 @@ export function createSettingsPorts(sdk: Sdk): SettingsPorts {
   return {
     get: (project) => readState<SettingsRecord>(kvs, `config-${project}`),
     cas: async (project, revision, data, screen, run) => {
-      const condition = (revision: number) => ({
+      const condition = (expected: number) => ({
         entityName: storageEntity,
         conditions: new Filter<SettingsRecord>().and(
           'revision',
-          revision === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(revision),
+          expected === 0 ? FilterConditions.notExists() : FilterConditions.equalTo(expected),
         ),
       });
       try {

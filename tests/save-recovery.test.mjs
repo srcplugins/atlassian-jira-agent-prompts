@@ -38,6 +38,11 @@ function fixture() {
     refreshAfterSave: async () => false,
     retainedTypes: async () => [],
     config: async () => '3',
+    // The space's prompt type, read for its name.
+    project: async (id) => ({
+      id,
+      issueTypes: [{ id: '3', name: 'Prompt', subtask: false, hierarchyLevel: 0 }],
+    }),
     field: async () => 'customfield_1',
     allowed: async () => {},
     search: async () => ({

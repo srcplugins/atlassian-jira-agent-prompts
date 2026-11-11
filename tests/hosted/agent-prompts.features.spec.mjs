@@ -694,10 +694,18 @@ test("AP-17 a section edited, retitled, duplicated or deleted in Jira is rewritt
   /** Edits the Description in Jira's own editor and saves it there; returns what Jira saved. */
   const jiraEdit = async (label, act, landed) => {
     await page.goto(`${activeTarget().site}/browse/${targetIssue.key}`);
-    // The fixture's own first paragraph: the middle of the read view is the section's expand.
-    await page.getByTestId('issue.views.field.rich-text.description').locator('p').first().click();
+    // Jira's own edit button, reached as a keyboard user does: it shows only on hover, and a click
+    // on the read view's text no longer opens the editor. Before the work item view is ready the
+    // key opens nothing, and opening the editor saves nothing, so it repeats until the editor shows.
     const content = page.locator('#ak-editor-textarea');
-    await expect(content).toBeVisible();
+    const edit = page
+      .getByRole('region', { name: 'Description section', exact: true })
+      .getByRole('button', { name: 'Edit Description, edit', exact: true });
+    await expect(async () => {
+      await edit.focus();
+      await page.keyboard.press('Enter');
+      await expect(content).toBeVisible({ timeout: 5000 });
+    }).toPass({ timeout: 60000 });
     // The editor opens the section's expand as it was last shown; open it to reach the prompt.
     const prompt = content.getByText(instructions, { exact: false });
     await expect(async () => {
@@ -752,7 +760,7 @@ test("AP-17 a section edited, retitled, duplicated or deleted in Jira is rewritt
     await save('Sync');
     expect(await read()).toEqual({ description: expected, [field.id]: [sourceIssue.key] });
   };
-  const choose = async () => {
+  const chooseSource = async () => {
     const combo = editor(page).getByRole('combobox', { name: 'Agent Prompts', exact: true });
     await observeAction(page, 'search', () => combo.fill(sourceIssue.key), t);
     await combo.press('ArrowDown');
@@ -769,7 +777,7 @@ test("AP-17 a section edited, retitled, duplicated or deleted in Jira is rewritt
   target.expected.customField = { id: field.id, value: [sourceIssue.key] };
   owned.run.persist();
   await open();
-  await choose();
+  await chooseSource();
   await save();
   expect(await read()).toEqual({ description: linked, [field.id]: [sourceIssue.key] });
 

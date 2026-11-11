@@ -52,7 +52,7 @@ export const checks = [
   },
   {
     title: 'Field editor loads on a marked work item',
-    async run({ page, site, target, issue, get, state }) {
+    async run({ page, site, target, issue, get, state: licensing }) {
       const field = await agentPromptsField(get, target);
       await page.goto(`${site}/browse/${issue.key}`);
       const readView = fieldReadView(page, field.id);
@@ -61,14 +61,14 @@ export const checks = [
       const retry = editor.getByRole('button', { name: 'Try again', exact: true });
       // Unlicensed: the editor loaded and the app answered, with exactly the subscription refusal.
       const opened =
-        state?.outcome === 'unlicensed' ? editor.getByText(refusal, { exact: true }) : combo;
+        licensing?.outcome === 'unlicensed' ? editor.getByText(refusal, { exact: true }) : combo;
       // Jira can drop a click on a freshly loaded work item; opening the editor only reads.
       await expect(async () => {
         if (!(await opened.isVisible()))
           await readView.click({ position: { x: 2, y: 2 }, timeout: 5000 });
         await expect(opened).toBeVisible({ timeout: 5000 });
       }).toPass({ timeout: 40000, intervals: [1000, 3000] });
-      if (state?.outcome === 'unlicensed') {
+      if (licensing?.outcome === 'unlicensed') {
         await expect(retry).toBeVisible();
         await page.keyboard.press('Escape');
         return;
