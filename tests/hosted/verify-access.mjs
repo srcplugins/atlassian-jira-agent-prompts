@@ -81,6 +81,7 @@ const j =
         marker: markers.acceptance('access', `${id}. Synthetic space only.`),
         label: `${markers.namespace}-access-${short.toLowerCase()}`,
         issues: {},
+        ownType: { name: `Access ${short}` },
         stage: 'preflight',
         clean: false,
       };
@@ -214,6 +215,27 @@ async function cleanup() {
       await api(`/issuetypescheme/${j.typeScheme.id}`, 'DELETE');
     }
     j.typeSchemeDeleted = true;
+    persist();
+  }
+  // The run's own prompt type, once its space and scheme are gone.
+  const own = j.ownType;
+  if (own?.intent && !own.gone) {
+    if (!own.id) {
+      const matches = (await api('/issuetype')).filter((x) => x.name === own.name);
+      assert.ok(matches.length <= 1, 'Own type outcome is ambiguous; inspect without retry');
+      own.id = matches[0] && String(matches[0].id);
+      persist();
+    }
+    const t = own.id && (await api(`/issuetype/${own.id}`));
+    if (t) {
+      assert.equal(t.name, own.name);
+      assert.equal(t.description, j.marker);
+      own.deleteIntent = true;
+      persist();
+      await api(`/issuetype/${t.id}`, 'DELETE');
+      assert.equal(await api(`/issuetype/${t.id}`), null);
+    }
+    own.gone = true;
     persist();
   }
   // The rest of what Jira created with the space stays after it.
@@ -401,8 +423,26 @@ try {
       )
       .toBe(j.securityScheme.id);
 
+    // The run's own prompt type in the space's own scheme: Jira's built-in work types are refused.
+    stage('own-type');
+    const own = j.ownType;
+    assert.ok(!(await api('/issuetype')).some((x) => x.name === own.name));
+    own.intent = true;
+    persist();
+    own.id = String(
+      (
+        await api('/issuetype', 'POST', {
+          name: own.name,
+          description: j.marker,
+          hierarchyLevel: 0,
+        })
+      ).id,
+    );
+    persist();
+    await api(`/issuetypescheme/${j.typeScheme.id}/issuetype`, 'PUT', { issueTypeIds: [own.id] });
+
     stage('configure');
-    const task = project.issueTypes.find((x) => x.name === 'Task' && !x.subtask);
+    const task = (await ownedProject()).issueTypes.find((x) => String(x.id) === own.id);
     const targetType = project.issueTypes.find(
       (x) => !x.subtask && x.id !== task?.id && x.hierarchyLevel === 0,
     );
