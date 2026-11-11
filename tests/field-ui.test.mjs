@@ -738,7 +738,7 @@ test('a failed save that finds the work item is now a prompt shows the notice in
   f.select(['1']);
   await f.click('Save');
   assert.equal(f.nodes('Select').length, 0);
-  assert.match(f.text(), new RegExp(notice.replace(/[.?]/g, '\\$&')));
+  assert.ok(f.text().includes(notice));
 });
 
 test('an empty picker names the space’s prompt type and says how to add one', async () => {
